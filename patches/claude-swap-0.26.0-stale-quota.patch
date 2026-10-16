@@ -1,0 +1,88 @@
+--- a/claude_swap/autoswitch.py
++++ b/claude_swap/autoswitch.py
+@@ -53,7 +53,12 @@
+ )
+ from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+ from claude_swap.switcher import ClaudeAccountSwitcher
+-from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
++from claude_swap.usage_store import (
++    STALE_OK_S,
++    UsageEntry,
++    due_candidate,
++    plan_oversleeps_interval,
++)
+ 
+ STATE_FILENAME = "autoswitch_state.json"
+ STATE_SCHEMA_VERSION = 1
+@@ -616,6 +621,31 @@
+ 
+ def _ref(number: str, email: str) -> dict:
+     return {"number": int(number), "email": email}
++
++
++def _decision_usage(
++    entries: dict[str, UsageEntry], current: str, now: float
++) -> dict[str, dict | str | None]:
++    """Do not mistake an old usage lower bound for active-account health."""
++    usage = {num: entry.decision_value() for num, entry in entries.items()}
++    active = entries.get(current)
++    if (
++        active is not None
++        and active.sentinel is None
++        and active.last_error == "http-429"
++        and active.fetched_at is not None
++        and now - active.fetched_at > STALE_OK_S
++    ):
++        # A throttled usage API can freeze a low reading while inference
++        # consumes the remaining quota. Use the existing unhealthy failover
++        # path, but only toward a freshly measured peer; rotating among stale
++        # peers would merely trade one unknown account for another. The store
++        # still retains its display data and honors the server's backoff.
++        usage[current] = None
++        for num, value in usage.items():
++            if isinstance(value, dict) and not entries[num].fresh(now):
++                usage[num] = None
++    return usage
+ 
+ 
+ def _headroom_by_account(
+@@ -1201,7 +1231,7 @@
+             entries = self.switcher.usage_entries_by_account(
+                 fetch={current, *candidates}
+             )
+-            usage = {num: entry.decision_value() for num, entry in entries.items()}
++            usage = _decision_usage(entries, current, self.clock())
+             headroom = _headroom_by_account(usage, self._models)
+             active_headroom = headroom.get(current)
+             decided_now = self.clock()
+@@ -1365,6 +1395,12 @@
+                     systemic = status
+                 continue
+             if status == "skip-live-session":
++                continue
++            if trigger == "failover" and _decision_usage(
++                entries, current, self.clock()
++            ).get(num) is None:
++                # Credential freshening may have taken long enough for a
++                # previously eligible measurement to age out.
+                 continue
+             return self._perform(num, email, trigger, left_snapshot)
+ 
+@@ -2049,7 +2085,7 @@
+             # nomination preserves a valid future plan under the store lock.
+             scheduled=not stale_candidate_plan,
+         )
+-        usage = {num: entry.decision_value() for num, entry in entries.items()}
++        usage = _decision_usage(entries, current, self.clock())
+ 
+         active_value = usage.get(current)
+         active_headroom = oauth.account_headroom(
+@@ -2091,7 +2127,7 @@
+             entries = self.switcher.usage_entries_by_account(
+                 fetch=escalation_fetch
+             )
+-            usage = {num: entry.decision_value() for num, entry in entries.items()}
++            usage = _decision_usage(entries, current, self.clock())
+ 
+         headroom = _headroom_by_account(usage, self._models)
+         return entries, usage, headroom
