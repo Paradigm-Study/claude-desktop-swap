@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-desktop-swap-pilot"
+version = "0.1.0a1"
+description = "Experimental native subscription coordinator and Mac client for a two-device Claude Desktop pilot"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{name = "Paradigm contributors"}]
+dependencies = [
+    "cryptography==50.0.2",
+    "keyring==25.7.0; sys_platform == 'darwin'",
+]
+
+[project.scripts]
+team-pool = "team_pool.server:main"
+team-pool-client = "team_pool.client:main"
+team-pool-prepare-account = "team_pool.provision:main"
+
+[tool.setuptools.packages.find]
+include = ["team_pool*"]
+
+[project.urls]
+Repository = "https://github.com/Paradigm-Study/claude-desktop-swap"

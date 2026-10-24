@@ -4,6 +4,12 @@ Use your native Claude subscriptions in **local Claude Desktop Code sessions**, 
 
 This companion project connects Desktop's process launcher to the native Claude Code credential store. Desktop keeps its existing login and conversation index while `cswap` manages the account used for Code requests. It also includes an optional correction for stale quota readings in `claude-swap` 0.26.0.
 
+**Two-Mac team pilot:** a separate experimental coordinator and client now support
+one-use enrollment and centrally assigned native credentials. Start with the
+[pilot runbook](docs/team-pilot.md). It uses direct subscription inference;
+live interoperability on two actual Macs still needs to be validated. Do not
+run local `cswap` rotation and the team agent against the same native store.
+
 **Experimental, unofficial, and macOS only.** The integration was exercised with Desktop's bundled Claude Code 2.1.293 and 2.1.295. Its launcher configuration is version-sensitive; compatibility with future Desktop releases is not guaranteed. This project is not affiliated with Anthropic or the upstream claude-swap maintainers.
 
 ## What it does
@@ -107,10 +113,14 @@ The uninstaller restores the settings it owns and refuses conflicting edits. Reo
 
 ## Development
 
-The installer tests use temporary directories and synthetic settings; they do not touch your installed Claude setup:
+The tests use temporary directories, synthetic credentials, and local HTTPS;
+they do not touch your installed Claude setup or call Anthropic. Install the
+pilot's test/runtime dependencies in an isolated Python 3.12+ environment:
 
 ```sh
-python3 -m unittest discover -s tests -v
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -e .
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
 The quota regression tests require `claude-swap==0.26.0` in an isolated environment; see the patch instructions. CI exercises the installer on macOS and Linux fixtures and the quota behavior against the pinned upstream package. Live Desktop authentication is a manual integration check, not covered by fixture tests.

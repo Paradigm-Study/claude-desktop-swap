@@ -1,6 +1,8 @@
 # Native team pool: design assessment
 
-Status: assessed design, not an implemented or deployed feature. Prepared October 24, 2026.
+Status: an experimental implementation is available on the pilot branch; no
+live two-Mac validation or deployment is claimed. Prepared October 24, 2026.
+See the [pilot runbook](team-pilot.md) and [live acceptance worksheet](team-pilot-acceptance.md).
 
 ## Recommendation
 
@@ -11,7 +13,7 @@ Proceed first with a bounded two-Mac compatibility prototype. The existing singl
 ## Teammate experience
 
 1. An administrator creates a short-lived, single-use invitation for one teammate/device.
-2. The teammate runs the signed/reviewable installer and enters the invitation through a hidden prompt. Do not put credentials in shell arguments, URLs, or shell history.
+2. The teammate runs the reviewable installer and enters the invitation through a hidden prompt. A signed distribution is future release work. Do not put credentials in shell arguments, URLs, or shell history.
 3. Setup stores a unique device credential in the user's Keychain, installs a user LaunchAgent, and enables the existing Desktop process wrapper. The system wrapper needs the same one-time administrator approval as the current integration.
 4. The teammate restarts Desktop once, keeps their existing Desktop login, and resumes a local Code conversation. The agent obtains the assigned subscription credential in the background.
 5. The agent renews its assignment after startup, sleep/wake, and on a bounded interval. The coordinator handles quota selection and credential refresh.
