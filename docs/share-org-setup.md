@@ -5,84 +5,77 @@ using their existing Share sign-in. No invitation token or separate pool account
 is needed. Claude Desktop Code continues to use native subscription access;
 inference goes directly to Anthropic.
 
-## One-time Mac setup
+## One-command Mac setup
 
-You need macOS, Claude Desktop with local Code initialized, Xcode Command Line
-Tools (for Git and the menu-bar app), and
-[uv](https://docs.astral.sh/uv/getting-started/installation/). In Claude Code, open
-`/team`, sign in to Claude Share, and confirm that Paradigm is listed. A shared
-session link alone does not establish team membership.
-
-Check `xcode-select -p` in Terminal. If the tools are missing, run
-`xcode-select --install` and finish the macOS installer before continuing.
-
-Quit Claude Desktop for this initial setup, then run in Terminal:
+In a local Claude Desktop Code conversation, run `/team`, sign in to Claude
+Share, and confirm that **Paradigm** is listed. A shared session link alone does
+not establish team membership. Then paste this command into Terminal:
 
 ```sh
-git clone --single-branch --branch codex/team-pool \
-  https://github.com/Paradigm-Study/claude-desktop-swap.git
-cd claude-desktop-swap
-uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python .
-sudo .venv/bin/python scripts/desktop_swap.py install --user "$USER"
+curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/codex/team-pool/install.sh | /bin/bash
 ```
 
-If you previously used the personal `cswap` rotator, stop its `cswap auto` loops
-and disable its menu-bar service before continuing:
+Run it as your ordinary Mac user, without `sudo` in front of the command. The
+installer uses the tested `v0.1.0a7` package and prepares its own Python runtime;
+Git, Python and uv do not need to be installed beforehand. If Apple Command Line
+Tools are missing, it opens their installer and continues when you finish it.
+
+Setup checks your saved Share sign-in and current Paradigm membership, installs
+the native launcher if needed, enrolls or links this Mac, starts background sync,
+and installs the **Claude Swap** menu bar. An existing correct launcher skips
+administrator approval and restarting Desktop. A first installation gracefully
+quits and reopens Desktop if it was running; it does not force-quit a busy app.
+The original Desktop profile and conversation index are preserved. The native
+Code credential is replaced with the assigned subscription credential, with a
+private recovery backup retained.
+
+macOS may ask for administrator approval. If Keychain asks for **`security` to
+access `Claude Code-credentials`**, choose **Always Allow** for that exact request.
+A one-time Allow does not authorize later background syncs. Setup verifies a real
+background sync before reporting success and pauses on access failures instead
+of repeatedly prompting. See [Keychain recovery](keychain-access.md).
+
+After setup, resume an existing local Code conversation and send a normal-speed
+message. The menu bar shows the pool account and sync status. Fast mode retains
+its separate paid-credit requirements. A second physical Mac still needs live
+verification in the [pilot acceptance worksheet](team-pilot-acceptance.md).
+
+## Repeat setup, upgrade, or link an existing device
+
+Run the same command again. It reuses the installed release, preserves the
+existing device token and native recovery backup, and links an existing invite
+enrollment to your Share identity. It refuses a different Share identity,
+manual credential drift, or a paused/revoked/left enrollment until you explicitly
+resolve that condition. A failed installation can be retried with the same
+command; it does not require a second enrollment or invitation token.
+
+The installer stops the personal `cswap` menu service to avoid competing writes.
+If you run `cswap auto` in a Terminal, stop that loop first. Global terminal and
+Codex gateway settings are preserved. Native setup supports the default Claude
+credential store only and refuses a `CLAUDE_CONFIG_DIR` override or conflicting
+native provider configuration.
+
+The package and runtime stay under
+`~/.local/share/claude-desktop-swap/releases/v0.1.0a7/`. Keep that directory in
+place while the service uses it. Setup prints the installed client path; for this
+release, status and contribution commands are:
 
 ```sh
-launchctl disable "gui/$(id -u)/com.cswap.menubar"
-launchctl bootout "gui/$(id -u)/com.cswap.menubar"
+~/.local/share/claude-desktop-swap/releases/v0.1.0a7/venv/bin/team-pool-client status
+~/.local/share/claude-desktop-swap/releases/v0.1.0a7/venv/bin/team-pool-client contribute-account
 ```
 
-The second command may say the service does not exist on a fresh Mac. Use a
-terminal without Claude gateway or API-key environment overrides, then run:
+If Share saves its sign-in elsewhere, use the same installer with its account
+file path. The native credential store must still be the default one:
 
 ```sh
-.venv/bin/team-pool-client enroll-share
-.venv/bin/team-pool-client sync --once --take-over-native-store
-.venv/bin/team-pool-client service-install
-python3 scripts/install_team_status.py install
-.venv/bin/team-pool-client status
+curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/codex/team-pool/install.sh | /bin/bash -s -- --account-file /absolute/path/shared-session/account.json
 ```
 
-The first command reads the private Share sign-in already saved on this Mac.
-If Share keeps its sign-in in another configuration folder, supply
-`enroll-share --account-file /absolute/path/shared-session/account.json`.
-The native pilot supports the default Claude credential store only; run setup
-without a `CLAUDE_CONFIG_DIR` override even when selecting another Share file.
-The sync command explicitly replaces the local Code subscription credential and
-keeps a private recovery backup. If macOS asks for `security` to access
-`Claude Code-credentials`, choose **Always Allow** for that exact request.
-A one-time Allow does not authorize later background syncs. Use client
-0.1.0a6 or newer; the earlier repeating approval defect is described in
-[Keychain recovery](keychain-access.md).
-
-Keep this checkout and its virtual environment in place. Reopen Claude Desktop,
-resume an existing local Code conversation, and send a normal-speed message.
-The **Claude Swap** menu bar shows the pool account and background sync status.
-Fast mode retains its separate paid-credit requirements.
-
-After about a minute, run `.venv/bin/team-pool-client status` again and confirm
-that it remains active and shows Paradigm membership. If it is paused with
-`keychain_access_required`, follow [Keychain recovery](keychain-access.md) before
-restarting the service.
-
-## A Mac already enrolled by invitation
-
-Upgrade the installed client, then attach its existing device to Share membership:
-
-```sh
-.venv/bin/team-pool-client service-remove
-git pull --ff-only
-uv pip install --python .venv/bin/python .
-.venv/bin/team-pool-client link-share
-.venv/bin/team-pool-client sync --once
-.venv/bin/team-pool-client service-install
-```
-
-Linking keeps the existing device token, native login, and recovery backup.
-It refuses a different pool or a later attempt to bind another Share identity.
+For a local readiness check, pass `--check` instead. It may prepare the downloaded
+runtime, but does not change Claude, enroll, or contact Share. The check requires
+noninteractive access to the current Keychain items; ordinary setup can request
+foreground authorization when needed. Readiness is not a successful enrollment.
 
 ## What membership controls
 

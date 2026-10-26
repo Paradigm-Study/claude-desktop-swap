@@ -4,18 +4,22 @@ Use your native Claude subscriptions in **local Claude Desktop Code sessions**, 
 
 This companion project connects Desktop's process launcher to the native Claude Code credential store. Desktop keeps its existing login and conversation index while `cswap` manages the account used for Code requests. It also includes an optional correction for stale quota readings in `claude-swap` 0.26.0.
 
-**Two-Mac team pilot:** a separate experimental coordinator and client now support
-one-use enrollment, account contribution from each teammate's Mac, and centrally
-assigned native credentials. After enrollment, `team-pool-client contribute-account`
-opens Claude authorization in the browser; the coordinator owns the new refresh
-credentials. Contribution leaves the existing local native login and Desktop
-profile in place. Start with the [pilot runbook](docs/team-pilot.md). It uses direct
-subscription inference. Live browser contributions have succeeded against the
-Cloudflare coordinator; interoperability on two actual Macs remains under
-validation in the [acceptance worksheet](docs/team-pilot-acceptance.md).
-Local `cswap add` does not share an account,
-and this does not automatically upload your existing local pool. Do not run local
-`cswap` rotation and the team agent against the same native store.
+**Shared native pool pilot:** Paradigm members sign into Claude Share with
+`/team`, then run this one-time Mac setup command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/codex/team-pool/install.sh | /bin/bash
+```
+
+No invitation token is needed. The installer handles prerequisites, enrollment,
+background sync and the Claude Swap menu bar. Run it again to upgrade or link an
+existing invite enrollment. macOS may request administrator or Keychain approval.
+See the [organization setup guide](docs/share-org-setup.md) for the complete flow.
+Inference stays directly on native subscriptions. Teammates can contribute new
+accounts from their own Macs; the coordinator owns their refresh credentials.
+The [acceptance worksheet](docs/team-pilot-acceptance.md) records the first Mac's
+live results; a second physical Mac remains to be verified. Local `cswap add`
+does not upload an account to the shared pool.
 
 The coordinator can also use [Cloudflare Workers and a SQLite Durable Object](docs/cloudflare-pool.md),
 with its own storage and secrets in an existing Cloudflare account. Teammates use
