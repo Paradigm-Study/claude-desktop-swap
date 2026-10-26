@@ -48,9 +48,9 @@ credential contents; write and read each took about 0.02 s, and the bundled Code
 authentication check completed in 0.14 s. Client 0.1.0a5 is installed and its
 LaunchAgent is running. A live guarded sync completed in 0.77 s with zero native
 writes for an unchanged assignment. A subsequent authentication check completed
-in 0.13 s and a normal-speed native turn returned OK in 2.1 s. Sustained Desktop
-prompt behavior still requires user confirmation; these checks do not establish
-that every existing dialog has closed. The separate shared status menu is
+in 0.13 s and a normal-speed native turn returned OK in 2.1 s. The user then confirmed that no new Keychain prompts appeared after this
+update. This confirms the observed prompt loop stopped; longer-term sleep/wake
+and token-refresh behavior remain pending. The separate shared status menu is
 installed and running; the personal selector remains unloaded and disabled.
 
 The live coordinator correctly excluded Account A at 100% weekly utilization and
