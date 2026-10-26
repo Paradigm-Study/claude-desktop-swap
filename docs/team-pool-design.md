@@ -1,7 +1,8 @@
 # Native team pool: design assessment
 
 Status: an experimental implementation is available on the pilot branch; no
-live two-Mac validation or deployment is claimed. Prepared October 24, 2026.
+live two-Mac validation or deployment is claimed. Prepared October 24, 2026;
+updated October 26, 2026 with self-service account contribution.
 See the [pilot runbook](team-pilot.md) and [live acceptance worksheet](team-pilot-acceptance.md).
 
 ## Recommendation
@@ -14,9 +15,10 @@ Proceed first with a bounded two-Mac compatibility prototype. The existing singl
 
 1. An administrator creates a short-lived, single-use invitation for one teammate/device.
 2. The teammate runs the reviewable installer and enters the invitation through a hidden prompt. A signed distribution is future release work. Do not put credentials in shell arguments, URLs, or shell history.
-3. Setup stores a unique device credential in the user's Keychain, installs a user LaunchAgent, and enables the existing Desktop process wrapper. The system wrapper needs the same one-time administrator approval as the current integration.
-4. The teammate restarts Desktop once, keeps their existing Desktop login, and resumes a local Code conversation. The agent obtains the assigned subscription credential in the background.
-5. The agent renews its assignment after startup, sleep/wake, and on a bounded interval. The coordinator handles quota selection and credential refresh.
+3. Enrollment stores a unique device credential in the user's Keychain. Any active enrolled device can run `team-pool-client contribute-account` to authorize an account for the shared pool. This separate browser flow does not read or replace the device's native login.
+4. For native synchronization, the teammate installs the existing Desktop process wrapper, explicitly takes over the native credential store once, and installs a user LaunchAgent. The system wrapper needs the same one-time administrator approval as the current integration.
+5. The teammate restarts Desktop once, keeps their existing Desktop login, and resumes a local Code conversation. The agent obtains the assigned subscription credential in the background.
+6. The agent renews its assignment after startup, sleep/wake, and on a bounded interval. The coordinator handles quota selection and credential refresh.
 
 "Set up once" means no routine account switching or repeated pool login by teammates. It cannot guarantee that a revoked account, expired device enrollment, changed OS permission, or future Desktop update will never require intervention.
 
@@ -24,17 +26,44 @@ Proceed first with a bounded two-Mac compatibility prototype. The existing singl
 
 ```mermaid
 flowchart LR
-    Admin[Administrator] -->|Add authorized accounts| Broker[Account coordinator]
-    Admin -->|One-use invitation| Agent[Teammate's Mac agent]
-    Agent -->|Unique device credential| Broker
+    Admin[Administrator] -->|One-use invitation| Agent[Teammate's Mac agent]
+    Agent -->|Unique device credential| Broker[Account coordinator]
+    Agent -->|Authorize contributed account| Login[Claude browser authorization]
+    Login -->|Code pasted at hidden prompt| Agent
+    Agent -->|Authorization code over HTTPS| Broker
     Broker -->|Assigned account access token| Agent
     Agent -->|Native credential update| Keychain[Local native credential store]
     Desktop[Claude Desktop Code] --> Keychain
     Desktop -->|Inference directly| Anthropic[Anthropic]
-    Broker -->|Quota sampling and refresh| Anthropic
+    Broker -->|Code exchange, quota sampling and refresh| Anthropic
 ```
 
 The coordinator is a credential service, not an inference gateway. Prompts, files, and model responses do not need to pass through it. It sees enrolled devices, assignments, and account-level quota measurements. It cannot infer precise per-person token usage from shared account totals.
+
+### Self-service account contribution
+
+An active enrolled Mac requests a short-lived contribution attempt. The coordinator
+creates a PKCE verifier and state, keeps the verifier, and returns the official
+Claude authorization URL. The teammate checks the intended subscription account in
+the browser, authorizes it, and pastes the resulting `code#state` into the client's
+hidden prompt. No code or token is accepted in shell arguments or saved in a
+transfer file. The client submits it to the coordinator over HTTPS; the coordinator
+exchanges it with Anthropic and persists encrypted account credentials. The new
+refresh credential has one owner from the start: the coordinator.
+
+This does not invoke native `/login`, import the Mac's Keychain credentials, or
+change its Desktop profile. Existing personal `cswap` accounts remain local.
+Contribution can happen after enrollment and before the first native-store sync,
+so an empty coordinator can be populated from either pilot Mac. It adds an account
+to normal quota-based assignment; it does not immediately force all clients onto
+that account. Its real account-level quota and permissions are shared by the pool.
+
+The client can resume a pending browser attempt, inspect its status or completion
+receipt, and cancel a pending attempt. An uncertain code-exchange outcome must not
+cause a blind retry of a potentially consumed code. The server owns recovery
+state; a cancel action is not a provider-token revocation or removal of an already
+contributed account. Live authorization, fresh-lineage independence, and continued
+Desktop operation remain acceptance tests, not guarantees inferred from fixtures.
 
 ### Coordinator
 
@@ -43,6 +72,7 @@ The coordinator is a credential service, not an inference gateway. Prompts, file
 - Sample quota centrally with bounded backoff. Workstation agents must not independently poll each account's usage endpoint.
 - Assign accounts per device with stickiness, cooldown, and hysteresis. Use quota plus active assignments to avoid sending every teammate to the same apparently empty account at once. Assignment counts are only a load heuristic, not a measured per-person quota.
 - Treat stale quota explicitly. Prefer a fresh eligible alternate; when all candidates are stale or exhausted, report that state instead of rotating blindly or switching to API billing.
+- Accept account contributions from active enrolled devices without distributing administrative credentials. Bind each authorization attempt to its device and keep PKCE verification and code exchange on the coordinator.
 - Maintain an admin-only device list and revocation action. Audit enrollment, assignment, refresh outcome, and revocation without logging tokens, request bodies, or account credential objects.
 
 ### Mac agent
@@ -89,6 +119,8 @@ No current account material should be exported as part of a design assessment or
 
 | Test | Required result |
 | --- | --- |
+| Second-Mac contribution | Mac B authorizes a fresh account through the browser; its native login/profile remain unchanged, and Mac A successfully uses that account through assignment. |
+| Contribution recovery | A lost submission response can be resolved through status without repeating the code exchange; cancel only affects a pending attempt. |
 | Fresh second Mac | Access-token-only native credential works with the current Desktop build; no copied trusted-device secret is needed. Record any required per-device login. |
 | Real token renewal | Broker refreshes once; both clients receive the replacement; neither attempts its own refresh. |
 | Existing conversation | A new turn after assignment change uses the new account without changing Desktop login or moving history. |
@@ -108,8 +140,8 @@ If fresh-device authentication or renewal requires copying refresh/trusted-devic
 
 ## Smallest implementation after validation
 
-1. **Coordinator:** authenticated enrollment, sticky assignments, admin revocation, one refresh owner, durable storage, centralized usage sampling, and TLS. Invitation redemption must be atomic and single-use.
-2. **Mac agent:** hidden-prompt enrollment, Keychain device credential, credential-store adapter, LaunchAgent lifecycle, and a small status/diagnostic command with redacted output.
+1. **Coordinator:** authenticated enrollment, device-bound PKCE account contribution, sticky assignments, admin revocation, one refresh owner, durable storage, centralized usage sampling, and TLS. Invitation redemption must be atomic and single-use.
+2. **Mac agent:** hidden-prompt enrollment and browser account contribution, Keychain device credential, credential-store adapter, LaunchAgent lifecycle, and a small status/diagnostic command with redacted output.
 3. **Installer:** reuse the existing wrapper and reversible settings changes; add agent installation and a clearly defined migration/uninstall policy for the native credential store.
 4. **Operations:** deploy to an always-on host, restrict administration, back up encrypted state, and monitor refresh failures and stale quota. The administrator's sleeping laptop is not an adequate shared dependency.
 

@@ -5,17 +5,24 @@ not a validated production service. The coordinator exchanges credentials only.
 Claude Desktop Code sends inference directly to Anthropic. No gateway, API-key
 billing, or Fast-mode enablement is introduced.
 
+Enrolled teammates can contribute an account by signing in through an official
+Claude authorization page opened on their own Mac. The coordinator exchanges
+the authorization code and owns the resulting refresh credentials. Contribution
+does not read or change the Mac's existing native login or Desktop profile.
+
 The automated integration test connects two synthetic Mac clients to a real
-local HTTPS server with fake provider credentials. Real Desktop login, token
-renewal, and session continuity still require the two-Mac acceptance test below.
+local HTTPS server with fake provider credentials. Real browser authorization,
+Desktop login, token renewal, and session continuity still require the two-Mac
+acceptance test below.
 
 ## Pilot boundaries
 
 Use two controlled Macs and one or two dedicated, authorized test accounts.
 The coordinator can run as a dedicated user on a Mac or Linux host. Every
 credential lineage must have exactly one refresh owner: the coordinator.
-Do not import the existing everyday account pool while its Claude or cswap
-processes still use refresh credentials. This pilot does not migrate that pool.
+Browser contribution creates a fresh coordinator-owned credential lineage.
+It does not upload an existing local `cswap` pool. The administrator import path
+requires stopping other refresh writers before transferring an existing lineage.
 
 The enrolled Mac receives a real reusable Anthropic access token. Device
 revocation stops future deliveries; it does not invalidate a provider token
@@ -24,8 +31,9 @@ Code. Account resource permissions and quota remain shared. See the design's
 trust boundary and credential-use restrictions before provisioning accounts.
 
 The coordinator is deliberately small: one process, local administration, no
-web dashboard, no administrator network endpoint. Stop it before running admin
-commands, then restart it. Clients retain their last token while it is valid.
+web dashboard, no administrator network endpoint. Enrolled devices can contribute
+accounts while it runs. Stop it before running local admin commands, then restart
+it. Clients retain their last token while it is valid.
 
 ## 1. Install the pilot package
 
@@ -56,7 +64,197 @@ launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.cswap.menubar.p
 Do not delete saved accounts or log out of a shared provider account to do this.
 Keep personal settings, project histories, and the Desktop login in place.
 
-## 2. Provision a dedicated coordinator-owned account
+## 2. Initialize the coordinator
+
+As the dedicated coordinator OS user:
+
+```sh
+mkdir -p "$HOME/pilot-private"
+chmod 700 "$HOME/pilot-private"
+.venv/bin/team-pool init
+```
+
+The pool may start empty. Enrolled teammates can add dedicated test accounts
+through the browser contribution flow below; no local account export is needed.
+The coordinator stores encrypted account material in its private state directory
+`~/.local/share/claude-desktop-team-pool/`. Back up its `master.key` with the
+database through a protected channel; anyone holding both can decrypt the pool.
+Local filesystem permissions remain part of the security boundary.
+
+## 3. Create two invitations and start HTTPS
+
+While the coordinator is stopped:
+
+```sh
+.venv/bin/team-pool invite --out "$HOME/pilot-private/mac-a.invite" --ttl 3600
+.venv/bin/team-pool invite --out "$HOME/pilot-private/mac-b.invite" --ttl 3600
+```
+
+Each file contains a separate, expiring, single-use invitation. Give each
+teammate only their own invitation through a private channel. Redemption creates
+a unique device bearer stored in that Mac's Keychain; the server retains its hash.
+
+Use an HTTPS hostname reachable from both Macs, on a trusted private network.
+Supply a certificate whose hostname matches and whose issuer both clients trust:
+
+```sh
+.venv/bin/team-pool serve --host 0.0.0.0 --port 8741 \
+  --tls-cert /absolute/path/fullchain.pem \
+  --tls-key /absolute/path/private-key.pem
+```
+
+Restrict network access to the two pilot Macs. There is no automatic certificate
+provisioning or internet-facing hardening. A self-signed certificate is not
+accepted merely because the server uses it; establish its trust separately.
+The client has no skip-verification switch. Plain HTTP is allowed only on
+loopback with an explicit client flag, for local tests; it is not the two-Mac path.
+
+The coordinator polls quota on assignment requests, at most every 120 seconds
+per healthy account. HTTP 429 and transport failures back off. Readings older
+than 300 seconds cannot attract a new assignment. Existing clients can retain a
+valid token while reporting stale or exhausted quota. Account selection is
+sticky and considers active device assignments; it is not per-person accounting.
+
+## 4. Enroll each Mac once
+
+Run as the teammate's normal macOS user, **without sudo**. Replace the example
+URL with the verified coordinator origin:
+
+```sh
+.venv/bin/team-pool-client enroll \
+  --server https://pool.internal.example.com:8741 --device-name "Pilot Mac A"
+```
+
+Enter the invitation at the hidden prompt. Alternatively use
+`--invitation-file /absolute/path/mac-a.invite`; it must be a private, user-owned
+file. Do not put the token itself on the command line.
+
+Enrollment alone does not change native credentials. If the pool is empty,
+contribute an account in the next step before attempting the first sync.
+
+## 5. Contribute an account from a teammate's Mac
+
+Every active enrolled device can contribute. Contributing makes the account's
+actual quota and permissions available to other enrolled teammates; it does not
+create per-person quotas or isolate account-owned resources. Only contribute an
+account you are authorized to share with this group. On an enrolled Mac, run:
+
+```sh
+.venv/bin/team-pool-client contribute-account
+```
+
+The coordinator starts a short-lived authorization attempt and holds its PKCE
+verifier. The client opens the official Claude authorization URL in the Mac's
+browser. Check that the browser is signed into the **subscription account you
+intend to share**, then authorize it. Paste the resulting `code#state` value into
+the terminal's hidden prompt. Never put that value or a provider token in a shell
+argument, chat, or file.
+
+The client submits that code to its enrolled coordinator over HTTPS. The
+coordinator exchanges it directly with Anthropic, checks the returned identity
+and required metadata, and stores the new credentials encrypted. The refresh
+token stays on the coordinator. The contribution command does not use `/login`,
+read the local Claude Keychain, switch the active native account, or change a
+Desktop profile. Existing native sessions are left in place by this command.
+
+To choose when to open the authorization page:
+
+```sh
+.venv/bin/team-pool-client contribute-account --no-browser
+```
+
+Open the displayed authorization URL yourself and use the same hidden prompt.
+Use these commands to inspect the last contribution or cancel a pending attempt:
+
+```sh
+.venv/bin/team-pool-client contribute-account --status
+.venv/bin/team-pool-client contribute-account --cancel
+```
+
+The flags are mutually exclusive. Running the command again, with or without
+`--no-browser`, resumes a pending browser login. `--status` retrieves a pending
+state or a saved completion receipt. If the submission response is lost, check
+`--status` rather than submitting the code again; the client does not
+incorrectly retry a potentially consumed authorization code. `--cancel` cancels
+only a pending attempt and does not remove an already contributed account.
+
+An `added` receipt confirms the new pool entry. `duplicate` means that account is
+already in the pool; its existing credentials are retained. `uncertain` means the
+code may have been consumed without a usable committed account. Do not reuse the
+old code. After checking status, start a fresh browser attempt if needed. An
+expired or cancelled attempt also needs a fresh authorization.
+
+A successful contribution makes the account available to the shared pool. It
+does not force every Mac to switch immediately: eligible accounts participate
+in the coordinator's normal quota-aware, sticky assignments on the next syncs.
+
+Run the same flow on Mac B to contribute Account B. Neither Mac receives the
+other account's refresh token. A local `cswap add` still only adds a local
+account; it does not contribute to this service. A deployed reachable coordinator
+and enrollment are prerequisites for sharing between Macs.
+
+## 6. Start native synchronization
+
+Close Desktop for the initial takeover. Complete a deliberate first takeover,
+then install the background agent:
+
+```sh
+.venv/bin/team-pool-client sync --once --take-over-native-store
+.venv/bin/team-pool-client status
+.venv/bin/team-pool-client service-install
+```
+
+The first sync stores displaced native account data in a separate Keychain
+backup. Ordinary project settings and local MCP/plugin secrets are retained.
+The client config under `~/.config/claude-desktop-swap/team.json` contains device
+IDs, timestamps, status, and hashes, not provider/device tokens. A pending-write
+journal records expected hashes so a save failure does not destroy recovery.
+
+Reopen Desktop and resume a local Code conversation. Initial identity/quota
+checks or a cold refresh can take tens of seconds. A running service or `active`
+status proves credential synchronization only; verify a real Code turn below.
+
+## 7. Record the two-Mac acceptance results
+
+Record results in [the acceptance worksheet](team-pilot-acceptance.md); do not
+record actual account emails, tokens, prompt contents, or private session IDs.
+
+1. Enroll both Macs. Contribute Account A from Mac A and Account B from Mac B
+   using the real browser authorization flow. Confirm each contribution leaves
+   that Mac's native login and Desktop profile unchanged. Record whether the
+   existing provider sessions remain valid after authorizing the new lineage.
+2. On both Macs, verify an existing local Code conversation remains present.
+   Run a harmless turn with normal-speed inference. Record the Desktop/bundled
+   Code versions and observed subscription identity.
+3. Confirm an account contributed on Mac B can serve a real Code turn on Mac A
+   through normal assignment. Observe a real provider-token refresh and another
+   successful turn on both Macs. Confirm only the coordinator submitted the refresh
+   grant. Shortening a
+   local timestamp or using synthetic tests is not proof of real token renewal.
+4. Exercise a quota-driven switch when a dedicated test account genuinely reaches
+   the threshold; don't burn quota solely to force it. Record cache delay and any
+   failed turn requiring a retry. Automated tests cover the threshold meanwhile.
+5. Test sleep/wake and a temporary coordinator outage. A valid existing credential
+   can keep working; an expired one must not silently fall back to another billing
+   path. Verify recovery after reconnection.
+6. Test a manual native account change on one Mac. The agent should pause and
+   preserve it. Do not use `/logout` casually: provider revocation can affect
+   other Macs holding the same token.
+7. Revoke one device and confirm delivery stops while the other continues.
+   Record the residual validity of the previously delivered provider token.
+8. Record model selection, artifact/connector access, local tools, and any subagent
+   behavior. Fast mode has separate billing; this pilot does not enable or fund it.
+
+If current Desktop requires a refresh or trusted-device token on each Mac,
+stop the pilot and revisit the architecture. Do not work around that result by
+distributing the full account store.
+
+## Optional: administrator import of an existing credential lineage
+
+Fresh browser contribution is the normal path. This alternative deliberately
+transfers an existing credential lineage and requires a stopped coordinator for
+the import.
+It is not part of teammate enrollment or contribution.
 
 In a **dedicated provisioning OS user**, sign into the unmodified native Claude
 Code CLI using Anthropic's normal login flow. This OS user must not have the
@@ -99,7 +297,6 @@ existing encrypted administrative channel; never put it in this repository or
 send it as a teammate invitation. Import it as the coordinator OS user:
 
 ```sh
-.venv/bin/team-pool init
 .venv/bin/team-pool add-account --id account-a \
   --credentials "$HOME/pilot-private/account-a.json" --exclusive-owner
 ```
@@ -115,101 +312,6 @@ resume a provisioning CLI with old refresh material after the coordinator has
 rotated it. The coordinator verifies UUID/org against the provider's profile
 endpoint before delivering an account. Subscription tier strings originate in
 the native login export; they are not independently verified by that endpoint.
-
-## 3. Create two invitations and start HTTPS
-
-While the coordinator is stopped:
-
-```sh
-.venv/bin/team-pool invite --out "$HOME/pilot-private/mac-a.invite" --ttl 3600
-.venv/bin/team-pool invite --out "$HOME/pilot-private/mac-b.invite" --ttl 3600
-```
-
-Each file contains a separate, expiring, single-use invitation. Give each
-teammate only their own invitation through a private channel. Redemption creates
-a unique device bearer stored in that Mac's Keychain; the server retains its hash.
-
-Use an HTTPS hostname reachable from both Macs, on a trusted private network.
-Supply a certificate whose hostname matches and whose issuer both clients trust:
-
-```sh
-.venv/bin/team-pool serve --host 0.0.0.0 --port 8741 \
-  --tls-cert /absolute/path/fullchain.pem \
-  --tls-key /absolute/path/private-key.pem
-```
-
-Restrict network access to the two pilot Macs. There is no automatic certificate
-provisioning or internet-facing hardening. A self-signed certificate is not
-accepted merely because the server uses it; establish its trust separately.
-The client has no skip-verification switch. Plain HTTP is allowed only on
-loopback with an explicit client flag, for local tests; it is not the two-Mac path.
-
-The coordinator polls quota on assignment requests, at most every 120 seconds
-per healthy account. HTTP 429 and transport failures back off. Readings older
-than 300 seconds cannot attract a new assignment. Existing clients can retain a
-valid token while reporting stale or exhausted quota. Account selection is
-sticky and considers active device assignments; it is not per-person accounting.
-
-## 4. Enroll each Mac once
-
-Close Desktop for initial takeover. Run as the teammate's normal macOS user,
-**without sudo**. Replace the example URL with the verified coordinator origin:
-
-```sh
-.venv/bin/team-pool-client enroll \
-  --server https://pool.internal.example.com:8741 --device-name "Pilot Mac A"
-```
-
-Enter the invitation at the hidden prompt. Alternatively use
-`--invitation-file /absolute/path/mac-a.invite`; it must be a private, user-owned
-file. Do not put the token itself on the command line.
-
-Complete a deliberate first takeover, then install the background agent:
-
-```sh
-.venv/bin/team-pool-client sync --once --take-over-native-store
-.venv/bin/team-pool-client status
-.venv/bin/team-pool-client service-install
-```
-
-The first sync stores displaced native account data in a separate Keychain
-backup. Ordinary project settings and local MCP/plugin secrets are retained.
-The client config under `~/.config/claude-desktop-swap/team.json` contains device
-IDs, timestamps, status, and hashes, not provider/device tokens. A pending-write
-journal records expected hashes so a save failure does not destroy recovery.
-
-Reopen Desktop and resume a local Code conversation. Initial identity/quota
-checks or a cold refresh can take tens of seconds. A running service or `active`
-status proves credential synchronization only; verify a real Code turn below.
-
-## 5. Record the two-Mac acceptance results
-
-Record results in [the acceptance worksheet](team-pilot-acceptance.md); do not
-record actual account emails, tokens, prompt contents, or private session IDs.
-
-1. On both Macs, verify an existing local Code conversation remains present.
-   Run a harmless turn with normal-speed inference. Record the Desktop/bundled
-   Code versions and observed subscription identity.
-2. Observe a real provider-token refresh and another successful turn on both
-   Macs. Confirm only the coordinator submitted the refresh grant. Shortening a
-   local timestamp or using synthetic tests is not proof of real token renewal.
-3. Exercise a quota-driven switch when a dedicated test account genuinely reaches
-   the threshold; don't burn quota solely to force it. Record cache delay and any
-   failed turn requiring a retry. Automated tests cover the threshold meanwhile.
-4. Test sleep/wake and a temporary coordinator outage. A valid existing credential
-   can keep working; an expired one must not silently fall back to another billing
-   path. Verify recovery after reconnection.
-5. Test a manual native account change on one Mac. The agent should pause and
-   preserve it. Do not use `/logout` casually: provider revocation can affect
-   other Macs holding the same token.
-6. Revoke one device and confirm delivery stops while the other continues.
-   Record the residual validity of the previously delivered provider token.
-7. Record model selection, artifact/connector access, local tools, and any subagent
-   behavior. Fast mode has separate billing; this pilot does not enable or fund it.
-
-If current Desktop requires a refresh or trusted-device token on each Mac,
-stop the pilot and revisit the architecture. Do not work around that result by
-distributing the full account store.
 
 ## Administration and recovery
 
@@ -299,4 +401,7 @@ uv pip install --python .venv/bin/python -e .
 The TLS test generates its own temporary certificate and fake Keychains. It
 exercises two enrollments, native-store writes, quota rotation, one refresh per
 account generation, manual-login pause, revocation, and explicit restoration.
-All provider calls are faked; no subscription quota is consumed.
+Contribution checks use a fake authorization provider as well. A simulated
+code exchange does not establish that Anthropic accepts the live flow or that
+Desktop can use a real contributed account. All provider calls are faked; no
+subscription quota is consumed.

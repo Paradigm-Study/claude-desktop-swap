@@ -7,9 +7,17 @@ private prompts, account emails, or session identifiers.
 | Check | Mac A | Mac B | Evidence / observed limitation |
 | --- | --- | --- | --- |
 | macOS / Desktop / bundled Code version | Pending | Pending | |
-| One-time enrollment and initial native turn | Pending | Pending | |
+| One-time enrollment | Pending | Pending | |
+| Browser contribution from each Mac | Pending | Pending | |
+| Contribution preserves native login and Desktop profile | Pending | Pending | |
+| Existing provider sessions survive fresh-lineage authorization | Pending | Pending | |
+| Account contributed by Mac B serves a native turn on Mac A | Pending | Pending | |
+| Contribution status recovers a lost completion response | Pending | Pending | |
+| Pending contribution cancellation | Pending | Pending | |
+| Initial native turn | Pending | Pending | |
 | Existing conversation retained | Pending | Pending | |
 | No refresh/trusted-device token delivered | Pending | Pending | |
+| Contributed-account refresh occurs only on coordinator | Pending | Pending | |
 | Real provider-token refresh followed by successful turn | Pending | Pending | |
 | Quota-based account switch in same conversation | Pending | Pending | |
 | Cache delay / in-flight turn / subagent behavior | Pending | Pending | |

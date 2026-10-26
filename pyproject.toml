@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-desktop-swap-pilot"
-version = "0.1.0a1"
-description = "Experimental native subscription coordinator and Mac client for a two-device Claude Desktop pilot"
+version = "0.1.0a2"
+description = "Experimental native Claude Desktop team pool with Mac enrollment and account contribution"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"

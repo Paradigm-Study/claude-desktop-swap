@@ -5,10 +5,15 @@ Use your native Claude subscriptions in **local Claude Desktop Code sessions**, 
 This companion project connects Desktop's process launcher to the native Claude Code credential store. Desktop keeps its existing login and conversation index while `cswap` manages the account used for Code requests. It also includes an optional correction for stale quota readings in `claude-swap` 0.26.0.
 
 **Two-Mac team pilot:** a separate experimental coordinator and client now support
-one-use enrollment and centrally assigned native credentials. Start with the
-[pilot runbook](docs/team-pilot.md). It uses direct subscription inference;
-live interoperability on two actual Macs still needs to be validated. Do not
-run local `cswap` rotation and the team agent against the same native store.
+one-use enrollment, account contribution from each teammate's Mac, and centrally
+assigned native credentials. After enrollment, `team-pool-client contribute-account`
+opens Claude authorization in the browser; the coordinator owns the new refresh
+credentials. Contribution leaves the existing local native login and Desktop
+profile in place. Start with the [pilot runbook](docs/team-pilot.md). It uses direct
+subscription inference; live browser authorization and interoperability on two
+actual Macs still need validation. Local `cswap add` does not share an account,
+and this does not automatically upload your existing local pool. Do not run local
+`cswap` rotation and the team agent against the same native store.
 
 **Experimental, unofficial, and macOS only.** The integration was exercised with Desktop's bundled Claude Code 2.1.293 and 2.1.295. Its launcher configuration is version-sensitive; compatibility with future Desktop releases is not guaranteed. This project is not affiliated with Anthropic or the upstream claude-swap maintainers.
 
@@ -76,7 +81,7 @@ Desktop can launch its bundled Code process through the system managed `processW
 
 The wrapper removes host-pinned OAuth, API-key, and gateway environment values for the selected macOS user, then executes the original command and arguments. Claude Code can consequently read the native credential store that `cswap` updates. Other macOS users pass through the wrapper unchanged. The integration also removes the host's blanket nonessential-traffic restriction, which otherwise suppresses some account capabilities.
 
-No proxy or API server is introduced. No application bundle or Anthropic binary is modified. The repository contains no account exports, credentials, session histories, or Anthropic source code.
+The Desktop launcher introduces no proxy or API server. The optional team coordinator exchanges credentials; inference still goes directly to Anthropic. No application bundle or Anthropic binary is modified. The repository contains no account exports, credentials, session histories, or Anthropic source code.
 
 See [architecture and limitations](docs/architecture.md) for the exact state boundaries and modified files.
 

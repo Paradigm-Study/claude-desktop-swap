@@ -89,7 +89,9 @@ class Transport:
         self.opener = urllib.request.build_opener(*handlers)
 
     def post(self, path, body, token=None):
-        if path not in ("/v1/enroll", "/v1/assignment"):
+        if path not in ("/v1/enroll", "/v1/assignment", "/v1/contributions/start",
+                        "/v1/contributions/complete", "/v1/contributions/status",
+                        "/v1/contributions/cancel"):
             raise ClientError("Unknown coordinator endpoint.")
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if token is not None:
@@ -600,6 +602,11 @@ def main(argv=None):
         commands.add_parser(command)
     leave = commands.add_parser("leave")
     leave.add_argument("--restore", action="store_true")
+    contribute = commands.add_parser("contribute-account", help="Share a fresh subscription login with the enrolled pool")
+    contribution_options = contribute.add_mutually_exclusive_group()
+    contribution_options.add_argument("--no-browser", action="store_true", help="Print the authorization URL for manual opening")
+    contribution_options.add_argument("--status", action="store_true", help="Recover the last contribution receipt without exchanging a code")
+    contribution_options.add_argument("--cancel", action="store_true", help="Cancel a pending contribution login")
     args = parser.parse_args(argv)
     try:
         client = Client(args.config)
@@ -612,6 +619,10 @@ def main(argv=None):
             result = client.status()
         elif args.command == "resume":
             result = client.resume()
+        elif args.command == "contribute-account":
+            from .contribute import run_contribution
+            result = run_contribution(client, no_browser=args.no_browser,
+                                      status=args.status, cancel=args.cancel)
         elif args.command == "run":
             return run(client)
         elif args.command == "service-install":

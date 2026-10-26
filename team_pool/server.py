@@ -29,6 +29,11 @@ REFRESH_MARGIN = 300
 THRESHOLD = 90
 DEVICE_ACTIVE_SECONDS = 300
 MAX_BODY = 8192
+CONTRIBUTION_TTL = 600
+CONTRIBUTION_INVALID_ATTEMPTS = 3
+CONTRIBUTION_STARTS_PER_HOUR = 5
+CONTRIBUTION_STARTS_PER_DAY = 20
+CONTRIBUTION_CODE_LIMIT = 4225
 METADATA = ("accountUuid", "emailAddress", "organizationUuid", "subscriptionType", "rateLimitTier")
 
 
@@ -132,11 +137,23 @@ class Coordinator:
                   id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
                   revoked INTEGER NOT NULL DEFAULT 0, account_id TEXT REFERENCES accounts(id),
                   last_seen REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS contributions (
+                  id TEXT PRIMARY KEY, device_id TEXT NOT NULL REFERENCES devices(id),
+                  created REAL NOT NULL, expires REAL NOT NULL, state TEXT NOT NULL,
+                  secret BLOB, invalid_attempts INTEGER NOT NULL DEFAULT 0,
+                  account_id TEXT REFERENCES accounts(id));
+                CREATE INDEX IF NOT EXISTS contribution_device_created
+                  ON contributions(device_id, created);
                 CREATE TABLE IF NOT EXISTS audit (
                   at REAL NOT NULL, event TEXT NOT NULL, subject TEXT NOT NULL);
             ''')
             with self.db:
                 self.db.execute("UPDATE accounts SET state='quarantined',error='interrupted-refresh' WHERE state='refreshing'")
+                # A grant may already have been consumed. Never replay one after
+                # an interrupted exchange, including after a successful response
+                # that was not committed to the account table.
+                self.db.execute("UPDATE contributions SET state='uncertain',secret=NULL WHERE state='exchanging'")
+                self.db.execute("UPDATE contributions SET state='expired',secret=NULL WHERE state='pending' AND expires<=?", (self.clock(),))
         except Exception:
             self.close()
             raise
@@ -225,6 +242,133 @@ class Coordinator:
             if not self.db.execute("UPDATE devices SET revoked=1 WHERE id=?", (device_id,)).rowcount:
                 raise PoolError("unknown-device", 404)
             self._audit("device-revoked", device_id)
+
+    def authenticate_device(self, token):
+        """Authenticate without contacting the provider or reading a request body."""
+        if not isinstance(token, str) or not 32 <= len(token) <= 256:
+            raise PoolError("unauthorized", 401)
+        with self.lock:
+            device = self.db.execute("SELECT * FROM devices WHERE token_hash=? AND revoked=0", (digest(token),)).fetchone()
+            if device is None:
+                raise PoolError("unauthorized", 401)
+            return device
+
+    def _expire_contributions(self):
+        with self.db:
+            self.db.execute("UPDATE contributions SET state='expired',secret=NULL WHERE state='pending' AND expires<=?", (self.clock(),))
+
+    def _contribution(self, device_id, contribution_id):
+        if not isinstance(contribution_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", contribution_id):
+            raise PoolError("unknown-contribution", 404)
+        row = self.db.execute("SELECT * FROM contributions WHERE id=? AND device_id=?", (contribution_id, device_id)).fetchone()
+        if row is None:
+            raise PoolError("unknown-contribution", 404)
+        return row
+
+    @staticmethod
+    def _contribution_receipt(row):
+        result = {"contribution_id": row["id"], "state": row["state"], "expires_at": row["expires"]}
+        if row["account_id"] is not None:
+            result["account_id"] = row["account_id"]
+        return result
+
+    def _finish_contribution(self, row, state, account_id=None):
+        # Caller owns the transaction so an account and its receipt are atomic.
+        self.db.execute("UPDATE contributions SET state=?,secret=NULL,account_id=? WHERE id=?", (state, account_id, row["id"]))
+        self._audit("contribution-" + state, row["id"])
+        return self._contribution_receipt(self._contribution(row["device_id"], row["id"]))
+
+    def contribution_start(self, token):
+        with self.lock:
+            device = self.authenticate_device(token)
+            self._expire_contributions()
+            row = self.db.execute("SELECT * FROM contributions WHERE device_id=? AND state='pending'", (device["id"],)).fetchone()
+            if row is None:
+                now = self.clock()
+                counts = self.db.execute("SELECT sum(created>?),count(*) FROM contributions WHERE device_id=? AND created>?",
+                                         (now - 3600, device["id"], now - 86400)).fetchone()
+                if (counts[0] or 0) >= CONTRIBUTION_STARTS_PER_HOUR or counts[1] >= CONTRIBUTION_STARTS_PER_DAY:
+                    raise PoolError("contribution-start-limit", 429)
+                contribution_id = secrets.token_urlsafe(24)
+                secret = {"verifier": secrets.token_urlsafe(48), "state": secrets.token_urlsafe(32)}
+                encrypted = self.cipher.encrypt(json.dumps(secret).encode())
+                # Generate/validate before persisting. This call must be local;
+                # provider traffic begins only after an authorization code.
+                authorization_url = self.provider.authorization_url(secret["verifier"], secret["state"])
+                with self.db:
+                    self.db.execute("INSERT INTO contributions(id,device_id,created,expires,state,secret) VALUES (?,?,?,?,'pending',?)",
+                                    (contribution_id, device["id"], now, now + CONTRIBUTION_TTL, encrypted))
+                    self._audit("contribution-started", contribution_id)
+                row = self._contribution(device["id"], contribution_id)
+            else:
+                secret = json.loads(self.cipher.decrypt(row["secret"]))
+                authorization_url = self.provider.authorization_url(secret["verifier"], secret["state"])
+            return {**self._contribution_receipt(row), "authorization_url": authorization_url}
+
+    def contribution_status(self, token, contribution_id):
+        with self.lock:
+            device = self.authenticate_device(token)
+            self._expire_contributions()
+            return self._contribution_receipt(self._contribution(device["id"], contribution_id))
+
+    def contribution_cancel(self, token, contribution_id):
+        with self.lock:
+            device = self.authenticate_device(token)
+            self._expire_contributions()
+            row = self._contribution(device["id"], contribution_id)
+            if row["state"] == "pending":
+                with self.db:
+                    return self._finish_contribution(row, "cancelled")
+            return self._contribution_receipt(row)
+
+    def contribution_complete(self, token, contribution_id, code):
+        # The single-writer lock covers this exchange just like native refresh.
+        # It also makes duplicate concurrent completions return one receipt.
+        with self.lock:
+            device = self.authenticate_device(token)
+            self._expire_contributions()
+            row = self._contribution(device["id"], contribution_id)
+            if row["state"] != "pending":
+                return self._contribution_receipt(row)
+            secret = json.loads(self.cipher.decrypt(row["secret"]))
+            valid = isinstance(code, str) and len(code) <= CONTRIBUTION_CODE_LIMIT and code.count("#") == 1
+            raw_code, callback_state = code.split("#", 1) if valid else ("", "")
+            valid = (valid and 1 <= len(raw_code) <= 4096 and all(33 <= ord(char) <= 126 for char in raw_code)
+                     and bool(re.fullmatch(r"[A-Za-z0-9_-]{32,128}", callback_state))
+                     and secrets.compare_digest(callback_state, secret["state"]))
+            if not valid:
+                with self.db:
+                    attempts = row["invalid_attempts"] + 1
+                    self.db.execute("UPDATE contributions SET invalid_attempts=? WHERE id=?", (attempts, row["id"]))
+                    if attempts >= CONTRIBUTION_INVALID_ATTEMPTS:
+                        return self._finish_contribution(row, "failed")
+                raise PoolError("invalid-authorization-code")
+            # Commit before the first external call. Do not persist the code.
+            with self.db:
+                self.db.execute("UPDATE contributions SET state='exchanging' WHERE id=?", (row["id"],))
+                self._audit("contribution-exchanging", row["id"])
+            try:
+                credentials = validate_credentials(self.provider.exchange_code(raw_code, secret["verifier"], secret["state"]))
+                if credentials["expires_at"] <= self.clock() + EXPIRY_MARGIN or credentials["account"]["subscriptionType"] not in {"pro", "max", "team", "enterprise"}:
+                    raise PoolError("ineligible-subscription")
+                # exchange_code verifies profile metadata against the grant and
+                # requires a paid native plan. Never trust client-supplied IDs.
+                with self.db:
+                    for account in self.db.execute("SELECT id,secret FROM accounts"):
+                        prior = json.loads(self.cipher.decrypt(account["secret"]))
+                        if prior["account"]["accountUuid"] == credentials["account"]["accountUuid"]:
+                            return self._finish_contribution(row, "duplicate", account["id"])
+                    account_id = "contrib-" + secrets.token_hex(16)
+                    encrypted = self.cipher.encrypt(json.dumps(credentials).encode())
+                    self.db.execute("INSERT INTO accounts(id,secret,generation,state,verified) VALUES (?,?,1,'ready',1)", (account_id, encrypted))
+                    self._audit("account-added", account_id)
+                    return self._finish_contribution(row, "added", account_id)
+            except Exception:
+                # Provider response bodies/errors can carry credential values.
+                # Even validation failure follows a possibly consumed code, so
+                # preserve no grant material and never retry it automatically.
+                with self.db:
+                    return self._finish_contribution(row, "uncertain")
 
     def _quarantine(self, account_id, error):
         with self.db:
@@ -368,27 +512,64 @@ class PoolHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            if self.path not in ("/v1/enroll", "/v1/assignment"):
+            contribution_routes = {
+                "/v1/contributions/start", "/v1/contributions/complete",
+                "/v1/contributions/status", "/v1/contributions/cancel",
+            }
+            if self.path not in {"/v1/enroll", "/v1/assignment"} | contribution_routes:
                 raise PoolError("not-found", 404)
+            token = None
+            if self.path in contribution_routes:
+                auth = self.headers.get_all("Authorization", [])
+                if len(auth) != 1 or not auth[0].startswith("Bearer "):
+                    raise PoolError("unauthorized", 401)
+                token = auth[0][7:]
+                # Reject revoked/unknown devices before parsing any contribution
+                # body, doing cryptography, or making a provider request.
+                self.server.coordinator.authenticate_device(token)
             if self.headers.get("Transfer-Encoding"):
                 raise PoolError("unsupported-transfer-encoding")
-            length = int(self.headers.get("Content-Length", "0"))
+            lengths = self.headers.get_all("Content-Length", [])
+            if len(lengths) != 1:
+                raise PoolError("invalid-body-size", 413)
+            length = int(lengths[0])
             if not 0 < length <= MAX_BODY:
                 raise PoolError("invalid-body-size", 413)
-            body = json.loads(self.rfile.read(length))
+            def unique_object(pairs):
+                value = {}
+                for key, item in pairs:
+                    if key in value:
+                        raise PoolError("invalid-body")
+                    value[key] = item
+                return value
+            body = json.loads(self.rfile.read(length), object_pairs_hook=unique_object)
             if not isinstance(body, dict):
                 raise PoolError("invalid-body")
             if self.path == "/v1/enroll":
                 if set(body) != {"invitation", "device_name"}:
                     raise PoolError("invalid-body")
                 result = self.server.coordinator.enroll(body["invitation"], body["device_name"])
-            else:
+            elif self.path == "/v1/assignment":
                 if body:
                     raise PoolError("invalid-body")
                 auth = self.headers.get("Authorization", "")
                 if not auth.startswith("Bearer "):
                     raise PoolError("unauthorized", 401)
                 result = self.server.coordinator.assignment(auth[7:])
+            elif self.path == "/v1/contributions/start":
+                if body:
+                    raise PoolError("invalid-body")
+                result = self.server.coordinator.contribution_start(token)
+            elif self.path == "/v1/contributions/complete":
+                if set(body) != {"contribution_id", "code"}:
+                    raise PoolError("invalid-body")
+                result = self.server.coordinator.contribution_complete(token, body["contribution_id"], body["code"])
+            else:
+                if set(body) != {"contribution_id"}:
+                    raise PoolError("invalid-body")
+                method = (self.server.coordinator.contribution_cancel if self.path.endswith("/cancel")
+                          else self.server.coordinator.contribution_status)
+                result = method(token, body["contribution_id"])
             self._reply(200, result)
         except PoolError as exc:
             self._reply(exc.status, {"error": exc.code})

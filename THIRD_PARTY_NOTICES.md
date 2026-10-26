@@ -10,7 +10,10 @@ The experimental `team_pool` package is a separate coordinator and client. Its
 OAuth endpoint conventions, native credential format, and cooperative lock
 paths were informed by claude-swap's `oauth.py`, `credentials.py`, and
 `claude_locks.py`. The same upstream attribution and MIT notice apply to that
-reference material. The pilot does not vendor claude-swap or modify its install.
+reference material. Contribution authorization endpoints, PKCE parameters,
+scopes, and profile metadata mappings were checked against the native Claude
+Code 2.1.300 flow. These are observed interoperability details, not a supported
+public integration API. The pilot does not vendor claude-swap or modify its install.
 
 The pilot also depends on `cryptography` and, on macOS, `keyring`. Their licenses
 are included in the installed distributions; see [cryptography](https://github.com/pyca/cryptography)

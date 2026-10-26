@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 try:
     from cryptography import x509
@@ -21,6 +22,8 @@ except ImportError:
 from team_pool.client import Client, PausedError, RequestError
 from team_pool.native import NativeStore, NATIVE_SERVICE
 from team_pool.server import Coordinator, PoolHTTPServer
+from team_pool.contribute import Contribution
+from team_pool.provider import Provider
 
 
 class MemoryKeychain:
@@ -52,6 +55,7 @@ class FakeAnthropic:
         self.grants = {"a": 0, "b": 0}
         self.credentials = {}
         self.token_accounts = {}
+        self.exchanges = []
         for account in ("a", "b"):
             item = {
                 "access_token": "synthetic-access-" + account,
@@ -67,6 +71,13 @@ class FakeAnthropic:
             }
             self.credentials[account] = item
             self.token_accounts[item["access_token"]] = account
+
+    def authorization_url(self, verifier, state):
+        return Provider().authorization_url(verifier, state)
+
+    def exchange_code(self, code, verifier, state):
+        self.exchanges.append((code, verifier, state))
+        return dict(self.credentials[code[-1]])
 
     def identity(self, token):
         return self.credentials[self.token_accounts[token]]["account"]
@@ -200,6 +211,72 @@ class TwoMacPilotTests(unittest.TestCase):
             with self.assertRaises(RequestError):
                 Transport(self.url).post("/v1/enroll", {
                     "invitation": self.pool.invite(), "device_name": "untrusted"})
+
+    def test_teammates_contribute_over_https_then_share_and_renew_native_pool(self):
+        # Start with no admin-imported accounts: teammates populate the pool.
+        with self.pool.lock, self.pool.db:
+            self.pool.db.execute("DELETE FROM accounts")
+        one, two = self.clients
+        originals = [client.native.snapshot() for client in self.clients]
+        flow_one, flow_two = Contribution(one), Contribution(two)
+        first = flow_one.start()
+        state = parse_qs(urlsplit(first["authorization_url"]).query)["state"][0]
+        added = flow_one.complete(first["contribution_id"], "synthetic-code-a#" + state)
+        self.assertEqual(added["state"], "added")
+        self.assertEqual(flow_one.inspect(), added)
+        self.assertEqual([client.native.snapshot() for client in self.clients], originals)
+        self.assertEqual(len(self.provider.exchanges), 1)
+
+        # A different Mac can use the contribution without receiving its refresh token.
+        for client in self.clients:
+            self.assertEqual(client.sync(take_over_native_store=True)["account_id"], added["account_id"])
+        before = [client.native.snapshot() for client in self.clients]
+        second = flow_two.start()
+        state = parse_qs(urlsplit(second["authorization_url"]).query)["state"][0]
+        new = flow_two.complete(second["contribution_id"], "synthetic-code-b#" + state)
+        self.assertEqual(new["state"], "added")
+        self.assertEqual([client.native.snapshot() for client in self.clients], before)
+        self.assertEqual(len(self.pool.accounts()), 2)
+
+        # Both switch to the fresh account when the first reaches the threshold.
+        self.provider.usage_pct["a"] = 95
+        self.clock.now += 121
+        for client in self.clients:
+            self.assertEqual(client.sync()["account_id"], new["account_id"])
+        self.clock.now += 3200
+        for client in self.clients:
+            client.sync()
+            name = client.native.username
+            native = json.loads(client.native.backend.get_password(NATIVE_SERVICE, name))
+            self.assertNotIn("refreshToken", native["claudeAiOauth"])
+            self.assertEqual(native["claudeAiOauth"]["accessToken"], "synthetic-access-b-1")
+            self.assertEqual(native["mcpOAuth"]["private"], "local-mcp-" + name)
+            self.assertEqual(json.loads(client.native.config.read_text())["projects"], {"local": name})
+            self.assertNotIn("synthetic-code", client.config.read_text())
+        self.assertEqual(self.provider.grants, {"a": 1, "b": 1})
+
+    def test_contribution_lost_response_recovers_receipt_over_https(self):
+        one = self.clients[0]
+        flow = Contribution(one)
+        operation = flow.start()
+        state = parse_qs(urlsplit(operation["authorization_url"]).query)["state"][0]
+        # Inject a lost response AFTER the real HTTPS endpoint commits its receipt.
+        real = one._transport(one._load())
+        class LostResponse:
+            def post(self, path, body, token=None):
+                result = real.post(path, body, token)
+                if path.endswith("complete"):
+                    raise RequestError()
+                return result
+        one.transport = LostResponse()
+        from team_pool.client import ClientError
+        with self.assertRaises(ClientError):
+            flow.complete(operation["contribution_id"], "synthetic-code-a#" + state)
+        receipt = flow.inspect()
+        self.assertEqual(receipt["state"], "duplicate")
+        self.assertEqual(receipt["account_id"], "a")
+        self.assertEqual(len(self.provider.exchanges), 1)
+        self.assertEqual(len(self.pool.accounts()), 2)
 
 
 if __name__ == "__main__":
