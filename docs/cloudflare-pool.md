@@ -6,8 +6,9 @@ Worker, database, encryption key, administrator credential, and invitations.
 Claude Share's rooms, containers, routes, and authentication are not involved.
 
 This is the experimental two-Mac pilot. Automated tests use fake provider
-credentials; real authorization, provider renewal, and Desktop continuity must
-still pass the [acceptance worksheet](team-pilot-acceptance.md).
+credentials. Real browser authorization has succeeded on the first Mac; provider
+renewal and Desktop continuity on both Macs remain in the
+[acceptance worksheet](team-pilot-acceptance.md).
 
 ## What Cloudflare handles
 

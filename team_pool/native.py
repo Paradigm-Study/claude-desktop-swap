@@ -157,8 +157,8 @@ class NativeStore:
             if os.geteuid() == 0:
                 raise NativeStoreError("Run the native pilot agent as the logged-in user, without sudo.")
             try:
-                from keyring.backends.macOS import Keyring
-                backend = Keyring()
+                from .macos_keychain import MacOSKeychain
+                backend = MacOSKeychain()
             except ImportError:
                 raise NativeStoreError("Install the pilot's macOS keyring dependency first.") from None
         self.backend = backend

@@ -10,8 +10,10 @@ assigned native credentials. After enrollment, `team-pool-client contribute-acco
 opens Claude authorization in the browser; the coordinator owns the new refresh
 credentials. Contribution leaves the existing local native login and Desktop
 profile in place. Start with the [pilot runbook](docs/team-pilot.md). It uses direct
-subscription inference; live browser authorization and interoperability on two
-actual Macs still need validation. Local `cswap add` does not share an account,
+subscription inference. Live browser contributions have succeeded against the
+Cloudflare coordinator; interoperability on two actual Macs remains under
+validation in the [acceptance worksheet](docs/team-pilot-acceptance.md).
+Local `cswap add` does not share an account,
 and this does not automatically upload your existing local pool. Do not run local
 `cswap` rotation and the team agent against the same native store.
 
