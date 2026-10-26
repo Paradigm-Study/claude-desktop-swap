@@ -15,9 +15,9 @@ private prompts, account emails, or session identifiers.
 | Account contributed by Mac B serves a native turn on Mac A | Pending | Pending | |
 | Contribution status recovers a lost completion response | Pending | Pending | |
 | Pending contribution cancellation | Passed | Pending | Live contribution start/cancel exercised before real authorization. |
-| Initial native turn | Bundled CLI passed; Desktop UI pending | Pending | Auth reports claude.ai / firstParty / max. Normal-speed Sonnet returned OK in 9.1 s with tools/hooks disabled and no session persistence. |
-| Existing conversation retained | Pending | Pending | |
-| No refresh/trusted-device token delivered | Passed | Pending | Assignment contains access token only; native-store verification follows activation. |
+| Initial native turn | Passed | Pending | Auth reports claude.ai / firstParty / max. Normal-speed Sonnet returned OK in 9.1 s; user also confirmed a successful Desktop message after restart. |
+| Existing conversation retained | Passed | Pending | User confirmed existing conversations remained available and a resumed conversation worked. |
+| No refresh/trusted-device token delivered | Passed | Pending | Assignment and active native-store verification confirm access-only credentials; recovery backup retained separately. |
 | Contributed-account refresh occurs only on coordinator | Pending | Pending | |
 | Real provider-token refresh followed by successful turn | Pending | Pending | |
 | Quota-based account switch in same conversation | Pending | Pending | |
