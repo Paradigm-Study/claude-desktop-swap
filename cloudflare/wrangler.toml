@@ -1,0 +1,24 @@
+name = "claude-desktop-pool"
+main = "src/worker.mjs"
+compatibility_date = "2026-10-19"
+workers_dev = true
+preview_urls = false
+
+[observability]
+enabled = false
+
+[vars]
+POOL_SWITCH_THRESHOLD = "98"
+
+[[durable_objects.bindings]]
+name = "POOL"
+class_name = "PoolObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PoolObject"]
+
+[[ratelimits]]
+name = "ENROLL_LIMIT"
+namespace_id = "72330"
+simple = { limit = 10, period = 60 }

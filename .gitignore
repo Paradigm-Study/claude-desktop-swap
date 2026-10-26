@@ -20,3 +20,6 @@ dist/
 *.pem
 *.key
 *.invite
+node_modules/
+.wrangler/
+.dev.vars*

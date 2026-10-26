@@ -30,7 +30,12 @@ already delivered. The same native credential store can affect terminal Claude
 Code. Account resource permissions and quota remain shared. See the design's
 trust boundary and credential-use restrictions before provisioning accounts.
 
-The coordinator is deliberately small: one process, local administration, no
+For managed hosting, use the [Cloudflare coordinator runbook](cloudflare-pool.md)
+instead of sections 2–3 below. It preserves the same Mac client API with a
+single SQLite Durable Object and authenticated remote administration. The
+local Python coordinator remains an alternative.
+
+The local Python coordinator is deliberately small: one process, local administration, no
 web dashboard, no administrator network endpoint. Enrolled devices can contribute
 accounts while it runs. Stop it before running local admin commands, then restart
 it. Clients retain their last token while it is valid.
@@ -58,10 +63,13 @@ Stop any foreground `cswap auto` loops as well. If the existing menu-bar
 LaunchAgent is installed and loaded, unload it before enrolling:
 
 ```sh
+launchctl disable "gui/$(id -u)/com.cswap.menubar"
 launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.cswap.menubar.plist"
 ```
 
 Do not delete saved accounts or log out of a shared provider account to do this.
+Disabling the service prevents it from returning at login and competing with the
+team agent. Re-enable it only after leaving and restoring the personal setup.
 Keep personal settings, project histories, and the Desktop login in place.
 
 ## 2. Initialize the coordinator
