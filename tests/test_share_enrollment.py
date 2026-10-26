@@ -161,7 +161,8 @@ class ShareEnrollmentTests(unittest.TestCase):
         result = subprocess.run([sys.executable, "-m", "team_pool.client", "--config", str(self.home / "missing.json"),
                                  "link-share"], env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
-        self.assertIn("existing active pool enrollment", result.stderr)
+        expected = "existing active pool enrollment" if sys.platform == "darwin" else "requires macOS"
+        self.assertIn(expected, result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
 

@@ -675,6 +675,8 @@ def main(argv=None):
     contribution_options.add_argument("--cancel", action="store_true", help="Cancel a pending contribution login")
     args = parser.parse_args(argv)
     try:
+        if sys.platform != "darwin":
+            raise ClientError("The native pool client requires macOS.")
         client = Client(args.config)
         if args.command == "enroll":
             invitation = _private_read(args.invitation_file).decode().strip() if args.invitation_file else getpass.getpass("Single-use invitation: ")
