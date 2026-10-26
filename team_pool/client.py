@@ -93,7 +93,8 @@ class Transport:
                         "/v1/contributions/complete", "/v1/contributions/status",
                         "/v1/contributions/cancel"):
             raise ClientError("Unknown coordinator endpoint.")
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        headers = {"Content-Type": "application/json", "Accept": "application/json",
+                   "User-Agent": "claude-desktop-swap-pilot/1"}
         if token is not None:
             headers["Authorization"] = "Bearer " + token
         request = urllib.request.Request(

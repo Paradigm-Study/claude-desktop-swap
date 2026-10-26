@@ -55,7 +55,8 @@ class Admin:
     def post(self, path, body):
         request = urllib.request.Request(self.server + path, method="POST",
             data=json.dumps(body).encode(), headers={"Content-Type": "application/json",
-            "Authorization": "Bearer " + self.token, "Accept": "application/json"})
+            "Authorization": "Bearer " + self.token, "Accept": "application/json",
+            "User-Agent": "claude-desktop-swap-pilot/1"})
         try:
             with self.opener.open(request, timeout=75) as response:
                 raw = response.read(65537)
