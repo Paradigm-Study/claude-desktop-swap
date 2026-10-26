@@ -7,8 +7,10 @@ private prompts, account emails, or session identifiers.
 
 | Check | Mac A | Mac B | Evidence / observed limitation |
 | --- | --- | --- | --- |
-| macOS / Desktop / bundled Code version | 27.0.1 / 3.6556.2 / 2.1.308 | Pending | Client 0.1.0a5; Cloudflare coordinator. |
-| One-time enrollment | Passed | Pending | One-use invite redeemed; device token stored in Keychain. |
+| macOS / Desktop / bundled Code version | 27.0.1 / 3.6556.2 / 2.1.308 | Pending | Client 0.1.0a6; Cloudflare coordinator. |
+| One-time enrollment | Passed | Pending | Original invite enrollment linked to live Paradigm Share membership; same device token retained. |
+| Share membership enrollment without an invitation | Passed | Pending | Saved Share sign-in enrolled a temporary device, delivered an access-only assignment, rejected grant replay, and rejected delivery after test-device revocation. |
+| Membership linking preserves native login and Desktop profile | Passed | Pending | Native fingerprint, device ID, and original Desktop profile unchanged by linking; background sync active. |
 | Browser contribution from each Mac | Passed | Pending | Two real accounts contributed from Mac A through fresh authorization. |
 | Contribution preserves native login and Desktop profile | Passed | Pending | Native fingerprint unchanged by contribution; Desktop profile unchanged after activation/restart. |
 | Existing provider sessions survive fresh-lineage authorization | Pending | Pending | |
@@ -57,3 +59,18 @@ The live coordinator correctly excluded Account A at 100% weekly utilization and
 assigned Account B with available quota. This establishes quota selection, not
 an account switch during an existing Desktop conversation. No real provider-token
 refresh, sleep/wake cycle, or two-Mac continuity result has been claimed.
+
+Organization enrollment was deployed and verified on October 26, 2026. The
+existing directory continued serving its previous code for about six minutes
+after the public Worker reported the new version; live enrollment passed after
+propagation without resetting data or changing routes. Client 0.1.0a6 linked
+Mac A through its existing Share sign-in. A subsequent native authentication
+check reported claude.ai / firstParty / max in 0.13 s, and a normal-speed Sonnet
+turn returned OK in 2.14 s. This is a bundled Code check; the user's earlier
+Desktop conversation-continuity confirmation remains the UI evidence.
+
+All five saved accounts are now identity- and usage-verified in the shared pool.
+Three had quota at verification; two were weekly-exhausted. Four old Claude
+proxy registrations and the three transferred personal refresh lineages were
+retired before coordinator ownership. Codex's proxy stayed running. Retired
+credential snapshots are private recovery evidence, not active refresh owners.
