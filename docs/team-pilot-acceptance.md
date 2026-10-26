@@ -7,7 +7,7 @@ private prompts, account emails, or session identifiers.
 
 | Check | Mac A | Mac B | Evidence / observed limitation |
 | --- | --- | --- | --- |
-| macOS / Desktop / bundled Code version | 27.0.1 / 3.6556.2 / 2.1.308 | Pending | Client 0.1.0a4; Cloudflare coordinator. |
+| macOS / Desktop / bundled Code version | 27.0.1 / 3.6556.2 / 2.1.308 | Pending | Client 0.1.0a5; Cloudflare coordinator. |
 | One-time enrollment | Passed | Pending | One-use invite redeemed; device token stored in Keychain. |
 | Browser contribution from each Mac | Passed | Pending | Two real accounts contributed from Mac A through fresh authorization. |
 | Contribution preserves native login and Desktop profile | Passed | Pending | Native fingerprint unchanged by contribution; Desktop profile unchanged after activation/restart. |
@@ -15,7 +15,7 @@ private prompts, account emails, or session identifiers.
 | Account contributed by Mac B serves a native turn on Mac A | Pending | Pending | |
 | Contribution status recovers a lost completion response | Pending | Pending | |
 | Pending contribution cancellation | Passed | Pending | Live contribution start/cancel exercised before real authorization. |
-| Initial native turn | Passed | Pending | Auth reports claude.ai / firstParty / max. Normal-speed Sonnet returned OK in 9.1 s; user also confirmed a successful Desktop message after restart. |
+| Initial native turn | Passed | Pending | Auth reports claude.ai / firstParty / max. Normal-speed Sonnet returned OK in 2.1 s after the a5 repair; user previously confirmed a successful Desktop message after restart. |
 | Existing conversation retained | Passed | Pending | User confirmed existing conversations remained available and a resumed conversation worked. |
 | No refresh/trusted-device token delivered | Passed | Pending | Assignment and active native-store verification confirm access-only credentials; recovery backup retained separately. |
 | Contributed-account refresh occurs only on coordinator | Pending | Pending | |
@@ -36,11 +36,22 @@ an incompatible policy would need bypassing, or a user's manual login is overwri
 
 Observed during activation: the previous Keyring setter attempted to delete and
 recreate an existing native item; macOS rejected it with OSStatus -25244. Its
-original fingerprint and recovery backup remained intact. Client 0.1.0a4 updates
-the data in place with SecItemUpdate, and adds only when absent. The first sync
-then succeeded in 50.2 s. The background LaunchAgent is active, and the personal
-selector is unloaded and disabled. Native Keychain reads remain relatively slow
-on Mac A; polling and provider caching are not an immediate per-request failover.
+original fingerprint and recovery backup remained intact. Client 0.1.0a4's
+SecItemUpdate correction allowed initial activation in 50.2 s, but failed the
+sustained user experience: repeated approval prompts returned. Those timings
+must not be treated as evidence of intrinsically slow Keychain reads.
+
+The [Keychain investigation](keychain-access.md) established that each Python
+data write reset the partition permission needed by Desktop's security tool.
+The native item was repaired through Apple's security tool with identical
+credential contents; write and read each took about 0.02 s, and the bundled Code
+authentication check completed in 0.14 s. Client 0.1.0a5 is installed and its
+LaunchAgent is running. A live guarded sync completed in 0.77 s with zero native
+writes for an unchanged assignment. A subsequent authentication check completed
+in 0.13 s and a normal-speed native turn returned OK in 2.1 s. Sustained Desktop
+prompt behavior still requires user confirmation; these checks do not establish
+that every existing dialog has closed. The separate shared status menu is
+installed and running; the personal selector remains unloaded and disabled.
 
 The live coordinator correctly excluded Account A at 100% weekly utilization and
 assigned Account B with available quota. This establishes quota selection, not

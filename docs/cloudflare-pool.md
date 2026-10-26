@@ -135,10 +135,15 @@ If the pool is empty, contribute its first account before syncing. Otherwise:
 .venv/bin/team-pool-client sync --once --take-over-native-store
 .venv/bin/team-pool-client service-install
 .venv/bin/team-pool-client status
+python3 scripts/install_team_status.py install
 ```
 
 Reopen Desktop and resume an existing local Code conversation. Verify a harmless
 normal-speed turn. A running service alone does not prove Desktop interoperability.
+The separate [Claude Swap menu bar](team-status-menu.md) shows shared-pool status
+without accessing credentials or running a second account selector.
+Use client 0.1.0a5 or newer; earlier pilot clients could repeatedly undo Keychain
+approval. See [Keychain recovery and writer limits](keychain-access.md).
 
 ## Contribute an account from any enrolled Mac
 

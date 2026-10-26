@@ -5,7 +5,8 @@ import sys
 import unittest
 
 from team_pool.macos_keychain import (
-    ITEM_NOT_FOUND, KeychainWriteError, MacOSKeychain, _SecurityAPI,
+    ITEM_NOT_FOUND, KeychainInteractionError, KeychainWriteError, MacOSKeychain,
+    _SecurityAPI, access_required_status,
 )
 
 
@@ -29,6 +30,13 @@ class FakeAPI:
         self.update_status = update_status
         self.add_status = add_status
         self.calls = []
+        self.interaction_allowed = True
+
+    def get_user_interaction_allowed(self):
+        return self.interaction_allowed
+
+    def set_user_interaction_allowed(self, allowed):
+        self.interaction_allowed = allowed
 
     def update(self, service, username, data):
         self.calls.append(("update", service, username, data))
@@ -93,6 +101,31 @@ class MacOSKeychainTests(unittest.TestCase):
         backend.delete_password("service", "user")
         self.assertEqual(reader.calls, [("get", "service", "user"), ("delete", "service", "user")])
         self.assertEqual(api.calls, [])
+
+    def test_noninteractive_scope_covers_reader_writer_and_restores_previous_policy(self):
+        backend, reader, api = self.make_backend()
+        # The same process policy must cover the independently implemented reader.
+        reader.get_password = lambda *args: api.interaction_allowed
+        for previous in (True, False):
+            api.interaction_allowed = previous
+            with self.assertRaisesRegex(RuntimeError, "synthetic exit"):
+                with backend.noninteractive():
+                    self.assertFalse(backend.get_password("service", "user"))
+                    backend.set_password("service", "user", "fake-value")
+                    self.assertFalse(api.interaction_allowed)
+                    raise RuntimeError("synthetic exit")
+            self.assertEqual(api.interaction_allowed, previous)
+
+    def test_numeric_denial_is_recovered_from_chained_keyring_exception_without_parsing_text(self):
+        for status in (-25308, -128, -25293):
+            error = RuntimeError("FAKE_SECRET_MUST_NOT_ESCAPE")
+            error.__cause__ = RuntimeError(status, "FAKE_SECRET_MUST_NOT_ESCAPE")
+            self.assertEqual(access_required_status(error), status)
+        self.assertIsNone(access_required_status(RuntimeError("Secret text including -25308")))
+        self.assertIsNone(access_required_status(RuntimeError(-25300, "Item not found")))
+        cycle = RuntimeError("cycle")
+        cycle.__cause__ = cycle
+        self.assertIsNone(access_required_status(cycle))
 
 
 class CFConstructionTests(unittest.TestCase):
@@ -164,6 +197,23 @@ class CFConstructionTests(unittest.TestCase):
         with self.assertRaises(MemoryError):
             self.api.update("service", "user", b"fake")
         self.assertEqual(self.values, {})
+
+    def test_process_ui_policy_uses_boolean_pointer_and_refuses_api_failure(self):
+        def get_policy(destination):
+            ctypes.cast(destination, ctypes.POINTER(ctypes.c_ubyte))[0] = 1
+            return 0
+        self.api._get_interaction = get_policy
+        self.assertTrue(self.api.get_user_interaction_allowed())
+        values = []
+        self.api._set_interaction = lambda allowed: values.append(allowed) or 0
+        self.api.set_user_interaction_allowed(False)
+        self.assertEqual(values, [False])
+        self.api._set_interaction = lambda allowed: -50
+        with self.assertRaises(KeychainInteractionError):
+            self.api.set_user_interaction_allowed(False)
+        self.api._get_interaction = lambda destination: -50
+        with self.assertRaises(KeychainInteractionError):
+            self.api.get_user_interaction_allowed()
 
     @unittest.skipUnless(sys.platform == "darwin", "CoreFoundation is macOS-only")
     def test_real_cf_bindings_preserve_unicode_and_large_binary_data_without_keychain(self):

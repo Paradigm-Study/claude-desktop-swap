@@ -1,9 +1,10 @@
-"""Update existing macOS Keychain items without replacing their ownership or ACL.
+"""Use the same Apple writer as Claude for its native credential item.
 
 keyring 25.7's macOS setter deletes and re-adds an item. Claude's existing
 credential item can reject that deletion even when updating its data is allowed.
-Only an item-not-found result permits adding a new item here. All secret data
-stays in process memory; the Security API never receives a shell command.
+Private pilot items use data-only Security API updates. The native item uses
+security(1): a Python data write changes its partition ACL to Python's identity
+and causes Claude's security(1) reader to request approval again.
 """
 
 from __future__ import annotations
@@ -13,6 +14,24 @@ from contextlib import ExitStack, contextmanager
 
 
 ITEM_NOT_FOUND = -25300
+ACCESS_REQUIRED = frozenset({-25308, -128, -25293})
+
+
+def access_required_status(error):
+    """Read numeric OSStatus only, including keyring's chained API exception.
+
+    Backend messages can contain secrets. Never parse or expose their text.
+    """
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        status = getattr(error, "status", None)
+        if type(status) is int and status in ACCESS_REQUIRED:
+            return status
+        if error.args and type(error.args[0]) is int and error.args[0] in ACCESS_REQUIRED:
+            return error.args[0]
+        error = error.__cause__ or error.__context__
+    return None
 
 
 class KeychainWriteError(RuntimeError):
@@ -21,24 +40,41 @@ class KeychainWriteError(RuntimeError):
         super().__init__(f"Keychain write failed (OSStatus {self.status}).")
 
 
-class MacOSKeychain:
-    """Keyring-compatible adapter with an atomic, data-only setter."""
+class KeychainInteractionError(RuntimeError):
+    """The process could not establish its required Keychain UI policy."""
 
-    def __init__(self, *, reader=None, api=None):
+
+class MacOSKeychain:
+    """Keep native credentials on Apple's identity and pilot secrets on Python.
+
+    Do not route the native item back through SecItemUpdate: that failed approach
+    replaces its partition ACL with Python's identity even without deleting it.
+    """
+
+    def __init__(self, *, reader=None, api=None, native_cli=None):
         if reader is None:
             from keyring.backends.macOS import Keyring
             reader = Keyring()
         self._reader = reader
         self._api = api if api is not None else _SecurityAPI()
+        from .native_security import NativeSecurityCLI
+        self._native_cli = native_cli or NativeSecurityCLI(self._api)
+        self._background = False
 
     def get_password(self, service, username):
+        if service == "Claude Code-credentials":
+            return self._native_cli.get_password(username, background=self._background)
         return self._reader.get_password(service, username)
 
     def delete_password(self, service, username):
+        if service == "Claude Code-credentials":
+            return self._native_cli.delete_password(username, background=self._background)
         # Explicit removal is used when leaving the pilot, never during set.
         return self._reader.delete_password(service, username)
 
     def set_password(self, service, username, password):
+        if service == "Claude Code-credentials":
+            return self._native_cli.set_password(username, password, background=self._background)
         username = "" if username is None else username
         data = password.encode("utf-8")
         status = self._api.update(service, username, data)
@@ -46,6 +82,24 @@ class MacOSKeychain:
             status = self._api.add(service, username, data)
         if status != 0:
             raise KeychainWriteError(status)
+
+    def validate_password(self, service, username, password):
+        if service == "Claude Code-credentials":
+            self._native_cli.validate_password(username, password)
+
+    @contextmanager
+    def noninteractive(self):
+        # Private pilot items use this process-wide flag. The native security(1)
+        # child does not inherit it and gets a separate metadata/ACL preflight.
+        previous = self._api.get_user_interaction_allowed()
+        self._api.set_user_interaction_allowed(False)
+        previous_background = self._background
+        self._background = True
+        try:
+            yield
+        finally:
+            self._background = previous_background
+            self._api.set_user_interaction_allowed(previous)
 
 
 class _SecurityAPI:
@@ -62,6 +116,12 @@ class _SecurityAPI:
                                   pointer, pointer)
         self._add = self._bind(self._security, "SecItemAdd", ctypes.c_int32,
                                pointer, pointer)
+        self._get_interaction = self._bind(
+            self._security, "SecKeychainGetUserInteractionAllowed", ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_ubyte))
+        self._set_interaction = self._bind(
+            self._security, "SecKeychainSetUserInteractionAllowed", ctypes.c_int32,
+            ctypes.c_ubyte)
         self._string = self._bind(self._cf, "CFStringCreateWithBytes", pointer,
                                   pointer, pointer, index, ctypes.c_uint32,
                                   ctypes.c_ubyte)
@@ -85,6 +145,16 @@ class _SecurityAPI:
     def _constant(self, name):
         # Exported constants belong to the framework and must not be released.
         return ctypes.c_void_p.in_dll(self._security, name).value
+
+    def get_user_interaction_allowed(self):
+        allowed = ctypes.c_ubyte()
+        if self._get_interaction(ctypes.byref(allowed)) != 0:
+            raise KeychainInteractionError("Could not read the process Keychain interaction policy.")
+        return bool(allowed.value)
+
+    def set_user_interaction_allowed(self, allowed):
+        if self._set_interaction(bool(allowed)) != 0:
+            raise KeychainInteractionError("Could not set the process Keychain interaction policy.")
 
     @contextmanager
     def _owned(self, reference):

@@ -20,6 +20,8 @@ and this does not automatically upload your existing local pool. Do not run loca
 The coordinator can also use [Cloudflare Workers and a SQLite Durable Object](docs/cloudflare-pool.md),
 with its own storage and secrets in an existing Cloudflare account. Teammates use
 the same Mac client and native subscription mode; no always-on Mac is required.
+The team client has a separate [Claude Swap status menu bar](docs/team-status-menu.md);
+keep the personal `cswap` rotator stopped while using the shared pool.
 
 **Experimental, unofficial, and macOS only.** The integration was exercised with Desktop's bundled Claude Code 2.1.293 and 2.1.295. Its launcher configuration is version-sensitive; compatibility with future Desktop releases is not guaranteed. This project is not affiliated with Anthropic or the upstream claude-swap maintainers.
 

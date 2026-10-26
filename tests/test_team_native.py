@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from team_pool.native import (
     NATIVE_SERVICE, PILOT_SERVICE, NativeDriftError, NativePolicyError,
-    NativeStore, NativeStoreError,
+    NativeKeychainAccessError, NativePayloadError, NativeStore, NativeStoreError,
 )
 
 NOW = 1_900_000_000
@@ -155,6 +155,39 @@ class NativeStoreTests(unittest.TestCase):
         self.assertEqual(self.current_credentials(), changed)
         self.assertFalse(self.store.snapshot()["has_backup"])
 
+    def test_unchanged_plan_still_validates_backup_policy_and_drift_without_writes(self):
+        fingerprint = self.activate()
+        saved_keychain = dict(self.backend.items)
+        saved_config = self.store.config.read_bytes()
+        self.assertEqual(self.store.plan(assignment(), fingerprint),
+                         dict.fromkeys(("before", "keychain_only", "after"), fingerprint))
+        self.assertEqual(self.backend.items, saved_keychain)
+        self.assertEqual(self.store.config.read_bytes(), saved_config)
+        with self.assertRaises(NativeDriftError):
+            self.store.plan(assignment(), "a" * 64)
+        settings = self.store.claude / "settings.json"
+        settings.write_text('{"forceLoginOrgUUID":"other-organization"}')
+        with self.assertRaises(NativePolicyError):
+            self.store.plan(assignment(), fingerprint)
+        settings.unlink()
+        self.backend.delete_password(PILOT_SERVICE, "pilot-test:native-backup")
+        with self.assertRaisesRegex(NativeStoreError, "No enrollment backup"):
+            self.store.plan(assignment(), fingerprint)
+
+    def test_complete_native_payload_limit_is_checked_before_any_backup_or_write(self):
+        from team_pool.native_security import write_command
+        credentials = self.current_credentials()
+        credentials["pluginSecrets"] = {"large": "fake-plugin-secret-" * 400}
+        self.backend.set_password(NATIVE_SERVICE, "pilot-test", json.dumps(credentials))
+        self.backend.validate_password = lambda service, username, value: write_command(username, value)
+        before = self.store.snapshot()["fingerprint"]
+        for operation in (self.store.plan, self.store.apply):
+            with self.assertRaises(NativePayloadError):
+                operation(assignment(), before, initialize=True)
+            self.assertEqual(self.current_credentials(), credentials)
+            self.assertFalse(self.store.snapshot()["has_backup"])
+            self.assertEqual(json.loads(self.store.config.read_text()), self.old_config)
+
     def test_explicit_restore_can_recover_journaled_keychain_only_interruption(self):
         before = self.store.snapshot()["fingerprint"]
         plan = self.store.plan(assignment(), before, initialize=True)
@@ -217,6 +250,28 @@ class NativeStoreTests(unittest.TestCase):
         self.assertNotIn("FAKE_SECRET", str(failure.exception))
         self.assertEqual(self.current_credentials(), self.old_credentials)
         self.assertEqual(json.loads(self.store.config.read_text()), self.old_config)
+
+    def test_keychain_access_denials_remain_typed_but_never_include_backend_text(self):
+        from team_pool.macos_keychain import KeychainWriteError
+        for status in (-25308, -128, -25293):
+            wrapped = RuntimeError("FAKE_SECRET_FROM_BACKEND")
+            wrapped.__cause__ = RuntimeError(status, "FAKE_SECRET_FROM_API")
+            with self.subTest(status=status, operation="read"), \
+                    patch.object(self.backend, "get_password", side_effect=wrapped):
+                with self.assertRaises(NativeKeychainAccessError) as raised:
+                    self.store.snapshot()
+                self.assertEqual(raised.exception.status, status)
+                self.assertNotIn("FAKE_SECRET", str(raised.exception))
+            with self.subTest(status=status, operation="write"), \
+                    patch.object(self.backend, "set_password", side_effect=KeychainWriteError(status)):
+                with self.assertRaises(NativeKeychainAccessError) as raised:
+                    self.store.set_secret("device-token", "FAKE_SECRET_INPUT")
+                self.assertEqual(raised.exception.status, status)
+                self.assertNotIn("FAKE_SECRET", str(raised.exception))
+            with self.subTest(status=status, operation="delete"), \
+                    patch.object(self.backend, "delete_password", side_effect=wrapped):
+                with self.assertRaises(NativeKeychainAccessError):
+                    self.store._set(NATIVE_SERVICE, "pilot-test", None)
 
     def test_config_failure_rolls_back_immediate_native_change(self):
         with patch.object(self.store, "_write_config", side_effect=OSError("disk full")):

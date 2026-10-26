@@ -1,6 +1,7 @@
 """Client lifecycle tests use temporary state, fake Keychains and local HTTP only."""
 
 import copy
+from contextlib import contextmanager
 import hashlib
 import io
 import json
@@ -15,7 +16,7 @@ import unittest
 from unittest.mock import patch
 
 from team_pool import client
-from team_pool.native import NativeDriftError, NativePolicyError
+from team_pool.native import NativeDriftError, NativeKeychainAccessError, NativePayloadError, NativePolicyError, NativeStoreError
 
 
 INVITE = "fixture-invitation-never-live"
@@ -44,6 +45,15 @@ class FakeNative:
         self.writes = []
         self.race = False
         self.partial_write = False
+        self.interaction_allowed = True
+
+    @contextmanager
+    def noninteractive(self):
+        self.interaction_allowed = False
+        try:
+            yield
+        finally:
+            self.interaction_allowed = True
 
     def preflight(self):
         pass
@@ -238,11 +248,105 @@ class ClientLifecycleTests(unittest.TestCase):
         self.enroll()
         for changes in ({"expires_at": 999}, {"expires_at": float("nan")},
                         {"renew_after": -1}, {"scopes": "user:inference"},
-                        {"generation": True}, {"access_token": "bad\ntoken"}):
+                        {"generation": True}, {"access_token": "bad\ntoken"},
+                        {"account": {"emailAddress": "bad\nlabel"}}):
             self.transport.next = assignment(**changes)
             with self.subTest(changes=changes), self.assertRaises(client.ClientError):
                 self.client.sync()
         self.assertEqual(self.native.writes, [])
+
+    def test_status_includes_only_validated_account_email(self):
+        self.enroll()
+        status = self.client.sync()
+        self.assertEqual(status["account_email"], "example@example.invalid")
+        self.assertEqual(self.client.status()["account_email"], status["account_email"])
+        self.assertNotIn(PROVIDER_TOKEN, self.path.read_text())
+
+    def test_unchanged_validated_plan_updates_status_without_native_write(self):
+        self.enroll()
+        self.client.sync()
+        fingerprint = self.native.snapshot()["fingerprint"]
+        unchanged = dict.fromkeys(("before", "keychain_only", "after"), fingerprint)
+        self.now += 30
+        self.transport.next = assignment(state="quota_stale")
+        with patch.object(self.native, "plan", return_value=unchanged) as plan, \
+                patch.object(self.native, "apply") as apply:
+            result = self.client.sync()
+        plan.assert_called_once()
+        self.assertFalse(plan.call_args.kwargs["initialize"])
+        apply.assert_not_called()
+        self.assertEqual(result["state"], "degraded")
+        self.assertEqual(result["reason"], "quota_stale")
+        self.assertEqual(json.loads(self.path.read_text())["synced_at"], self.now)
+        self.assertNotIn("pending_write", json.loads(self.path.read_text()))
+
+    def test_equal_initial_plan_still_creates_native_backup(self):
+        self.native.credentials = assignment()
+        self.enroll()
+        fingerprint = self.native.snapshot()["fingerprint"]
+        unchanged = dict.fromkeys(("before", "keychain_only", "after"), fingerprint)
+        with patch.object(self.native, "plan", return_value=unchanged):
+            self.client.sync(take_over_native_store=True)
+        self.assertTrue(self.native.has_backup)
+        self.assertEqual(len(self.native.writes), 1)
+
+    def test_keychain_denial_at_each_sync_stage_pauses_and_requires_foreground_resume(self):
+        self.enroll()
+        self.client.sync()
+        for stage in ("preflight", "snapshot", "get_secret", "plan", "apply"):
+            with self.subTest(stage=stage):
+                with patch.object(self.native, stage, side_effect=NativeKeychainAccessError(-25308)) as operation:
+                    with self.assertRaisesRegex(client.PausedError, "foreground authorization"):
+                        self.client.sync()
+                    self.assertEqual(self.client.status()["reason"], "keychain_access_required")
+                    operation.reset_mock()
+                    with self.assertRaises(client.PausedError):
+                        self.restart().sync()
+                    operation.assert_not_called()
+                self.client.resume()
+                self.assertEqual(self.client.sync()["state"], "active")
+
+    def test_keychain_resume_retains_drift_and_policy_guards(self):
+        self.enroll()
+        self.client.sync()
+        with patch.object(self.native, "get_secret", side_effect=NativeKeychainAccessError(-128)):
+            with self.assertRaises(client.PausedError):
+                self.client.sync()
+            with self.assertRaises(client.PausedError):
+                self.client.resume()
+        self.native.credentials = None
+        with self.assertRaisesRegex(client.ClientError, "manual login or logout"):
+            self.client.resume()
+        self.assertEqual(self.client.status()["state"], "paused")
+
+    def test_denied_renewal_retains_journal_then_foreground_retry_completes(self):
+        self.enroll()
+        self.client.sync()
+        before = self.native.snapshot()["fingerprint"]
+        self.transport.next = assignment(generation=2, access_token="fixture-refreshed-access")
+        with patch.object(self.native, "apply", side_effect=NativeKeychainAccessError(-25293)):
+            with self.assertRaises(client.PausedError):
+                self.client.sync()
+        state = json.loads(self.path.read_text())
+        self.assertEqual(state["pending_write"]["before"], before)
+        self.assertEqual(self.native.snapshot()["fingerprint"], before)
+        self.assertNotIn("fixture-refreshed-access", self.path.read_text())
+        self.client.resume()
+        self.assertNotIn("pending_write", json.loads(self.path.read_text()))
+        self.assertTrue(self.native.interaction_allowed)
+        self.assertEqual(self.client.sync()["state"], "active")
+        self.assertEqual(json.loads(self.path.read_text())["generation"], 2)
+
+    def test_native_payload_limit_pauses_before_journal_or_native_write(self):
+        self.enroll()
+        with patch.object(self.native, "plan", side_effect=NativePayloadError("FAKE_SECRET")), \
+                patch.object(self.native, "apply") as apply:
+            with self.assertRaisesRegex(client.PausedError, "complete native credential payload") as raised:
+                self.client.sync()
+        self.assertNotIn("FAKE_SECRET", str(raised.exception))
+        self.assertEqual(self.client.status()["reason"], "native_store_capacity")
+        self.assertNotIn("pending_write", json.loads(self.path.read_text()))
+        apply.assert_not_called()
 
     def test_different_enrollment_requires_explicit_leave(self):
         self.enroll()
@@ -372,6 +476,33 @@ class ClientLifecycleTests(unittest.TestCase):
         self.assertTrue(all(5 <= delay <= 300 for delay in delays))
         for secret in (INVITE, DEVICE_TOKEN, PROVIDER_TOKEN):
             self.assertNotIn(secret, output.getvalue())
+
+    def test_daemon_disables_keychain_ui_before_first_access_and_exits_on_denial(self):
+        self.enroll()
+        self.client.sync()
+        calls = []
+
+        def denied_preflight():
+            calls.append(self.native.interaction_allowed)
+            raise NativeKeychainAccessError(-25308)
+
+        with patch.object(self.native, "preflight", side_effect=denied_preflight), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            result = client.run(self.client, sleep=lambda _: self.fail("Permission denials must not retry"))
+        self.assertEqual(result, 2)
+        self.assertEqual(calls, [False])
+        self.assertTrue(self.native.interaction_allowed)
+        self.assertEqual(self.client.status()["reason"], "keychain_access_required")
+        self.assertIn("foreground authorization", output.getvalue())
+
+    def test_daemon_cannot_start_if_keychain_ui_cannot_be_disabled(self):
+        self.enroll()
+        with patch.object(self.native, "noninteractive", side_effect=NativeStoreError("FAKE_SECRET")), \
+                patch.object(self.client, "sync") as sync, \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertEqual(client.run(self.client), 2)
+        sync.assert_not_called()
+        self.assertNotIn("FAKE_SECRET", output.getvalue())
 
     def test_service_contains_no_tokens_and_uses_fixed_absolute_interpreter(self):
         self.enroll()

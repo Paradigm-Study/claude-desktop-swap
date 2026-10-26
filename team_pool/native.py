@@ -41,12 +41,24 @@ class NativeStoreError(RuntimeError):
     """A local native store operation could not safely complete."""
 
 
+class NativeKeychainAccessError(NativeStoreError):
+    """Foreground approval or an unlocked Keychain is required."""
+
+    def __init__(self, status):
+        self.status = status
+        super().__init__("Keychain access requires foreground authorization.")
+
+
 class NativeDriftError(NativeStoreError):
     """Another writer changed the native account; do not overwrite it."""
 
 
 class NativePolicyError(NativeStoreError):
     """An auth override or policy requires a different configuration."""
+
+
+class NativePayloadError(NativePolicyError):
+    """The complete native payload exceeds the safe writer's format or capacity."""
 
 
 def _json(value):
@@ -166,7 +178,11 @@ class NativeStore:
     def _get(self, service, account):
         try:
             return self.backend.get_password(service, account)
-        except Exception:
+        except Exception as error:
+            from .macos_keychain import access_required_status
+            status = access_required_status(error)
+            if status is not None:
+                raise NativeKeychainAccessError(status) from None
             raise NativeStoreError("Keychain read failed or was denied; no plaintext fallback is used.") from None
 
     def _set(self, service, account, value):
@@ -178,8 +194,26 @@ class NativeStore:
                 self.backend.set_password(service, account, value)
                 if self.backend.get_password(service, account) != value:
                     raise ValueError
-        except Exception:
+        except Exception as error:
+            from .macos_keychain import access_required_status
+            status = access_required_status(error)
+            if status is not None:
+                raise NativeKeychainAccessError(status) from None
             raise NativeStoreError("Keychain write failed or could not be verified.") from None
+
+    @contextmanager
+    def noninteractive(self):
+        """Suppress in-process UI and reject known interactive native CLI access.
+
+        The native CLI has a metadata preflight and bounded timeout; a concurrent
+        lock or ACL change can still race that check and cause one prompt.
+        """
+        from .macos_keychain import KeychainInteractionError
+        try:
+            with self.backend.noninteractive():
+                yield
+        except KeychainInteractionError:
+            raise NativeStoreError("Cannot establish noninteractive Keychain access; background synchronization stopped.") from None
 
     def _secret_account(self, name):
         if not isinstance(name, str) or not name or len(name) > 80 or name == "native-backup":
@@ -363,6 +397,16 @@ class NativeStore:
         replacement = {k: v for k, v in credentials.items() if k in SHARED_KEYS}
         replacement["claudeAiOauth"] = oauth
         new_config = dict(config, oauthAccount=identity)
+        # Check the complete serialized payload, including local MCP/plugin data,
+        # before creating a backup or persisting a write journal. Never truncate
+        # those fields to fit security(1)'s bounded interactive input buffer.
+        validator = getattr(self.backend, "validate_password", None)
+        if validator is not None:
+            from .native_security import KeychainPayloadError
+            try:
+                validator(NATIVE_SERVICE, self.username, _json(replacement))
+            except KeychainPayloadError:
+                raise NativePayloadError("Native credential payload cannot be safely written by security(1); no data was changed.") from None
         return credentials, config, replacement, new_config, backup
 
     def plan(self, assignment: dict, expected_fingerprint: str | None, *, initialize=False) -> dict:

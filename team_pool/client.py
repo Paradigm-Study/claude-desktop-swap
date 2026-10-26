@@ -288,8 +288,17 @@ class Client:
     def _transport(self, state):
         return self.transport or Transport(state["server"], allow_loopback_http=state.get("allow_loopback_http", False))
 
+    def _keychain_access_required(self, state=None):
+        message = ("Keychain access requires foreground authorization. Run resume and then sync --once "
+                   "in Terminal, approve the expected Keychain request, then restart the service.")
+        if state is not None:
+            state.update(state="paused", reason="keychain_access_required")
+            self._save(state)
+            raise PausedError(message) from None
+        raise ClientError(message) from None
+
     def _preflight(self, state=None):
-        from .native import NativePolicyError, NativeStoreError
+        from .native import NativeKeychainAccessError, NativePolicyError, NativeStoreError
         try:
             self.preflight()
             self.native.preflight()
@@ -305,6 +314,8 @@ class Client:
                 self._save(state)
                 raise PausedError("Native setup or policy changed. Correct it, then explicitly resume the client.") from None
             raise ClientError("Native setup or policy preflight failed; verify the launcher, local selectors, and authentication settings.") from None
+        except NativeKeychainAccessError:
+            self._keychain_access_required(state)
         except NativeStoreError:
             raise ClientError("Native credential preflight failed; verify Keychain access.") from None
 
@@ -330,14 +341,18 @@ class Client:
             return self._status(state)
 
     def sync(self, *, take_over_native_store=False):
-        from .native import NativeDriftError, NativePolicyError, NativeStoreError
+        from .native import NativeDriftError, NativeKeychainAccessError, NativePayloadError, NativePolicyError, NativeStoreError
         with _lock(self.config):
             state = self._load()
             if state["state"] in ("revoked", "left"):
                 raise PausedError("Enrollment was revoked or left. Inspect status and follow the recovery runbook.")
+            if state["state"] == "paused":
+                raise PausedError("Client is paused. Inspect status and explicitly resume after correcting the reported condition.")
             self._preflight(state)
             try:
                 snapshot = self.native.snapshot()
+            except NativeKeychainAccessError:
+                self._keychain_access_required(state)
             except NativeStoreError:
                 raise ClientError("Cannot inspect native credential state; no assignment was requested.") from None
             self._recover_pending(state, snapshot)
@@ -350,7 +365,10 @@ class Client:
                 state.update(state="paused", reason="native_credentials_changed")
                 self._save(state)
                 raise PausedError("Native credentials changed. Synchronization paused without overwriting them.")
-            token = self.native.get_secret(DEVICE_SECRET)
+            try:
+                token = self.native.get_secret(DEVICE_SECRET)
+            except NativeKeychainAccessError:
+                self._keychain_access_required(state)
             if not _safe_string(token):
                 raise ClientError("Device credential is missing. Leave and enroll with a new invitation.")
             try:
@@ -374,16 +392,29 @@ class Client:
                 pending = {key: plan[key] for key in ("before", "keychain_only", "after")}
                 pending.update(self._assignment_metadata(assignment))
                 state["pending_write"] = pending
+                if not initialize and plan["before"] == plan["keychain_only"] == plan["after"]:
+                    # plan re-reads under native locks and validates policy,
+                    # expiry, ownership and backup. The credential is unchanged:
+                    # commit only fresh coordinator metadata, without a Keychain
+                    # write or a .claude.json rewrite on every polling interval.
+                    self._finish_pending(state)
+                    return self._status(state)
                 self._save(state)
                 fingerprint = self.native.apply(assignment, expected, initialize=initialize)
             except NativeDriftError:
                 state.update(state="paused", reason="native_credentials_changed")
                 self._save(state)
                 raise PausedError("Native credentials changed. Synchronization paused without overwriting them.") from None
+            except NativePayloadError:
+                state.update(state="paused", reason="native_store_capacity")
+                self._save(state)
+                raise PausedError("The complete native credential payload exceeds the supported security(1) format or size. Existing credentials and MCP/plugin data were preserved.") from None
             except NativePolicyError:
                 state.update(state="paused", reason="native_setup_or_policy")
                 self._save(state)
                 raise PausedError("Native policy blocks this assignment; correct the policy or pool, then explicitly resume.") from None
+            except NativeKeychainAccessError:
+                self._keychain_access_required(state)
             except NativeStoreError:
                 raise ClientError("Could not update the native credential store. Enrollment is preserved.") from None
             if fingerprint != pending["after"]:
@@ -396,6 +427,7 @@ class Client:
     def _assignment_metadata(self, assignment):
         metadata = {
             "account_id": assignment["account_id"], "generation": assignment["generation"],
+            "account_email": assignment["account"]["emailAddress"],
             "expires_at": assignment["expires_at"], "synced_at": self.clock(),
             "renew_after": min(300, max(5, assignment["renew_after"])),
             "state": "degraded" if assignment.get("state") in ("quota_stale", "quota_exhausted") else "active",
@@ -408,7 +440,7 @@ class Client:
         pending = state["pending_write"]
         state.update(managed=True, fingerprint=pending["after"])
         state.pop("reason", None)
-        for key in ("account_id", "generation", "expires_at", "synced_at", "renew_after", "state", "reason"):
+        for key in ("account_id", "account_email", "generation", "expires_at", "synced_at", "renew_after", "state", "reason"):
             if key in pending:
                 state[key] = pending[key]
         state.pop("pending_write")
@@ -444,12 +476,13 @@ class Client:
             or not isinstance(value.get("scopes"), list)
             or not all(_safe_string(scope, maximum=256) for scope in value["scopes"])
             or not isinstance(value.get("account"), dict)
+            or not _safe_string(value["account"].get("emailAddress"), maximum=320)
             or value.get("state", "fresh") not in ("fresh", "quota_stale", "quota_exhausted")
         ):
             raise ClientError("Coordinator returned an invalid or expired assignment.")
 
     def _status(self, state):
-        result = {key: state[key] for key in ("state", "device_id", "account_id", "expires_at", "reason") if key in state}
+        result = {key: state[key] for key in ("state", "device_id", "account_id", "account_email", "expires_at", "reason") if key in state}
         if state.get("expires_at", float("inf")) <= self.clock():
             result["credential_expired"] = True
             if result["state"] not in ("paused", "revoked", "left"):
@@ -469,12 +502,19 @@ class Client:
 
     def resume(self):
         """Acknowledge repaired setup; never overwrite or accept native-login drift."""
+        from .native import NativeKeychainAccessError
         with _lock(self.config):
             state = self._load()
             if state["state"] in ("revoked", "left"):
                 raise ClientError("Revoked or departed enrollment cannot be resumed.")
-            self._preflight()
-            snapshot = self.native.snapshot()
+            self._preflight(state)
+            try:
+                snapshot = self.native.snapshot()
+                token = self.native.get_secret(DEVICE_SECRET)
+            except NativeKeychainAccessError:
+                self._keychain_access_required(state)
+            if not _safe_string(token):
+                raise ClientError("Device credential is missing. Leave and enroll with a new invitation.")
             self._recover_pending(state, snapshot)
             if state.get("managed") and snapshot["fingerprint"] != state["fingerprint"]:
                 raise ClientError("Native credentials still differ; resume will not overwrite a manual login or logout.")
@@ -563,6 +603,18 @@ def remove_service(*, home=None, runner=subprocess.run):
 
 
 def run(client, *, sleep=time.sleep, jitter=random.uniform):
+    from .native import NativeStoreError
+    try:
+        with client.native.noninteractive():
+            return _run(client, sleep=sleep, jitter=jitter)
+    except NativeStoreError:
+        # Refuse to run if the background guards fail; do not retry without them
+        # or expose backend exception text.
+        print("Background synchronization stopped: noninteractive Keychain access could not complete.", flush=True)
+        return 2
+
+
+def _run(client, *, sleep, jitter):
     failures = 0
     last_state = None
     while True:
@@ -571,7 +623,11 @@ def run(client, *, sleep=time.sleep, jitter=random.uniform):
             failures = 0
             delay = max(5, status.get("next_sync_in", 30))
         except PausedError:
-            print("Client paused. Inspect status and correct the reported condition.", flush=True)
+            status = client.status()
+            if status.get("reason") == "keychain_access_required":
+                print("Client paused: Keychain access requires foreground authorization. Run resume and sync --once in Terminal before restarting the service.", flush=True)
+            else:
+                print("Client paused. Inspect status and correct the reported condition.", flush=True)
             return 2
         except ClientError:
             failures += 1
