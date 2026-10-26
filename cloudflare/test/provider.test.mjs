@@ -209,6 +209,74 @@ test('usage validates all subscription windows and leaves extra usage out', asyn
   assert.equal(requests[0].headers['anthropic-beta'], 'oauth-2025-04-20');
 });
 
+test('weekly row aggregates are metadata rather than quota windows', async () => {
+  const aggregate = { as_of: '2026-10-26T12:00:00Z', rows: [],
+    window_started_at: '2026-10-20T12:00:00Z' };
+  const { provider } = fake([{
+    five_hour: { utilization: 40 }, seven_day: { utilization: 78 },
+    seven_day_opus: null, seven_day_sonnet: null,
+    seven_day_breakdown: aggregate,
+    seven_day_other_aggregate: { ...aggregate, rows: [{ percent: 99 }] },
+    extra_usage: { is_enabled: true, utilization: 100 },
+  }]);
+  assert.deepEqual(await provider.usage('access'), { five_hour: 40, seven_day: 78 });
+});
+
+test('metadata classification never hides required or malformed actual windows', async () => {
+  const base = { five_hour: { utilization: 40 }, seven_day: { utilization: 78 } };
+  for (const value of [
+    { ...base, five_hour: { rows: [] } },
+    { ...base, seven_day: { rows: [] } },
+    { ...base, seven_day_opus: {} },
+    { ...base, seven_day_opus: { resets_at: '2026-10-27T00:00:00Z' } },
+    { ...base, seven_day_opus: { rows: [], utilization: null } },
+    { ...base, seven_day_opus: { rows: [], utilization: '70' } },
+    { ...base, seven_day_opus: { rows: [], resets_at: null } },
+    { ...base, seven_day_breakdown: { rows: 'invalid' } },
+  ]) await fails(fake([value]).provider.usage('access'), 'bad-usage');
+  assert.equal((await fake([{ ...base, seven_day_opus: { rows: [], utilization: 95 } }])
+    .provider.usage('access')).seven_day_opus, 95);
+});
+
+test('current limits shape includes nonbinding per-model quotas and excludes spending', async () => {
+  const scoped = { kind: 'weekly_scoped', group: 'weekly', is_active: false, percent: 0,
+    scope: { model: { id: null, display_name: 'Fable' }, surface: null } };
+  const base = { five_hour: { utilization: 40 }, seven_day: { utilization: 78 },
+    seven_day_breakdown: { as_of: '2026-10-26T12:00:00Z', rows: [],
+      window_started_at: '2026-10-20T12:00:00Z' },
+    limits: [
+      { kind: 'session', group: 'session', is_active: false, percent: 40, scope: null },
+      { kind: 'weekly_all', group: 'weekly', is_active: true, percent: 78, scope: {} },
+      scoped,
+      { kind: 'extra_usage', group: 'spend', percent: 100, scope: { model: { display_name: 'Fable' } } },
+    ],
+    extra_usage: { is_enabled: true, utilization: 100 },
+  };
+  assert.deepEqual(await fake([base]).provider.usage('access'), {
+    five_hour: 40, seven_day: 78, 'weekly_scoped:fable': 0,
+  });
+  base.limits.push({ ...scoped, percent: 95 },
+    { ...scoped, percent: 10, scope: { model: { display_name: 'FABLE' } } });
+  assert.equal((await fake([base]).provider.usage('access'))['weekly_scoped:fable'], 95);
+});
+
+test('malformed scoped quotas fail closed instead of disappearing from model-all selection', async () => {
+  const scoped = { kind: 'weekly_scoped', group: 'weekly', is_active: false, percent: 0,
+    scope: { model: { display_name: 'Fable' } } };
+  const base = { five_hour: { utilization: 40 }, seven_day: { utilization: 78 } };
+  for (const change of [
+    { percent: null }, { percent: true }, { percent: '95' }, { percent: -1 },
+    { percent: NaN }, { percent: Infinity }, { percent: undefined },
+    { group: null }, { group: 'spend' }, { scope: null }, { scope: {} },
+    { scope: { model: { display_name: '' } } },
+    { scope: { model: { display_name: 'Fable\n' } } },
+  ]) await fails(fake([{ ...base, limits: [{ ...scoped, ...change }] }]).provider.usage('access'), 'bad-usage');
+  for (const limits of [{}, 'unknown', [null]]) {
+    await fails(fake([{ ...base, limits }]).provider.usage('access'), 'bad-usage');
+  }
+  assert.deepEqual(await fake([{ ...base, limits: null }]).provider.usage('access'), { five_hour: 40, seven_day: 78 });
+});
+
 test('missing or invalid usage is unknown, while over-100 utilization stays exhausted', async () => {
   for (const value of [{}, { five_hour: null, seven_day: { utilization: 1 } },
     ...[true, -1, '0', NaN, Infinity, null].map(utilization => ({

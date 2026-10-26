@@ -195,12 +195,41 @@ class Provider:
         keys = {"five_hour", "seven_day"} | {k for k in raw if k.startswith("seven_day_")}
         for key in keys:
             value = raw.get(key)
-            if value is None and key not in ("five_hour", "seven_day"):
+            required = key in ("five_hour", "seven_day")
+            if value is None and not required:
+                continue
+            # Weekly row aggregates describe consumption, not a quota window.
+            # A reset-bearing or ambiguous object still fails closed below.
+            if (not required and isinstance(value, dict)
+                    and isinstance(value.get("rows"), list)
+                    and "utilization" not in value and "resets_at" not in value):
                 continue
             pct = value.get("utilization") if isinstance(value, dict) else None
             if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct) or pct < 0:
                 raise ProviderError("bad-usage")
             result[key] = float(pct)
+        # Valid observed quota windows can have is_active=False. Every per-model
+        # weekly quota participates in model-all selection regardless of that
+        # flag; spending/extra-usage limits deliberately do not.
+        limits = raw.get("limits")
+        if limits is not None:
+            if not isinstance(limits, list):
+                raise ProviderError("bad-usage")
+            for limit in limits:
+                if not isinstance(limit, dict):
+                    raise ProviderError("bad-usage")
+                if limit.get("kind") != "weekly_scoped":
+                    continue
+                scope = limit.get("scope")
+                model = scope.get("model") if isinstance(scope, dict) else None
+                name = model.get("display_name") if isinstance(model, dict) else None
+                pct = limit.get("percent")
+                if (limit.get("group") != "weekly" or not self._metadata_string(name)
+                        or isinstance(pct, bool) or not isinstance(pct, (int, float))
+                        or not math.isfinite(pct) or pct < 0):
+                    raise ProviderError("bad-usage")
+                key = "weekly_scoped:" + name.lower()
+                result[key] = max(result.get(key, 0), float(pct))
         return result
 
     def refresh(self, credentials):

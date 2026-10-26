@@ -167,6 +167,67 @@ class ProviderTest(unittest.TestCase):
             with self.subTest(body=body), self.assertRaises(ProviderError):
                 Provider(opener=FakeOpener(body)).usage('secret')
 
+    def test_weekly_row_aggregates_are_metadata_not_quota_windows(self):
+        aggregate = {'as_of': '2026-10-26T12:00:00Z', 'rows': [],
+                     'window_started_at': '2026-10-20T12:00:00Z'}
+        opener = FakeOpener({'five_hour': {'utilization': 40}, 'seven_day': {'utilization': 78},
+            'seven_day_opus': None, 'seven_day_sonnet': None,
+            'seven_day_breakdown': aggregate,
+            'seven_day_other_aggregate': {**aggregate, 'rows': [{'percent': 99}]},
+            'extra_usage': {'is_enabled': True, 'utilization': 100}})
+        self.assertEqual(Provider(opener=opener).usage('access'), {'five_hour': 40, 'seven_day': 78})
+
+    def test_metadata_classification_does_not_hide_malformed_quota_windows(self):
+        base = {'five_hour': {'utilization': 40}, 'seven_day': {'utilization': 78}}
+        for change in ({'five_hour': {'rows': []}}, {'seven_day': {'rows': []}},
+                       {'seven_day_opus': {}},
+                       {'seven_day_opus': {'resets_at': '2026-10-27T00:00:00Z'}},
+                       {'seven_day_opus': {'rows': [], 'utilization': None}},
+                       {'seven_day_opus': {'rows': [], 'utilization': '70'}},
+                       {'seven_day_opus': {'rows': [], 'resets_at': None}},
+                       {'seven_day_breakdown': {'rows': 'invalid'}}):
+            with self.subTest(change=change), self.assertRaisesRegex(ProviderError, '^bad-usage$'):
+                Provider(opener=FakeOpener({**base, **change})).usage('access')
+        result = Provider(opener=FakeOpener({**base,
+            'seven_day_opus': {'rows': [], 'utilization': 95}})).usage('access')
+        self.assertEqual(result['seven_day_opus'], 95)
+
+    def test_current_limits_include_nonbinding_model_quotas_but_not_spend(self):
+        scoped = {'kind': 'weekly_scoped', 'group': 'weekly', 'is_active': False, 'percent': 0,
+                  'scope': {'model': {'id': None, 'display_name': 'Fable'}, 'surface': None}}
+        body = {'five_hour': {'utilization': 40}, 'seven_day': {'utilization': 78},
+            'seven_day_breakdown': {'as_of': '2026-10-26T12:00:00Z', 'rows': [],
+                                    'window_started_at': '2026-10-20T12:00:00Z'},
+            'limits': [
+                {'kind': 'session', 'group': 'session', 'is_active': False, 'percent': 40, 'scope': None},
+                {'kind': 'weekly_all', 'group': 'weekly', 'is_active': True, 'percent': 78, 'scope': {}},
+                scoped,
+                {'kind': 'extra_usage', 'group': 'spend', 'percent': 100,
+                 'scope': {'model': {'display_name': 'Fable'}}}],
+            'extra_usage': {'is_enabled': True, 'utilization': 100}}
+        self.assertEqual(Provider(opener=FakeOpener(body)).usage('access'), {
+            'five_hour': 40, 'seven_day': 78, 'weekly_scoped:fable': 0})
+        body['limits'].extend([{**scoped, 'percent': 95},
+            {**scoped, 'percent': 10, 'scope': {'model': {'display_name': 'FABLE'}}}])
+        self.assertEqual(Provider(opener=FakeOpener(body)).usage('access')['weekly_scoped:fable'], 95)
+
+    def test_malformed_scoped_quotas_fail_closed(self):
+        scoped = {'kind': 'weekly_scoped', 'group': 'weekly', 'is_active': False, 'percent': 0,
+                  'scope': {'model': {'display_name': 'Fable'}}}
+        base = {'five_hour': {'utilization': 40}, 'seven_day': {'utilization': 78}}
+        for change in ({'percent': None}, {'percent': True}, {'percent': '95'}, {'percent': -1},
+                       {'percent': float('nan')}, {'percent': float('inf')},
+                       {'group': None}, {'group': 'spend'}, {'scope': None}, {'scope': {}},
+                       {'scope': {'model': {'display_name': ''}}},
+                       {'scope': {'model': {'display_name': 'Fable\n'}}}):
+            with self.subTest(change=change), self.assertRaisesRegex(ProviderError, '^bad-usage$'):
+                Provider(opener=FakeOpener({**base, 'limits': [{**scoped, **change}]})).usage('access')
+        for limits in ({}, 'unknown', [None]):
+            with self.subTest(limits=limits), self.assertRaisesRegex(ProviderError, '^bad-usage$'):
+                Provider(opener=FakeOpener({**base, 'limits': limits})).usage('access')
+        self.assertEqual(Provider(opener=FakeOpener({**base, 'limits': None})).usage('access'),
+                         {'five_hour': 40, 'seven_day': 78})
+
     def test_refresh_requires_successor_and_preserves_imported_fields(self):
         opener = FakeOpener({'access_token': 'new-access', 'refresh_token': 'new-refresh', 'expires_in': 1000,
                              'scope': 'user:inference user:profile'})

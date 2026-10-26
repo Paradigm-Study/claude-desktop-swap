@@ -239,12 +239,38 @@ export class Provider {
     const keys = new Set(['five_hour', 'seven_day', ...Object.keys(raw).filter(k => k.startsWith('seven_day_'))]);
     for (const key of keys) {
       const value = raw[key];
-      if ((value === null || value === undefined) && key !== 'five_hour' && key !== 'seven_day') continue;
+      const required = key === 'five_hour' || key === 'seven_day';
+      if (!required && (value === null || value === undefined)) continue;
+      // The API also returns weekly row aggregates (as_of/rows/window_started_at).
+      // Those describe consumption; only quota windows expose utilization. A
+      // reset-bearing or otherwise ambiguous object still fails closed below.
+      if (!required && isRecord(value) && Array.isArray(value.rows)
+        && !Object.hasOwn(value, 'utilization') && !Object.hasOwn(value, 'resets_at')) continue;
       const pct = isRecord(value) ? value.utilization : undefined;
       if (typeof pct !== 'number' || !Number.isFinite(pct) || pct < 0) {
         throw new ProviderError('bad-usage');
       }
       result[key] = pct;
+    }
+    // Newer responses put per-model weekly quotas in limits[]. Valid observed
+    // quota windows can have is_active=false, so that flag must not remove them
+    // from model-all account selection. Spend is separate.
+    const limits = raw.limits;
+    if (limits !== undefined && limits !== null) {
+      if (!Array.isArray(limits)) throw new ProviderError('bad-usage');
+      for (const limit of limits) {
+        if (!isRecord(limit)) throw new ProviderError('bad-usage');
+        if (limit.kind !== 'weekly_scoped') continue;
+        const model = isRecord(limit.scope) && isRecord(limit.scope.model) ? limit.scope.model : null;
+        const name = model?.display_name;
+        const pct = limit.percent;
+        if (limit.group !== 'weekly' || !metadataString(name)
+          || typeof pct !== 'number' || !Number.isFinite(pct) || pct < 0) {
+          throw new ProviderError('bad-usage');
+        }
+        const key = `weekly_scoped:${name.toLowerCase()}`;
+        result[key] = Math.max(result[key] ?? 0, pct);
+      }
     }
     return result;
   }
