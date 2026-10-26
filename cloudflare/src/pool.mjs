@@ -321,7 +321,7 @@ export class PoolObject extends DurableObject {
         break;
       case '/admin/accounts/list':
         this.requireKeys(body, []);
-        result = { accounts: this.query('SELECT id,generation,state,verified,fetched,next_poll,error FROM accounts ORDER BY id') };
+        result = { accounts: await this.listAccounts() };
         break;
       case '/admin/devices/list':
         this.requireKeys(body, []);
@@ -407,6 +407,26 @@ export class PoolObject extends DurableObject {
       this.query('UPDATE devices SET revoked=1 WHERE id=?', device);
       this.audit('device-revoked', device);
     });
+  }
+
+  async listAccounts() {
+    const accounts = [];
+    for (const row of this.query('SELECT id,generation,state,verified,fetched,next_poll,error,usage,secret FROM accounts ORDER BY id')) {
+      const credentials = await this.decrypt(row.secret);
+      // Only cached quota and human-readable labels leave this admin endpoint.
+      // Explicit fields keep grant material and provider IDs out of responses.
+      accounts.push({
+        id: row.id, generation: row.generation, state: row.state,
+        verified: row.verified, fetched: row.fetched, next_poll: row.next_poll,
+        expires_at: credentials.expires_at,
+        error: row.error, usage: row.usage === null ? null : JSON.parse(row.usage),
+        account: {
+          emailAddress: credentials.account.emailAddress,
+          subscriptionType: credentials.account.subscriptionType,
+        },
+      });
+    }
+    return accounts;
   }
 
   async addAccount(id, credentials, exclusiveOwner = false, replaceQuarantined = false) {

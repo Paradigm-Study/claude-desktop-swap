@@ -68,6 +68,7 @@ class FakeAnthropic {
       if (this.usageFailure) return this.reply(this.usageFailure, { error: 'test-error' }, { 'retry-after': '600' });
       const name = this.accesses.get(header(options, 'authorization')?.replace(/^Bearer /, ''));
       if (!name) return this.reply(401, { error: 'unknown-test-token' });
+      if (this.rawUsage) return this.reply(200, this.rawUsage);
       const quota = this.quotas.get(name) ?? { five_hour: 10, seven_day: 10 };
       return this.reply(200, Object.fromEntries(Object.entries(quota).map(([key, utilization]) => [key, { utilization }])));
     }
@@ -205,6 +206,45 @@ test('two Macs balance fresh accounts, keep sticky assignments, and switch at co
   assert.equal(switched.state, 'fresh');
   assert.equal(Object.hasOwn(switched, 'refresh_token'), false);
   assert.deepEqual(Object.keys(switched.account).sort(), Object.keys(credentials('b', 1).account).sort());
+});
+
+test('admin account diagnostics expose cached actual usage and a safe label without credentials or provider calls', async () => {
+  const value = await h.add('measured');
+  const before = (await h.admin('accounts/list')).accounts[0];
+  assert.equal(before.usage, null);
+  assert.deepEqual(before.account, { emailAddress: 'measured@example.test', subscriptionType: 'max' });
+  assert.equal(h.provider.calls.length, 0, 'listing imported accounts must not contact the provider');
+  h.provider.rawUsage = {
+    five_hour: { utilization: 40, resets_at: '2026-10-27T02:00:00Z' },
+    seven_day: { utilization: 78, resets_at: '2026-10-30T02:00:00Z' },
+    seven_day_breakdown: { as_of: '2026-10-26T20:00:00Z', window_started_at: '2026-10-23T02:00:00Z', rows: [] },
+    limits: [{ kind: 'weekly_scoped', group: 'weekly', percent: 7.8,
+      is_active: false, scope: { model: { display_name: 'Fable' } } }],
+  };
+  const device = await h.enroll();
+  assert.equal((await h.assignment(device)).account_id, 'measured');
+  const calls = h.provider.calls.length;
+  const response = await h.admin('accounts/list');
+  const account = response.accounts[0];
+  assert.deepEqual(account.usage, { five_hour: 40, seven_day: 78, 'weekly_scoped:fable': 7.8 });
+  assert.deepEqual(account.account, { emailAddress: 'measured@example.test', subscriptionType: 'max' });
+  assert.equal(account.verified, 1);
+  assert.equal(account.state, 'ready');
+  assert.equal(account.fetched, h.now);
+  assert.deepEqual(Object.keys(account).sort(), [
+    'account', 'error', 'expires_at', 'fetched', 'generation', 'id', 'next_poll', 'state', 'usage', 'verified',
+  ]);
+  assert.equal(h.provider.calls.length, calls, 'admin diagnostics must use cached observations');
+  const raw = JSON.stringify(response);
+  const encrypted = (await h.sql('SELECT secret FROM accounts WHERE id=?', 'measured'))[0].secret;
+  for (const forbidden of [value.access_token, value.refresh_token, encrypted, 'access_token', 'refresh_token',
+    'accountUuid', 'organizationUuid', 'rateLimitTier', 'scopes', 'secret']) {
+    assert.equal(raw.includes(forbidden), false, 'admin diagnostics must not return credential material or additional identity fields');
+  }
+  await h.request('/admin/accounts/list', {}, device.device_token, { expected: 401 });
+  const health = await h.mf.dispatchFetch('https://pool.example.test/health');
+  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a2' });
+  assert.equal(h.provider.calls.length, calls);
 });
 
 test('stale quota preserves an existing assignment and refuses new device assignment', async () => {
