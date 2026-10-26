@@ -7,10 +7,14 @@ inference goes directly to Anthropic.
 
 ## One-time Mac setup
 
-You need macOS, Claude Desktop with local Code initialized, and
+You need macOS, Claude Desktop with local Code initialized, Xcode Command Line
+Tools (for Git and the menu-bar app), and
 [uv](https://docs.astral.sh/uv/getting-started/installation/). In Claude Code, open
 `/team`, sign in to Claude Share, and confirm that Paradigm is listed. A shared
 session link alone does not establish team membership.
+
+Check `xcode-select -p` in Terminal. If the tools are missing, run
+`xcode-select --install` and finish the macOS installer before continuing.
 
 Quit Claude Desktop for this initial setup, then run in Terminal:
 
@@ -48,8 +52,9 @@ If Share keeps its sign-in in another configuration folder, supply
 The native pilot supports the default Claude credential store only; run setup
 without a `CLAUDE_CONFIG_DIR` override even when selecting another Share file.
 The sync command explicitly replaces the local Code subscription credential and
-keeps a private recovery backup. Approve the expected macOS Keychain request for
-`security` to access `Claude Code-credentials` if one appears. Use client
+keeps a private recovery backup. If macOS asks for `security` to access
+`Claude Code-credentials`, choose **Always Allow** for that exact request.
+A one-time Allow does not authorize later background syncs. Use client
 0.1.0a6 or newer; the earlier repeating approval defect is described in
 [Keychain recovery](keychain-access.md).
 
@@ -57,6 +62,11 @@ Keep this checkout and its virtual environment in place. Reopen Claude Desktop,
 resume an existing local Code conversation, and send a normal-speed message.
 The **Claude Swap** menu bar shows the pool account and background sync status.
 Fast mode retains its separate paid-credit requirements.
+
+After about a minute, run `.venv/bin/team-pool-client status` again and confirm
+that it remains active and shows Paradigm membership. If it is paused with
+`keychain_access_required`, follow [Keychain recovery](keychain-access.md) before
+restarting the service.
 
 ## A Mac already enrolled by invitation
 
