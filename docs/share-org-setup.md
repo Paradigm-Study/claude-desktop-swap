@@ -61,8 +61,8 @@ place while the service uses it. Setup prints the installed client path; for thi
 release, status and contribution commands are:
 
 ```sh
-~/.local/share/claude-desktop-swap/releases/v0.1.0a7/venv/bin/team-pool-client status
-~/.local/share/claude-desktop-swap/releases/v0.1.0a7/venv/bin/team-pool-client contribute-account
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a7/venv/bin/team-pool-client status
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a7/venv/bin/team-pool-client contribute-account
 ```
 
 If Share saves its sign-in elsewhere, use the same installer with its account

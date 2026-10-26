@@ -7,7 +7,8 @@ private prompts, account emails, or session identifiers.
 
 | Check | Mac A | Mac B | Evidence / observed limitation |
 | --- | --- | --- | --- |
-| macOS / Desktop / bundled Code version | 27.0.1 / 3.6556.2 / 2.1.308 | Pending | Client 0.1.0a6; Cloudflare coordinator. |
+| macOS / Desktop / bundled Code version | 27.0.1 / 3.6556.2 / 2.1.308 | Pending | Client 0.1.0a7; Cloudflare coordinator. |
+| Public one-command setup and repeat run | Passed on enrolled Mac | Pending | Public installer downloaded the tagged runtime; activation and a piped-command rerun preserved device, backup, native fingerprint and Desktop profile. Fresh physical Mac remains pending. |
 | One-time enrollment | Passed | Pending | Original invite enrollment linked to live Paradigm Share membership; same device token retained. |
 | Share membership enrollment without an invitation | Passed | Pending | Saved Share sign-in enrolled a temporary device, delivered an access-only assignment, rejected grant replay, and rejected delivery after test-device revocation. |
 | Membership linking preserves native login and Desktop profile | Passed | Pending | Native fingerprint, device ID, and original Desktop profile unchanged by linking; background sync active. |
@@ -74,3 +75,15 @@ Three had quota at verification; two were weekly-exhausted. Four old Claude
 proxy registrations and the three transferred personal refresh lineages were
 retired before coordinator ownership. Codex's proxy stayed running. Retired
 credential snapshots are private recovery evidence, not active refresh owners.
+
+The public one-command installer for `v0.1.0a7` was verified on Mac A on October
+26, 2026. The downloaded script matched the released source, prepared a private
+Python runtime, passed a read-only readiness check, and completed activation.
+Running the exact public `curl ... | /bin/bash` command again reused that runtime
+and enrollment. Both runs preserved the device ID and token, recovery backup,
+native credential fingerprint, Share identity, and original Desktop profile.
+The background sync and menu bar had live processes, and a subsequent background
+cycle remained active. Native authentication
+reported claude.ai / firstParty / max in 0.14 s; a normal-speed Sonnet request
+returned OK in 2.41 s. This verifies upgrade and rerun on the existing Mac, not
+the Command Line Tools/admin/Keychain prompts on a second fresh Mac.
