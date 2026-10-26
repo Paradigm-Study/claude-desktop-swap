@@ -2,8 +2,9 @@
 
 The pool runs as a separate Worker and one SQLite Durable Object in an existing
 Cloudflare account. It can share the account used by Claude Share, but has its own
-Worker, database, encryption key, administrator credential, and invitations.
-Claude Share's rooms, containers, routes, and authentication are not involved.
+Worker, database, encryption key, and administrator credential. An optional
+private binding to Claude Share's directory enables membership-based enrollment;
+Share's rooms and containers remain independent of native inference.
 
 This is the experimental two-Mac pilot. Automated tests use fake provider
 credentials. Real browser authorization has succeeded on the first Mac; provider
@@ -90,6 +91,11 @@ only their own file through a private channel. The admin CLI never prints the
 invitation itself. `GET /health` returns service status without account/device data.
 
 ## Teammate setup
+
+For the Paradigm Claude Share organization, use the
+[one-time Mac setup with your existing Share sign-in](share-org-setup.md).
+No invitation token is needed. The invitation flow below remains available for
+an independently administered pilot that does not link a Share organization.
 
 Each teammate needs macOS, Claude Desktop with local Code initialized, and
 [uv](https://docs.astral.sh/uv/getting-started/installation/). Keep their original

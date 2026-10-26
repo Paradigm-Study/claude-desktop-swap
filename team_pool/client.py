@@ -89,7 +89,7 @@ class Transport:
         self.opener = urllib.request.build_opener(*handlers)
 
     def post(self, path, body, token=None):
-        if path not in ("/v1/enroll", "/v1/assignment", "/v1/contributions/start",
+        if path not in ("/v1/enroll", "/v1/enroll/share", "/v1/link/share", "/v1/assignment", "/v1/contributions/start",
                         "/v1/contributions/complete", "/v1/contributions/status",
                         "/v1/contributions/cancel"):
             raise ClientError("Unknown coordinator endpoint.")
@@ -483,6 +483,9 @@ class Client:
 
     def _status(self, state):
         result = {key: state[key] for key in ("state", "device_id", "account_id", "account_email", "expires_at", "reason") if key in state}
+        if state.get("share_team_id") and state.get("share_account_id"):
+            result["membership_linked"] = True
+            result["share_team"] = state.get("share_team_name", state["share_team_id"])
         if state.get("expires_at", float("inf")) <= self.clock():
             result["credential_expired"] = True
             if result["state"] not in ("paused", "revoked", "left"):
@@ -652,6 +655,12 @@ def main(argv=None):
     enroll.add_argument("--device-name", required=True)
     enroll.add_argument("--invitation-file", type=Path)
     enroll.add_argument("--allow-loopback-http", action="store_true", help="Local test coordinators only")
+    from .share_enrollment import DEFAULT_ACCOUNT_FILE, DEFAULT_SHARE_SERVER
+    for name in ("enroll-share", "link-share"):
+        share = commands.add_parser(name, help="Use this Mac's Claude Share team sign-in instead of an invitation")
+        share.add_argument("--share-server", default=DEFAULT_SHARE_SERVER)
+        share.add_argument("--device-name")
+        share.add_argument("--account-file", type=Path, default=DEFAULT_ACCOUNT_FILE)
     sync = commands.add_parser("sync")
     sync.add_argument("--once", action="store_true", required=True)
     sync.add_argument("--take-over-native-store", action="store_true")
@@ -670,6 +679,11 @@ def main(argv=None):
         if args.command == "enroll":
             invitation = _private_read(args.invitation_file).decode().strip() if args.invitation_file else getpass.getpass("Single-use invitation: ")
             result = client.enroll(args.server, args.device_name, invitation, allow_loopback_http=args.allow_loopback_http)
+        elif args.command in ("enroll-share", "link-share"):
+            from .share_enrollment import enroll_from_share
+            result = enroll_from_share(client, share_server=args.share_server,
+                                       device_name=args.device_name, account_file=args.account_file,
+                                       link=args.command == "link-share")
         elif args.command == "sync":
             result = client.sync(take_over_native_store=args.take_over_native_store)
         elif args.command == "status":
@@ -705,4 +719,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Collaborating CLI modules import this package's ClientError. Use the same
+    # module instance under -m so their safe diagnostics reach the typed handler.
+    from .client import main as cli_main
+    raise SystemExit(cli_main())

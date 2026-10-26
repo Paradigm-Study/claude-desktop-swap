@@ -14,7 +14,7 @@ export default {
     if (!env.POOL_MASTER_KEY || !env.POOL_ADMIN_TOKEN) {
       return reply(503, 'coordinator-not-configured');
     }
-    if (url.pathname === '/v1/enroll') {
+    if (['/v1/enroll', '/v1/enroll/share'].includes(url.pathname)) {
       // Keep unauthenticated invitation guessing outside the singleton queue.
       const limited = await env.ENROLL_LIMIT.limit({
         key: request.headers.get('CF-Connecting-IP') || 'unknown',

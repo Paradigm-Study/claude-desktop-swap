@@ -9,6 +9,7 @@ const EXPIRY_MARGIN = 60;
 const REFRESH_MARGIN = 300;
 const DEVICE_ACTIVE_SECONDS = 300;
 const CONTRIBUTION_TTL = 600;
+const SHARE_TIMEOUT_MS = 5000;
 const METADATA = ['accountUuid', 'emailAddress', 'organizationUuid', 'subscriptionType', 'rateLimitTier'];
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
@@ -220,9 +221,15 @@ export class PoolObject extends DurableObject {
         'CREATE INDEX IF NOT EXISTS contribution_device_created ON contributions(device_id, created)',
         'CREATE TABLE IF NOT EXISTS audit (at REAL NOT NULL, event TEXT NOT NULL, subject TEXT NOT NULL)',
         'CREATE TABLE IF NOT EXISTS enrollment_limits (id TEXT PRIMARY KEY, count INTEGER NOT NULL, expires REAL NOT NULL)',
+        'CREATE TABLE IF NOT EXISTS consumed_share_grants (grant_hash TEXT PRIMARY KEY, device_id TEXT NOT NULL, consumed REAL NOT NULL)',
       ];
       this.transaction(() => {
         for (const statement of schema) this.query(statement);
+        // Add columns in place so enrolled invitation devices keep their identity.
+        const columns = new Set(this.query('PRAGMA table_info(devices)').map(row => row.name));
+        for (const column of ['share_account_id', 'share_team_id']) {
+          if (!columns.has(column)) this.query(`ALTER TABLE devices ADD COLUMN ${column} TEXT`);
+        }
         this.query("UPDATE accounts SET state='quarantined',error='interrupted-refresh' WHERE state='refreshing'");
         this.query("UPDATE contributions SET state='uncertain',secret=NULL WHERE state='exchanging'");
         this.expireContributions();
@@ -271,11 +278,11 @@ export class PoolObject extends DurableObject {
     const url = new URL(request.url);
     if (url.search) throw new PoolError('not-found', 404);
     if (request.method === 'GET' && url.pathname === '/health') {
-      return reply(200, { ok: true, mode: 'native-subscription', version: '0.1.0a2' });
+      return reply(200, { ok: true, mode: 'native-subscription', version: '0.1.0a6' });
     }
     if (request.method !== 'POST') throw new PoolError('not-found', 404);
     const routes = new Set([
-      '/v1/enroll', '/v1/assignment', '/v1/contributions/start', '/v1/contributions/complete',
+      '/v1/enroll', '/v1/enroll/share', '/v1/link/share', '/v1/assignment', '/v1/contributions/start', '/v1/contributions/complete',
       '/v1/contributions/status', '/v1/contributions/cancel', '/admin/invites',
       '/admin/accounts/list', '/admin/accounts/import', '/admin/devices/list', '/admin/devices/revoke',
     ]);
@@ -285,17 +292,23 @@ export class PoolObject extends DurableObject {
     if (path.startsWith('/admin/')) {
       const token = this.bearer(request);
       if (!(await secretEqual(token, this.env.POOL_ADMIN_TOKEN))) throw new PoolError('unauthorized', 401);
-    } else if (path !== '/v1/enroll') {
+    } else if (!['/v1/enroll', '/v1/enroll/share'].includes(path)) {
       device = await this.authenticateDevice(this.bearer(request));
     } else {
       await this.limitEnrollment(request.headers.get('CF-Connecting-IP') || 'unknown');
     }
     const body = await readBody(request, path === '/admin/accounts/import' ? 65536 : 8192);
+    if (device) await this.checkShareMembership(device);
     let result;
     switch (path) {
       case '/v1/enroll':
         this.requireKeys(body, ['invitation', 'device_name']);
         result = await this.enroll(body.invitation, body.device_name);
+        break;
+      case '/v1/enroll/share':
+      case '/v1/link/share':
+        this.requireKeys(body, ['grant', 'verifier', 'device_name']);
+        result = await this.enrollShare(body, device);
         break;
       case '/v1/assignment':
         this.requireKeys(body, []);
@@ -325,7 +338,7 @@ export class PoolObject extends DurableObject {
         break;
       case '/admin/devices/list':
         this.requireKeys(body, []);
-        result = { devices: this.query('SELECT id,name,revoked,account_id,last_seen FROM devices ORDER BY last_seen DESC') };
+        result = { devices: this.query('SELECT id,name,revoked,account_id,last_seen,share_account_id,share_team_id FROM devices ORDER BY last_seen DESC') };
         break;
       case '/admin/devices/revoke':
         this.requireKeys(body, ['device_id']);
@@ -359,6 +372,108 @@ export class PoolObject extends DurableObject {
     return device;
   }
 
+  shareConfiguration() {
+    const server = this.env.POOL_PUBLIC_URL;
+    const team = this.env.POOL_SHARE_TEAM_ID;
+    let url;
+    try { url = new URL(server); } catch { throw new PoolError('share-not-configured', 503); }
+    if (!this.env.SHARE_DIRECTORY || url.protocol !== 'https:' || url.origin !== server
+        || typeof team !== 'string' || !/^[A-Za-z0-9_-]{1,128}(?![\s\S])/.test(team)) {
+      throw new PoolError('share-not-configured', 503);
+    }
+    return { server, team };
+  }
+
+  async shareRpc(method, args) {
+    this.shareConfiguration();
+    const directory = this.env.SHARE_DIRECTORY.get(this.env.SHARE_DIRECTORY.idFromName('directory'));
+    let timer;
+    try {
+      // Only this private cross-script DO binding receives the bridge request.
+      // No Share session token is accepted or retained by the pool.
+      return await Promise.race([
+        (async () => {
+          const response = await directory.fetch(`https://share-directory.internal/rpc/${method}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args),
+          });
+          if (!response.ok) throw new Error('directory-response');
+          const data = await response.json();
+          if (!object(data) || !object(data.result) || typeof data.result.ok !== 'boolean') throw new Error('directory-response');
+          return data.result;
+        })(),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('directory-timeout')), SHARE_TIMEOUT_MS); }),
+      ]);
+    } catch {
+      throw new PoolError('share-directory-unavailable', 503);
+    } finally { clearTimeout(timer); }
+  }
+
+  async checkShareMembership(device) {
+    if (device.share_account_id === null && device.share_team_id === null
+        && !this.one('SELECT device_id FROM consumed_share_grants WHERE device_id=?', device.id)) return;
+    const { server, team } = this.shareConfiguration();
+    if (typeof device.share_account_id !== 'string'
+        || !/^[A-Za-z0-9_-]{1,128}(?![\s\S])/.test(device.share_account_id)
+        || device.share_team_id !== team) {
+      // Configuration drift or damaged local identity cannot establish removal.
+      // Keep the bearer recoverable while withholding every pool operation.
+      throw new PoolError('share-not-configured', 503);
+    }
+    const result = await this.shareRpc('nativePoolMembership', [device.share_account_id, device.share_team_id, server]);
+    if (result.ok) return;
+    // A structured bridge error is an outage, not proof of membership removal.
+    if (Object.hasOwn(result, 'error') || Object.hasOwn(result, 'status')) throw new PoolError('share-directory-unavailable', 503);
+    if (this.one('SELECT id FROM devices WHERE id=?', device.id)) this.revoke(device.id);
+    await this.ctx.storage.sync();
+    throw new PoolError('share-membership-required', 401);
+  }
+
+  async enrollShare(body, device) {
+    const { server, team } = this.shareConfiguration();
+    if (typeof body.grant !== 'string' || !/^[A-Za-z0-9_-]{43}(?![\s\S])/.test(body.grant)
+        || typeof body.verifier !== 'string' || !/^[A-Za-z0-9_-]{32,128}(?![\s\S])/.test(body.verifier)) {
+      throw new PoolError('invalid-share-grant', 401);
+    }
+    this.deviceName(body.device_name);
+    const hash = await digest(body.grant);
+    if (this.one('SELECT grant_hash FROM consumed_share_grants WHERE grant_hash=?', hash)) throw new PoolError('share-grant-used', 401);
+    const grant = await this.shareRpc('consumeNativePoolGrant', [body.grant, body.verifier, server]);
+    if (!grant.ok) {
+      if (Number.isInteger(grant.status) && grant.status >= 400 && grant.status < 500) throw new PoolError('invalid-share-grant', 401);
+      throw new PoolError('share-directory-unavailable', 503);
+    }
+    if (typeof grant.account_id !== 'string' || !/^[A-Za-z0-9_-]{1,128}(?![\s\S])/.test(grant.account_id)
+        || grant.team_id !== team || grant.device_name !== body.device_name
+        || typeof grant.expires_at !== 'number' || !Number.isFinite(grant.expires_at)
+        || grant.expires_at <= this.now() || grant.expires_at > this.now() + 600) {
+      throw new PoolError('invalid-share-grant', 401);
+    }
+    if (device?.share_account_id && (device.share_account_id !== grant.account_id || device.share_team_id !== grant.team_id)) {
+      throw new PoolError('share-identity-already-linked', 409);
+    }
+    const id = device?.id ?? randomToken(16);
+    const token = device ? null : randomToken(32);
+    const tokenHash = token ? await digest(token) : null;
+    const linked = { id, share_account_id: grant.account_id, share_team_id: grant.team_id };
+    await this.checkShareMembership(linked);
+    return this.transaction(() => {
+      // The lane covers RPC waits; the unique hash additionally prevents replay
+      // after a worker restart or a bridge response being retried.
+      this.query('INSERT INTO consumed_share_grants VALUES (?,?,?)', hash, id, this.now());
+      if (device) {
+        this.query('UPDATE devices SET share_account_id=?,share_team_id=?,name=? WHERE id=?', grant.account_id, grant.team_id, body.device_name, id);
+      } else {
+        this.query('INSERT INTO devices(id,token_hash,name,last_seen,share_account_id,share_team_id) VALUES (?,?,?,?,?,?)', id, tokenHash, body.device_name, this.now(), grant.account_id, grant.team_id);
+      }
+      this.audit(device ? 'device-share-linked' : 'device-share-enrolled', id);
+      return { device_id: id, ...(token ? { device_token: token } : {}), share_account_id: grant.account_id, share_team_id: grant.team_id };
+    });
+  }
+
+  deviceName(name) {
+    if (typeof name !== 'string' || name.length < 1 || name.length > 80 || /[\x00-\x1f\x7f]/.test(name)) throw new PoolError('invalid-device-name');
+  }
+
   async limitEnrollment(address) {
     const source = await digest(address);
     const now = this.now();
@@ -388,7 +503,7 @@ export class PoolObject extends DurableObject {
 
   async enroll(invitation, name) {
     if (typeof invitation !== 'string' || invitation.length < 32 || invitation.length > 256) throw new PoolError('invalid-invitation', 401);
-    if (typeof name !== 'string' || name.length < 1 || name.length > 80 || /[\x00-\x1f]/.test(name)) throw new PoolError('invalid-device-name');
+    this.deviceName(name);
     const invitationHash = await digest(invitation);
     const device = randomToken(16), token = randomToken(32), tokenHash = await digest(token);
     return this.transaction(() => {
@@ -405,6 +520,7 @@ export class PoolObject extends DurableObject {
     if (typeof device !== 'string' || !this.one('SELECT id FROM devices WHERE id=?', device)) throw new PoolError('unknown-device', 404);
     this.transaction(() => {
       this.query('UPDATE devices SET revoked=1 WHERE id=?', device);
+      this.query("UPDATE contributions SET state='cancelled',secret=NULL WHERE device_id=? AND state='pending'", device);
       this.audit('device-revoked', device);
     });
   }
@@ -493,6 +609,7 @@ export class PoolObject extends DurableObject {
       const secret = { verifier: randomToken(48), state: randomToken(32) };
       const encrypted = await this.encrypt(secret);
       authorizationUrl = await this.provider.authorizationUrl(secret.verifier, secret.state);
+      await this.checkShareMembership(device);
       this.transaction(() => {
         this.query("INSERT INTO contributions(id,device_id,created,expires,state,secret) VALUES (?,?,?,?,'pending',?)", id, device.id, now, now + CONTRIBUTION_TTL, encrypted);
         this.audit('contribution-started', id);
@@ -501,6 +618,7 @@ export class PoolObject extends DurableObject {
     } else {
       const secret = await this.decrypt(row.secret);
       authorizationUrl = await this.provider.authorizationUrl(secret.verifier, secret.state);
+      await this.checkShareMembership(device);
     }
     return { ...this.receipt(row), authorization_url: authorizationUrl };
   }
@@ -545,19 +663,23 @@ export class PoolObject extends DurableObject {
       for (const account of this.query('SELECT id,secret FROM accounts')) {
         const previous = await this.decrypt(account.secret);
         if (previous.account.accountUuid === credentials.account.accountUuid) {
+          await this.checkShareMembership(device);
           return this.transaction(() => this.finishContribution(row, 'duplicate', account.id));
         }
       }
       const accountId = `contrib-${Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')}`;
       const encrypted = await this.encrypt(credentials);
+      await this.checkShareMembership(device);
       return this.transaction(() => {
         this.query("INSERT INTO accounts(id,secret,generation,state,verified) VALUES (?,?,1,'ready',1)", accountId, encrypted);
         this.audit('account-added', accountId);
         return this.finishContribution(row, 'added', accountId);
       });
-    } catch {
+    } catch (error) {
       // A failed response may follow successful consumption. Never replay it.
-      return this.transaction(() => this.finishContribution(row, 'uncertain'));
+      const receipt = this.transaction(() => this.finishContribution(row, 'uncertain'));
+      if (error instanceof PoolError && ['share-membership-required', 'share-directory-unavailable', 'share-not-configured'].includes(error.code)) throw error;
+      return receipt;
     }
   }
 
@@ -657,6 +779,7 @@ export class PoolObject extends DurableObject {
       throw new PoolError('no-eligible-account', 503);
     }
     const { row, credentials } = usable.get(chosen);
+    await this.checkShareMembership(device);
     this.transaction(() => {
       this.query('UPDATE devices SET account_id=?,last_seen=? WHERE id=?', chosen, now, device.id);
       if (current !== chosen) this.audit('assignment-changed', device.id);

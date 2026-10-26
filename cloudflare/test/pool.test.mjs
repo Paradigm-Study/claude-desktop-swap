@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -65,6 +66,7 @@ class FakeAnthropic {
     }
     if (url.origin === 'https://api.anthropic.com' && url.pathname === USAGE_PATH && request.method === 'GET') {
       this.calls.push({ type: 'usage' });
+      await this.beforeUsage?.();
       if (this.usageFailure) return this.reply(this.usageFailure, { error: 'test-error' }, { 'retry-after': '600' });
       const name = this.accesses.get(header(options, 'authorization')?.replace(/^Bearer /, ''));
       if (!name) return this.reply(401, { error: 'unknown-test-token' });
@@ -127,11 +129,11 @@ class Harness {
     const main = this.production ? fileURLToPath(new URL('../src/worker.mjs', import.meta.url)) : fixture;
     this.mf = new Miniflare(convertV4MiniflareOptions({
       name: 'pool-integration',
-      modules: await Promise.all([main, fileURLToPath(new URL('../src/pool.mjs', import.meta.url)), fileURLToPath(new URL('../src/provider.mjs', import.meta.url))].map(async (path) => ({ type: 'ESModule', path, contents: await readFile(path, 'utf8') }))),
+      modules: await Promise.all([...new Set([main, fixture, fileURLToPath(new URL('../src/pool.mjs', import.meta.url)), fileURLToPath(new URL('../src/provider.mjs', import.meta.url))])].map(async (path) => ({ type: 'ESModule', path, contents: await readFile(path, 'utf8') + (this.production && path === main ? "\nexport { FixtureDirectory } from '../test/fixtures/worker.mjs';\n" : '') }))),
       compatibilityDate: '2026-04-01',
-      durableObjects: { POOL: { className: this.production ? 'PoolObject' : 'FixturePool', useSQLite: true } },
+      durableObjects: { POOL: { className: this.production ? 'PoolObject' : 'FixturePool', useSQLite: true }, SHARE_DIRECTORY: { className: 'FixtureDirectory', useSQLite: true } },
       resourcePersistencePath: this.path,
-      bindings: { POOL_MASTER_KEY: MASTER, POOL_ADMIN_TOKEN: ADMIN, POOL_SWITCH_THRESHOLD: '98', FIXTURE_TIME: this.now, ...this.bindingOverrides },
+      bindings: { POOL_MASTER_KEY: MASTER, POOL_ADMIN_TOKEN: ADMIN, POOL_SWITCH_THRESHOLD: '98', POOL_PUBLIC_URL: 'https://pool.example.test', POOL_SHARE_TEAM_ID: 'paradigm-team', FIXTURE_TIME: this.now, ...this.bindingOverrides },
       ratelimits: { ENROLL_LIMIT: { namespace_id: '991122', simple: { limit: 2, period: 60 } } },
       outboundService: (request) => this.provider.fetch(request),
     }));
@@ -153,6 +155,17 @@ class Harness {
   }
 
   admin(path, body = {}, options) { return this.request(`/admin/${path}`, body, ADMIN, options); }
+  async shareGrant({ account_id = 'share-account', team_id = 'paradigm-team', device_name = 'Share Mac', expires_at = this.now + 120, replay = false } = {}) {
+    const grant = randomBytes(32).toString('base64url'), verifier = randomBytes(48).toString('base64url');
+    const challenge = createHash('sha256').update(verifier).digest('hex');
+    await this.request('/__test/share/grant', { grant, challenge, account_id, team_id, device_name, expires_at, replay });
+    return { grant, verifier, device_name };
+  }
+  async shareEnroll(options) { return this.request('/v1/enroll/share', await this.shareGrant(options)); }
+  async shareMember(member, account_id = 'share-account', team_id = 'paradigm-team') {
+    return this.request('/__test/share/member', { member, account_id, team_id });
+  }
+  async shareOutage(outage) { return this.request('/__test/share/outage', { outage }); }
   async invite() { return (await this.admin('invites', { ttl: 86400 })).invitation; }
   async enroll(name = 'Test Mac') { return this.request('/v1/enroll', { invitation: await this.invite(), device_name: name }); }
   async add(name = 'a', expiry = this.now + 10000, quota = 10) {
@@ -243,7 +256,7 @@ test('admin account diagnostics expose cached actual usage and a safe label with
   }
   await h.request('/admin/accounts/list', {}, device.device_token, { expected: 401 });
   const health = await h.mf.dispatchFetch('https://pool.example.test/health');
-  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a2' });
+  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a6' });
   assert.equal(h.provider.calls.length, calls);
 });
 
@@ -493,7 +506,7 @@ test('production entry enforces HTTPS, configuration and enrollment throttling t
   h.production = true; await h.restart();
   const health = await h.mf.dispatchFetch('https://pool.example.test/health');
   assert.equal(health.status, 200);
-  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a2' });
+  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a6' });
   assert.equal(health.headers.get('cache-control'), 'no-store');
   const insecure = await h.mf.dispatchFetch('http://pool.example.test/health');
   assert.equal(insecure.status, 400); assert.equal((await insecure.json()).error, 'https-required');
@@ -510,4 +523,262 @@ test('production entry enforces HTTPS, configuration and enrollment throttling t
   const missing = await h.mf.dispatchFetch('https://pool.example.test/health');
   assert.equal(missing.status, 503); assert.equal((await missing.json()).error, 'coordinator-not-configured');
   assert.deepEqual(h.provider.calls, []);
+});
+
+
+test('Share enrollment returns a bound native device and persists only a grant hash', async () => {
+  const grant = await h.shareGrant();
+  const device = await h.request('/v1/enroll/share', grant);
+  assert.match(device.device_token, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(device.share_account_id, 'share-account');
+  assert.equal(device.share_team_id, 'paradigm-team');
+  const rows = (await h.admin('devices/list')).devices;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].name, 'Share Mac');
+  assert.equal(rows[0].share_account_id, device.share_account_id);
+  assert.equal(rows[0].share_team_id, device.share_team_id);
+  const consumed = await h.sql('SELECT * FROM consumed_share_grants');
+  assert.equal(consumed[0].grant_hash, createHash('sha256').update(grant.grant).digest('hex'));
+  assert.equal(consumed[0].device_id, device.device_id);
+  assert.doesNotMatch(JSON.stringify(consumed), new RegExp(`${grant.grant}|${grant.verifier}`));
+  await h.add();
+  const assignment = await h.assignment(device);
+  assert.equal(assignment.account_id, 'a');
+  assert.equal(Object.hasOwn(assignment, 'refresh_token'), false);
+});
+
+test('Share enrollment refuses nonmembers and challenge failures without creating a device', async () => {
+  const grant = await h.shareGrant();
+  await h.shareMember(false);
+  await h.request('/v1/enroll/share', grant, undefined, { expected: 401 });
+  await h.shareMember(true);
+  await h.request('/v1/enroll/share', { ...grant, verifier: 'x'.repeat(48) }, undefined, { expected: 401 });
+  assert.equal((await h.admin('devices/list')).devices.length, 0);
+  assert.equal((await h.sql('SELECT * FROM consumed_share_grants')).length, 0);
+  const device = await h.request('/v1/enroll/share', grant);
+  assert.ok(device.device_token, 'a failed proof must not consume a valid grant');
+});
+
+test('Share response must match the configured team, name and bounded future expiry', async () => {
+  for (const [options, name] of [
+    [{ team_id: 'another-team' }, undefined],
+    [{ device_name: 'Bound Name' }, 'Changed Name'],
+    [{ expires_at: h.now - 1 }, undefined],
+    [{ expires_at: h.now + 601 }, undefined],
+  ]) {
+    const grant = await h.shareGrant(options);
+    if (name) grant.device_name = name;
+    await h.request('/v1/enroll/share', grant, undefined, { expected: 401 });
+  }
+  assert.equal((await h.admin('devices/list')).devices.length, 0);
+});
+
+test('malformed Share credentials and unconfigured bridge fail before private consume', async () => {
+  const grant = await h.shareGrant();
+  for (const body of [{ ...grant, grant: 'x'.repeat(32) }, { ...grant, verifier: 'x'.repeat(31) }, { ...grant, verifier: 'x'.repeat(129) }, { ...grant, grant: grant.grant + '\n' }, { ...grant, verifier: grant.verifier + '\n' }]) {
+    await h.request('/v1/enroll/share', body, undefined, { expected: 401 });
+  }
+  await h.request('/v1/enroll/share', { ...grant, device_name: 'Bad\nName' }, undefined, { expected: 400 });
+  assert.equal((await h.request('/__test/share/stats')).calls, 0);
+  h.bindingOverrides = { POOL_PUBLIC_URL: 'https://pool.example.test/path' };
+  await h.restart();
+  await h.request('/v1/enroll/share', grant, undefined, { expected: 503 });
+  assert.equal((await h.admin('devices/list')).devices.length, 0);
+});
+
+test('concurrent Share grants enroll once and pool replay protection survives restart', async () => {
+  const grant = await h.shareGrant({ replay: true });
+  const responses = await Promise.all(Array.from({ length: 10 }, () => h.mf.dispatchFetch('https://pool.example.test/v1/enroll/share', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(grant),
+  })));
+  assert.equal(responses.filter(response => response.status === 200).length, 1);
+  assert.ok(responses.every(response => [200, 401].includes(response.status)));
+  await Promise.all(responses.map(response => response.arrayBuffer()));
+  assert.equal((await h.request('/__test/share/stats')).calls, 1);
+  await h.restart();
+  await h.request('/v1/enroll/share', grant, undefined, { expected: 401 });
+  assert.equal((await h.request('/__test/share/stats')).calls, 1);
+  assert.equal((await h.admin('devices/list')).devices.length, 1);
+});
+
+test('membership removal revokes a Share device and blocks assignment and all contribution routes', async () => {
+  await h.add();
+  const device = await h.shareEnroll();
+  const operation = await h.startContribution(device);
+  await h.assignment(device);
+  const calls = h.provider.calls.length;
+  await h.shareMember(false);
+  await h.assignment(device, { expected: 401 });
+  for (const path of ['start', 'complete', 'status', 'cancel']) {
+    await h.request(`/v1/contributions/${path}`, {}, device.device_token, { expected: 401 });
+  }
+  assert.equal(h.provider.calls.length, calls);
+  const row = (await h.admin('devices/list')).devices[0];
+  assert.equal(row.revoked, 1);
+  const contribution = (await h.sql('SELECT state,secret FROM contributions WHERE id=?', operation.contribution_id))[0];
+  assert.deepEqual(contribution, { state: 'cancelled', secret: null });
+  await h.shareMember(true);
+  await h.restart();
+  await h.assignment(device, { expected: 401 });
+});
+
+test('Share outage fails closed for enrollment and existing members without permanent revocation', async () => {
+  await h.add();
+  const device = await h.shareEnroll();
+  const grant = await h.shareGrant();
+  await h.shareOutage(true);
+  await h.request('/v1/enroll/share', grant, undefined, { expected: 503 });
+  for (const path of ['/v1/assignment', '/v1/contributions/start', '/v1/contributions/complete', '/v1/contributions/status', '/v1/contributions/cancel']) {
+    await h.request(path, {}, device.device_token, { expected: 503 });
+  }
+  assert.equal((await h.admin('devices/list')).devices[0].revoked, 0);
+  assert.equal(h.provider.calls.length, 0);
+  await h.shareOutage(false);
+  assert.equal((await h.assignment(device)).account_id, 'a');
+  assert.ok((await h.request('/v1/enroll/share', grant)).device_token);
+});
+
+test('linking an existing device keeps its bearer and assignment while binding exact Share identity', async () => {
+  await h.add();
+  const device = await h.enroll('Existing Mac');
+  const before = await h.assignment(device);
+  const result = await h.request('/v1/link/share', await h.shareGrant({ device_name: 'Existing Mac' }), device.device_token);
+  assert.deepEqual(result, { device_id: device.device_id, share_account_id: 'share-account', share_team_id: 'paradigm-team' });
+  const after = await h.assignment(device);
+  assert.equal(after.access_token, before.access_token);
+  assert.equal(after.account_id, before.account_id);
+  assert.equal((await h.admin('devices/list')).devices.length, 1);
+  await h.request('/v1/link/share', await h.shareGrant({ account_id: 'other-person' }), device.device_token, { expected: 409 });
+  assert.equal((await h.admin('devices/list')).devices[0].share_account_id, 'share-account');
+  await h.shareMember(false);
+  await h.assignment(device, { expected: 401 });
+});
+
+test('legacy invitation devices retain access during a directory outage and additive schema migration', async () => {
+  await h.add();
+  const device = await h.enroll();
+  await h.sql('ALTER TABLE devices DROP COLUMN share_account_id');
+  await h.sql('ALTER TABLE devices DROP COLUMN share_team_id');
+  await h.restart();
+  await h.shareOutage(true);
+  assert.equal((await h.assignment(device)).account_id, 'a');
+  assert.equal((await h.startContribution(device)).state, 'pending');
+  const row = (await h.admin('devices/list')).devices[0];
+  assert.equal(row.share_account_id, null);
+  assert.equal(row.share_team_id, null);
+});
+
+test('removal during an upstream quota wait prevents an assignment from leaving the pool', async () => {
+  await h.add();
+  const device = await h.shareEnroll();
+  h.provider.beforeUsage = () => h.shareMember(false);
+  const response = await h.assignment(device, { expected: 401 });
+  assert.deepEqual(response, { error: 'share-membership-required' });
+  assert.equal((await h.admin('devices/list')).devices[0].account_id, null);
+  assert.equal((await h.admin('devices/list')).devices[0].revoked, 1);
+});
+
+test('removal during OAuth exchange consumes the code once but cannot commit the contribution', async () => {
+  const device = await h.shareEnroll();
+  const operation = await h.startContribution(device);
+  h.provider.grants.set('valid-manual-code', 'donated');
+  h.provider.beforeGrant = () => h.shareMember(false);
+  await h.complete(device, operation, h.code(operation), { expected: 401 });
+  assert.equal(h.provider.count('exchange'), 1);
+  assert.equal((await h.admin('accounts/list')).accounts.length, 0);
+  assert.equal((await h.admin('devices/list')).devices[0].revoked, 1);
+  assert.deepEqual((await h.sql('SELECT state,secret FROM contributions'))[0], { state: 'uncertain', secret: null });
+});
+
+test('outage during OAuth exchange leaves a terminal uncertain receipt without revoking the member', async () => {
+  const device = await h.shareEnroll();
+  const operation = await h.startContribution(device);
+  h.provider.grants.set('valid-manual-code', 'donated');
+  h.provider.beforeGrant = () => h.shareOutage(true);
+  await h.complete(device, operation, h.code(operation), { expected: 503 });
+  assert.equal((await h.admin('accounts/list')).accounts.length, 0);
+  assert.equal((await h.admin('devices/list')).devices[0].revoked, 0);
+  await h.shareOutage(false);
+  assert.equal((await h.complete(device, operation)).state, 'uncertain');
+  assert.equal(h.provider.count('exchange'), 1);
+});
+
+test('production entry rate-limits Share enrollment together with invitation redemption', async () => {
+  const grant = await h.shareGrant();
+  h.production = true;
+  await h.restart();
+  const member = await h.request('/v1/enroll/share', grant);
+  assert.equal(member.share_team_id, 'paradigm-team');
+  await h.request('/v1/enroll/share', grant, undefined, { expected: 401 });
+  await h.request('/v1/enroll', { invitation: 'x'.repeat(43), device_name: 'Throttled' }, undefined, { expected: 429 });
+});
+
+
+test('malformed and streaming directory responses fail closed within the timeout without revoking', async () => {
+  await h.add();
+  const device = await h.shareEnroll();
+  await h.shareOutage('malformed');
+  await h.assignment(device, { expected: 503 });
+  await h.shareOutage('timeout');
+  const start = Date.now();
+  await h.assignment(device, { expected: 503 });
+  assert.ok(Date.now() - start < 7000, 'the RPC timer must include reading the response body');
+  assert.equal((await h.admin('devices/list')).devices[0].revoked, 0);
+  await h.shareOutage(false);
+  assert.equal((await h.assignment(device)).account_id, 'a');
+});
+
+test('directory failure after provider quota wait withholds credentials without revoking membership', async () => {
+  await h.add();
+  const device = await h.shareEnroll();
+  h.provider.beforeUsage = () => h.shareOutage(true);
+  assert.deepEqual(await h.assignment(device, { expected: 503 }), { error: 'share-directory-unavailable' });
+  const row = (await h.admin('devices/list')).devices[0];
+  assert.equal(row.revoked, 0);
+  assert.equal(row.account_id, null);
+  await h.shareOutage(false);
+  h.provider.beforeUsage = undefined;
+  assert.equal((await h.assignment(device)).account_id, 'a');
+});
+
+
+test('pool team configuration drift fails closed without permanently revoking a linked device', async () => {
+  await h.add();
+  const device = await h.shareEnroll();
+  h.bindingOverrides = { POOL_SHARE_TEAM_ID: 'wrong-configured-team' };
+  await h.restart();
+  assert.deepEqual(await h.assignment(device, { expected: 503 }), { error: 'share-not-configured' });
+  assert.equal((await h.admin('devices/list')).devices[0].revoked, 0);
+  assert.equal(h.provider.calls.length, 0);
+  h.bindingOverrides = {};
+  await h.restart();
+  assert.equal((await h.assignment(device)).account_id, 'a');
+});
+
+test('missing or corrupt linked identity fails closed without revocation or legacy downgrade', async () => {
+  await h.add();
+  const device = await h.shareEnroll();
+  for (const [account, team] of [
+    [null, 'paradigm-team'], ['share-account', null], [null, null],
+    ['bad account', 'paradigm-team'], ['share-account', 'wrong-recorded-team'],
+  ]) {
+    await h.sql('UPDATE devices SET share_account_id=?,share_team_id=? WHERE id=?', account, team, device.device_id);
+    assert.deepEqual(await h.assignment(device, { expected: 503 }), { error: 'share-not-configured' });
+    assert.equal((await h.admin('devices/list')).devices[0].revoked, 0);
+  }
+  assert.equal(h.provider.calls.length, 0);
+  await h.sql('UPDATE devices SET share_account_id=?,share_team_id=? WHERE id=?', 'share-account', 'paradigm-team', device.device_id);
+  assert.equal((await h.assignment(device)).account_id, 'a');
+});
+
+test('Share structured configuration disagreement preserves membership and recovers after repair', async () => {
+  await h.add();
+  const device = await h.shareEnroll();
+  await h.shareOutage('config-mismatch');
+  assert.deepEqual(await h.assignment(device, { expected: 503 }), { error: 'share-directory-unavailable' });
+  assert.equal((await h.admin('devices/list')).devices[0].revoked, 0);
+  assert.equal(h.provider.calls.length, 0);
+  await h.shareOutage(false);
+  await h.restart();
+  assert.equal((await h.assignment(device)).account_id, 'a');
 });
