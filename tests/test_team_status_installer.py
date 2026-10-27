@@ -97,20 +97,36 @@ class StatusInstallerOwnershipTests(unittest.TestCase):
             installer.verify_app(self.app)
 
     def test_helper_preserves_virtualenv_python_path(self):
+        executable = self.home / "fixture-python"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o700)
         runtime = self.home / "release/venv/bin/python"
         runtime.parent.mkdir(parents=True)
-        runtime.symlink_to(sys.executable)
+        runtime.symlink_to(executable)
         self.assertEqual(installer.helper_specification(runtime), {
             "python": str(runtime), "module": installer.HELPER_MODULE, "version": 1})
 
     def test_build_records_private_runtime_configuration_before_signing(self):
+        executable = self.home / "fixture-python"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o700)
         destination = self.home / "New.app"
-        with patch.object(installer.subprocess, "run") as run:
+        with patch.object(installer.sys, "executable", str(executable)), \
+             patch.object(installer.subprocess, "run") as run:
             installer.build_bundle(destination)
         path = destination / "Contents/Resources/helper.json"
-        self.assertEqual(json.loads(path.read_text()), installer.helper_specification())
+        self.assertEqual(json.loads(path.read_text()), installer.helper_specification(executable))
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(run.call_args_list[-1].args[0][0], "/usr/bin/codesign")
+
+    def test_group_or_world_writable_runtime_is_rejected(self):
+        executable = self.home / "fixture-python"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        for mode in (0o770, 0o702):
+            with self.subTest(mode=oct(mode)):
+                executable.chmod(mode)
+                with self.assertRaisesRegex(installer.InstallError, "persistent Claude Swap Python runtime"):
+                    installer.helper_specification(executable)
 
     def test_failed_menu_start_restores_previous_app_and_launch_agent(self):
         self.bundle()

@@ -194,6 +194,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(runtime["cwd"], str(release))
         self.assertFalse(runtime["gateway_env_present"])
         self.assertEqual([event["args"][0] for event in self.events("uv")], ["venv", "pip"])
+        self.assertIn("--managed-python", self.events("uv")[0]["args"])
         self.assert_clean()
 
     def test_ready_release_rerun_skips_fetch_and_preserves_runtime(self):

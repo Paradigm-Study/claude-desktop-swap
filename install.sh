@@ -138,7 +138,7 @@ setup_main() {
       fi
     fi
     [[ -x "$uv_bin" ]] || fail 'The Python environment manager did not install successfully.'
-    "$uv_bin" venv --python 3.12 "$release_dir/venv"
+    "$uv_bin" venv --managed-python --python 3.12 "$release_dir/venv"
     "$uv_bin" pip install --python "$release_dir/venv/bin/python" "$release_dir/source"
     "$release_dir/venv/bin/python" -c 'import team_pool.setup'
     printf '%s\n' "$RELEASE" > "$release_dir/.ready"
