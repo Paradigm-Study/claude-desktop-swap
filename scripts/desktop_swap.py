@@ -8,7 +8,7 @@ paid Fast mode. Quit Claude Desktop before installing or uninstalling.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import fcntl
 import json
@@ -32,6 +32,7 @@ from team_pool.desktop_profile import (DesktopProfileError, DesktopTarget,
 FLAG = "claudeCodeProcessWrapperEnabled"
 STATE_NAME = "claude-desktop-swap-state.json"
 LAUNCHER_NAME = "native-subscription-launcher"
+LOCK_NAME = ".claude-desktop-swap.lock"
 ENV_TO_CLEAR = (
     "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
     "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
@@ -209,15 +210,21 @@ def make_policy_directory(layout, target):
     # already exists on a real Mac; only the managed domain and user directory
     # may need creation on an unmanaged fresh installation.
     for path in (layout.managed_root, target.path.parent):
+        created = False
         with directory_fd(path.parent) as parent:
             try:
                 os.mkdir(path.name, 0o755, dir_fd=parent)
+                created = True
             except FileExistsError:
                 pass
         with directory_fd(path) as directory:
             info = os.fstat(directory)
             if info.st_uid != layout.system_uid or info.st_mode & 0o022:
                 raise SetupError("The Desktop managed policy directory has unsafe ownership or permissions.")
+            if created:
+                # mkdir's requested mode is reduced by the caller's umask.
+                # Desktop must be able to traverse these public policy paths.
+                os.fchmod(directory, 0o755)
 
 
 def render_launcher(uid: int, restore_fast_control=False) -> bytes:
@@ -445,21 +452,120 @@ def status(layout: Layout):
 
 def make_system_directory(layout):
     # The parent must already exist; refuse every symlink component.
+    created = False
     with directory_fd(layout.system_dir.parent) as parent:
         try:
             os.mkdir(layout.system_dir.name, 0o755, dir_fd=parent)
+            created = True
         except FileExistsError:
             pass
     with directory_fd(layout.system_dir) as directory:
         info = os.fstat(directory)
         if info.st_uid != layout.system_uid or stat.S_IMODE(info.st_mode) & 0o022:
             raise SetupError("The system configuration directory has unsafe ownership or permissions.")
+        if created:
+            os.fchmod(directory, 0o755)
+
+
+def repair_access(layout):
+    """Repair only public directory access demonstrably broken by this tool.
+
+    a7 could leave an inaccessible directory and lock before profile discovery.
+    a8 could finish writing a recognized installation below inaccessible policy
+    directories. Read all ownership evidence as root before changing any mode;
+    never infer ownership merely from a familiar pathname.
+    """
+    refusal = ("Cannot safely repair this Desktop installation's directory access. "
+               "Preserve its files and ask an administrator to inspect ownership and contents; nothing was widened.")
+    with ExitStack() as stack:
+        try:
+            system_fd = stack.enter_context(directory_fd(layout.system_dir))
+        except FileNotFoundError:
+            return "No installer directory exists; no access repair was needed."
+
+        def validate_directory(fd):
+            info = os.fstat(fd)
+            if info.st_uid != layout.system_uid or stat.S_IMODE(info.st_mode) & 0o022:
+                raise SetupError(refusal)
+            return info
+
+        def public(fd):
+            return stat.S_IMODE(os.fstat(fd).st_mode) & 0o055 == 0o055
+
+        validate_directory(system_fd)
+        entries = set(os.listdir(system_fd))
+        if LOCK_NAME in entries:
+            lock = os.open(LOCK_NAME, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=system_fd)
+        elif not entries:
+            lock = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                           0o600, dir_fd=system_fd)
+            os.fchmod(lock, 0o600)
+        else:
+            raise SetupError(refusal)
+        stack.callback(os.close, lock)
+        info = os.fstat(lock)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != layout.system_uid
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+            raise SetupError(refusal)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SetupError("Another installer is running; retry access repair after it finishes.") from None
+
+        entries = set(os.listdir(system_fd))
+        repairs = [system_fd] if not public(system_fd) else []
+        expected = {LOCK_NAME}
+        if entries != expected:
+            expected |= {STATE_NAME, LAUNCHER_NAME, "managed-settings.json"}
+            if entries != expected:
+                raise SetupError(refusal)
+            state, _ = load_state(layout)
+            managed, managed_snapshot, _, config, config_snapshot, _ = verify_installation(layout, state)
+            if (state["managed_existed"] or state["launcher_existed"]
+                    or managed != {"processWrapper": wrapper_setting(layout)}
+                    or managed_snapshot.mode != 0o644):
+                raise SetupError(refusal)
+            target = state_target(layout, state)
+            if target.kind == "managed":
+                if state["policy_existed"] or config != {FLAG: True} or config_snapshot.mode != 0o644:
+                    raise SetupError(refusal)
+                policy_fd = stack.enter_context(directory_fd(target.path.parent))
+                root_fd = stack.enter_context(directory_fd(layout.managed_root))
+                validate_directory(policy_fd)
+                validate_directory(root_fd)
+                if set(os.listdir(policy_fd)) != {target.path.name}:
+                    raise SetupError(refusal)
+                if not public(policy_fd):
+                    repairs.append(policy_fd)
+                if not public(root_fd):
+                    # This domain is normally shared with other managed apps.
+                    # Only the exact freshly created one-user tree proves that
+                    # this installer owns the inaccessible parent as well.
+                    if set(os.listdir(root_fd)) != {target.path.parent.name}:
+                        raise SetupError(refusal)
+                    repairs.append(root_fd)
+
+        # Recheck the locked system directory immediately before mode changes.
+        if set(os.listdir(system_fd)) != expected:
+            raise SetupError(refusal)
+        retained = os.fstat(lock)
+        named = os.stat(LOCK_NAME, dir_fd=system_fd, follow_symlinks=False)
+        if ((retained.st_dev, retained.st_ino) != (named.st_dev, named.st_ino)
+                or not stat.S_ISREG(named.st_mode) or named.st_uid != layout.system_uid
+                or stat.S_IMODE(named.st_mode) != 0o600 or named.st_nlink != 1):
+            raise SetupError(refusal)
+        for fd in repairs:
+            validate_directory(fd)
+        for fd in repairs:
+            os.fchmod(fd, 0o755)
+        return ("Repaired public launcher directory access; private files were unchanged."
+                if repairs else "Launcher directory access is already readable; no modes were changed.")
 
 
 @contextmanager
 def installation_lock(layout):
     with directory_fd(layout.system_dir) as parent:
-        fd = os.open(".claude-desktop-swap.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        fd = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=parent)
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_uid != layout.system_uid:
@@ -475,7 +581,7 @@ def installation_lock(layout):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for command in ("install", "status", "uninstall", "preflight"):
+    for command in ("install", "status", "uninstall", "preflight", "repair-access"):
         sub = commands.add_parser(command)
         sub.add_argument("--user", required=True, help="macOS account that runs Claude Desktop")
         if command == "install":
@@ -503,6 +609,9 @@ def main(argv=None):
             return 0
         if os.geteuid() != 0:
             raise SetupError("Run installation or removal with sudo.")
+        if args.command == "repair-access":
+            print(repair_access(layout))
+            return 0
         running = subprocess.run(["/usr/bin/pgrep", "-u", str(layout.uid), "-x", "Claude"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if running.returncode == 0:
             raise SetupError("Quit Claude Desktop first so it cannot overwrite its profile during setup.")

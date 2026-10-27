@@ -3,6 +3,7 @@ import copy
 import io
 import itertools
 import json
+import os
 from pathlib import Path
 import plistlib
 import subprocess
@@ -11,7 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from team_pool.client import Client, ClientError, DEVICE_SECRET, SERVICE, service_path
-from team_pool.setup import Setup, TEAM_ID, inspect_state, setup_lock, share_membership
+from team_pool.setup import Setup, TEAM_ID, directory_access_needs_repair, inspect_state, setup_lock, share_membership
 from team_pool.share_enrollment import DEFAULT_SHARE_SERVER
 from team_pool.desktop_profile import DesktopProfileError
 from test_team_client import FakeNative, FakeTransport
@@ -43,12 +44,14 @@ class SetupTests(unittest.TestCase):
         self.enroll_calls = []
         self.check_wrapper = Mock(return_value=None)
         self.desktop_preflight = Mock(return_value=None)
+        self.access_check = Mock(return_value=False)
         self.output = []
         self.setup = Setup(self.source, client=self.client, account_file=self.auth,
                            home=self.home, runner=self.runner, membership=self.membership,
                            enroll=self.enroll, installer=self.install,
                            verify_wrapper=self.check_wrapper, output=self.output.append,
                            desktop_preflight=self.desktop_preflight,
+                           access_check=self.access_check,
                            sleep=lambda _: None, clock=lambda: next(self.ticks))
         self.platform = patch("team_pool.setup.sys.platform", "darwin")
         self.platform.start()
@@ -114,6 +117,55 @@ class SetupTests(unittest.TestCase):
         self.assertTrue(self.loaded)
         self.assertFalse(any(args[0] in ("/usr/bin/sudo", "/usr/bin/osascript") for args in self.commands))
         self.assertIn("background sync was verified", self.output[-1])
+
+    def test_directory_repair_precedes_native_reads_without_stopping_desktop(self):
+        self.access_check.side_effect = [True, False]
+        original_preflight = self.native.preflight
+        def preflight():
+            self.assertTrue(any("repair-access" in args for args in self.commands))
+            self.assertFalse(any(args[0] == "/usr/bin/osascript" for args in self.commands))
+            return original_preflight()
+        self.native.preflight = preflight
+        self.setup.run()
+        repair = [args for args in self.commands if "repair-access" in args]
+        self.assertEqual(len(repair), 1)
+        self.assertEqual(repair[0][0], "/usr/bin/sudo")
+        self.membership.assert_called_once_with(self.auth)
+        self.assertEqual(self.client._load()["state"], "active")
+
+    def test_directory_repair_check_explains_filesystem_failure_without_keychain(self):
+        self.access_check.return_value = True
+        self.native.preflight = Mock(side_effect=AssertionError("Keychain must not be reached"))
+        with self.assertRaisesRegex(ClientError, "directory unreadable"):
+            self.setup.run(check=True)
+        self.assertEqual(self.mutations(), [])
+        self.native.preflight.assert_not_called()
+        self.membership.assert_not_called()
+
+    def test_membership_failure_prevents_directory_repair(self):
+        self.access_check.return_value = True
+        self.membership.side_effect = ClientError("not a member")
+        with self.assertRaisesRegex(ClientError, "not a member"):
+            self.setup.run()
+        self.assertEqual(self.mutations(), [])
+        self.assertEqual(self.native.writes, [])
+
+    def test_failed_directory_repair_does_not_continue_into_native_reads(self):
+        self.access_check.return_value = True
+        self.native.preflight = Mock(side_effect=AssertionError("Keychain must not be reached"))
+        original_runner = self.runner
+        def runner(args, **kwargs):
+            result = original_runner(args, **kwargs)
+            if "repair-access" in args:
+                result.returncode = 1
+            return result
+        self.setup.runner = runner
+        with self.assertRaisesRegex(ClientError, "permissions could not be repaired"):
+            self.setup.run()
+        self.native.preflight.assert_not_called()
+        self.desktop_preflight.assert_not_called()
+        self.assertEqual(self.enroll_calls, [])
+        self.assertFalse(any(args[0] == "/usr/bin/osascript" for args in self.commands))
 
     def test_rerun_preserves_device_backup_and_uses_link(self):
         self.setup.run()
@@ -321,6 +373,46 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(request.full_url, DEFAULT_SHARE_SERVER + "/api/me")
         self.assertIsNone(request.data)
         self.assertNotIn("ssa_", request.full_url)
+
+
+class DirectoryAccessTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.system = self.root / "ClaudeCode"
+        self.managed = self.root / "Managed Preferences"
+
+    def check(self):
+        return directory_access_needs_repair(system_dir=self.system, managed_root=self.managed,
+                                             username="fixture", system_uid=os.getuid())
+
+    def test_missing_directories_need_no_repair(self):
+        self.assertFalse(self.check())
+
+    def test_private_directory_is_detected_without_changing_it(self):
+        self.system.mkdir(mode=0o700)
+        self.assertTrue(self.check())
+        self.assertEqual(self.system.stat().st_mode & 0o777, 0o700)
+        self.system.chmod(0o755)
+        self.assertFalse(self.check())
+
+    def test_private_scoped_policy_directory_is_detected(self):
+        self.managed.mkdir(mode=0o755)
+        self.managed.chmod(0o755)
+        (self.managed / "fixture").mkdir(mode=0o700)
+        self.assertTrue(self.check())
+
+    def test_unsafe_or_symlinked_directory_is_not_treated_as_legacy_repair(self):
+        self.system.mkdir(mode=0o755)
+        self.system.chmod(0o777)
+        with self.assertRaisesRegex(ClientError, "unsafe ownership or permissions"):
+            self.check()
+        self.system.rmdir()
+        self.managed.mkdir(mode=0o755)
+        self.system.symlink_to(self.managed)
+        with self.assertRaisesRegex(ClientError, "unsafe ownership or permissions"):
+            self.check()
 
 
 if __name__ == "__main__":

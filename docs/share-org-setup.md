@@ -16,7 +16,7 @@ curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/
 ```
 
 Run it as your ordinary Mac user, without `sudo` in front of the command. The
-installer uses the tested `v0.1.0a8` package and prepares its own Python runtime;
+installer uses the tested `v0.1.0a9` package and prepares its own Python runtime;
 Git, Python and uv do not need to be installed beforehand. If Apple Command Line
 Tools are missing, it opens their installer and continues when you finish it.
 
@@ -43,7 +43,7 @@ verification in the [pilot acceptance worksheet](team-pilot-acceptance.md).
 ## If an older setup reported “Missing _meta.json”
 
 That error came from assuming Desktop's optional profile library existed. The
-`v0.1.0a8` installer supports an initialized ordinary Claude Desktop installation
+`v0.1.0a9` installer supports an initialized ordinary Claude Desktop installation
 without that library. Open Claude Desktop, finish its normal first sign-in if
 needed, and run the same one-command setup again. Do not create a replacement
 profile or delete your existing app data.
@@ -51,9 +51,13 @@ profile or delete your existing app data.
 For a standard installation, setup enables Desktop's supported user-scoped
 launcher preference. Existing profile installations keep their current profile.
 It preserves the app's sign-in, conversation index and deployment mode. A managed
-policy that disables the launcher must be resolved by its administrator. Setup
-now checks these conditions before stopping sync, closing Desktop or asking for
-administrator approval. The Terminal `Password:` prompt is the Mac administrator
+policy that disables the launcher must be resolved by its administrator. Setup checks Desktop initialization before stopping sync or closing Desktop.
+If an older installer left a recognized system directory unreadable, a9 first
+verifies Share membership and asks for administrator approval to repair that
+directory. The repair checks its contents and ownership, preserves private file
+permissions, and refuses unrelated files. It runs before native credential
+inspection, so the filesystem failure is no longer mislabeled as a Keychain
+problem. The Terminal `Password:` prompt is the Mac administrator
 password requested by `sudo`; it is separate from Claude sign-in and Keychain.
 
 ## Repeat setup, upgrade, or link an existing device
@@ -72,13 +76,13 @@ credential store only and refuses a `CLAUDE_CONFIG_DIR` override or conflicting
 native provider configuration.
 
 The package and runtime stay under
-`~/.local/share/claude-desktop-swap/releases/v0.1.0a8/`. Keep that directory in
+`~/.local/share/claude-desktop-swap/releases/v0.1.0a9/`. Keep that directory in
 place while the service uses it. Setup prints the installed client path; for this
 release, status and contribution commands are:
 
 ```sh
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a8/venv/bin/team-pool-client status
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a8/venv/bin/team-pool-client contribute-account
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a9/venv/bin/team-pool-client status
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a9/venv/bin/team-pool-client contribute-account
 ```
 
 If Share saves its sign-in elsewhere, use the same installer with its account

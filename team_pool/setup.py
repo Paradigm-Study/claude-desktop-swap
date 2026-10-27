@@ -31,6 +31,29 @@ KEYCHAIN_GUIDANCE = ('If macOS asks for “security” to access “Claude Code-
                      'choose Always Allow for that exact request. Never paste a password or token here.')
 
 
+def directory_access_needs_repair(*, system_dir=None, managed_root=None, username=None, system_uid=0):
+    """Detect the old installer's private directories without reading their files.
+
+    The privileged repair validates provenance and contents before changing a
+    mode. This check only decides whether that repair must precede native reads.
+    """
+    system_dir = Path(system_dir or "/Library/Application Support/ClaudeCode")
+    managed_root = Path(managed_root or "/Library/Managed Preferences")
+    username = username or pwd.getpwuid(os.getuid()).pw_name
+    for path in (system_dir, managed_root, managed_root / username):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            raise ClientError("A native setup directory is inaccessible. Preserve it and resolve its filesystem permissions before setup; this is not a Keychain error.") from None
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != system_uid or info.st_mode & 0o022:
+            raise ClientError("A native setup directory has unsafe ownership or permissions. Preserve it and resolve that filesystem condition before setup.")
+        if info.st_mode & 0o055 != 0o055:
+            return True
+    return False
+
+
 @contextmanager
 def setup_lock(path):
     """A separate lock allows client operations to retain their existing lock."""
@@ -124,6 +147,7 @@ class Setup:
                  membership=share_membership, enroll=enroll_from_share,
                  installer=install_service, verify_wrapper=verify_desktop_wrapper,
                  desktop_preflight=resolve_target,
+                 access_check=directory_access_needs_repair,
                  output=print):
         self.source = Path(source_dir).expanduser()
         self.home = Path(home or Path.home())
@@ -133,6 +157,7 @@ class Setup:
         self.membership, self.enroll, self.installer = membership, enroll, installer
         self.verify_wrapper, self.output = verify_wrapper, output
         self.desktop_preflight = desktop_preflight
+        self.access_check = access_check
         self.uid = os.getuid()
         self.domain = f"gui/{self.uid}"
         self.service = self.domain + "/" + SERVICE
@@ -292,6 +317,19 @@ class Setup:
             return self._run(check=False)
 
     def _run(self, *, check):
+        identity = None
+        if self.access_check():
+            if check:
+                raise ClientError("An older installer left a native setup directory unreadable. Run the normal setup command to repair its permissions with administrator approval; Keychain has not been accessed.")
+            # Authenticate membership before requesting a narrowly scoped
+            # filesystem repair. No service, Desktop or native login is changed.
+            identity = self.membership(self.account_file)
+            self.output("Repairing directory permissions left by an older setup. macOS administrator approval is required; no credentials will be read by this repair.")
+            result = self.command(["/usr/bin/sudo", sys.executable,
+                                   str(self.source / "scripts/desktop_swap.py"), "repair-access", "--user",
+                                   pwd.getpwuid(self.uid).pw_name], visible=True, timeout=180)
+            if result.returncode or self.access_check():
+                raise ClientError("Native setup directory permissions could not be repaired. Preserve the reported files and resolve that filesystem error before repeating setup; Keychain has not been accessed.")
         # Catch an uninitialized or unsupported Desktop layout before any
         # Keychain prompt, sudo request, app quit, or service interruption.
         try:
@@ -313,7 +351,7 @@ class Setup:
                         + ("native launcher is installed." if wrapper_ready else "native launcher will be installed with administrator approval.")
                         + " Server membership has not been checked. No configuration was changed.")
             return {"check": True, "enrolled": state is not None, "wrapper_ready": wrapper_ready}
-        identity = self.membership(self.account_file)
+        identity = identity or self.membership(self.account_file)
         if state and state.get("share_account_id") and (state["share_account_id"] != identity or state.get("share_team_id") != TEAM_ID):
             raise ClientError("This Mac is linked to a different Claude Share identity. Sign in to its original Share account; setup will not rebind it.")
         self.stop_team()

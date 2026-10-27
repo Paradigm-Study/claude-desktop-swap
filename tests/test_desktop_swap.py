@@ -348,6 +348,148 @@ class InstallationTests(unittest.TestCase):
         self.assertNotIn("target_kind", state)
         self.assertNotIn("policy_existed", state)
 
+    def test_created_directories_ignore_private_umask_and_files_stay_private(self):
+        self.standard_layout()
+        self.layout.system_dir.rmdir()
+        previous_umask = os.umask(0o077)
+        try:
+            swap.make_system_directory(self.layout)
+            with swap.installation_lock(self.layout):
+                swap.install(self.layout)
+        finally:
+            os.umask(previous_umask)
+        target = swap.desktop_target(self.layout)
+        for path in (self.layout.system_dir, self.layout.managed_root, target.path.parent):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o755)
+        for path in (self.layout.state, self.layout.system_dir / swap.LOCK_NAME):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        for path in (self.layout.managed, target.path):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+
+    def test_existing_safe_directories_are_not_automatically_widened(self):
+        self.standard_layout()
+        self.layout.system_dir.chmod(0o700)
+        self.layout.managed_root.mkdir(mode=0o700)
+        user_directory = self.layout.managed_root / "fixture-user"
+        user_directory.mkdir(mode=0o700)
+        swap.make_system_directory(self.layout)
+        swap.make_policy_directory(self.layout, swap.desktop_target(self.layout))
+        for path in (self.layout.system_dir, self.layout.managed_root, user_directory):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+
+    def test_a7_lock_only_leftover_repair_then_standard_install(self):
+        marker = self.standard_layout()
+        before = marker.read_bytes()
+        self.layout.system_dir.chmod(0o700)
+        lock = self.layout.system_dir / swap.LOCK_NAME
+        lock.write_bytes(b"501")
+        lock.chmod(0o600)
+        self.assertIn("Repaired", swap.repair_access(self.layout))
+        self.assertEqual(self.layout.system_dir.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(lock.read_bytes(), b"501")
+        self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+        with swap.installation_lock(self.layout):
+            swap.install(self.layout)
+        self.assertTrue(self.layout.state.exists())
+        self.assertEqual(self.layout.state.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(marker.read_bytes(), before)
+        self.assertFalse(self.meta.exists())
+        self.assertIn("already readable", swap.repair_access(self.layout))
+
+    def test_empty_leftover_repair_creates_private_lock(self):
+        self.layout.system_dir.chmod(0o700)
+        self.assertIn("Repaired", swap.repair_access(self.layout))
+        self.assertEqual((self.layout.system_dir / swap.LOCK_NAME).stat().st_mode & 0o777, 0o600)
+        self.assertIn("already readable", swap.repair_access(self.layout))
+
+    def test_repair_fixes_group_denial_even_when_other_users_can_read(self):
+        self.layout.system_dir.chmod(0o705)
+        self.assertIn("Repaired", swap.repair_access(self.layout))
+        self.assertEqual(self.layout.system_dir.stat().st_mode & 0o777, 0o755)
+
+    def test_intact_owned_install_repairs_only_public_directory_modes(self):
+        self.standard_layout()
+        with swap.installation_lock(self.layout):
+            swap.install(self.layout)
+        target = swap.desktop_target(self.layout)
+        directories = (self.layout.system_dir, self.layout.managed_root, target.path.parent)
+        files = (self.layout.state, self.layout.managed, self.layout.launcher,
+                 self.layout.system_dir / swap.LOCK_NAME, target.path)
+        before = {path: (path.read_bytes(), path.stat().st_mode) for path in files}
+        for path in directories:
+            path.chmod(0o700)
+        self.assertIn("Repaired", swap.repair_access(self.layout))
+        for path in directories:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(before, {path: (path.read_bytes(), path.stat().st_mode) for path in files})
+
+    def test_repair_does_not_widen_shared_policy_root_with_other_contents(self):
+        self.standard_layout()
+        with swap.installation_lock(self.layout):
+            swap.install(self.layout)
+        target = swap.desktop_target(self.layout)
+        (self.layout.managed_root / "another-user").mkdir()
+        directories = (self.layout.system_dir, self.layout.managed_root, target.path.parent)
+        for path in directories:
+            path.chmod(0o700)
+        with self.assertRaisesRegex(swap.SetupError, "nothing was widened"):
+            swap.repair_access(self.layout)
+        for path in directories:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+
+    def test_repair_rejects_unknown_files_before_any_widening(self):
+        self.layout.system_dir.chmod(0o700)
+        unknown = self.layout.system_dir / "unrelated.json"
+        unknown.write_text('{"preserve":true}')
+        with self.assertRaisesRegex(swap.SetupError, "nothing was widened"):
+            swap.repair_access(self.layout)
+        self.assertEqual(self.layout.system_dir.stat().st_mode & 0o777, 0o700)
+        self.assertFalse((self.layout.system_dir / swap.LOCK_NAME).exists())
+        self.assertEqual(unknown.read_text(), '{"preserve":true}')
+
+    def test_repair_rejects_unsafe_directory_and_lock_modes(self):
+        lock = self.layout.system_dir / swap.LOCK_NAME
+        lock.write_text("keep")
+        for directory_mode, lock_mode in ((0o777, 0o600), (0o700, 0o644)):
+            with self.subTest(directory_mode=directory_mode, lock_mode=lock_mode):
+                self.layout.system_dir.chmod(directory_mode)
+                lock.chmod(lock_mode)
+                with self.assertRaisesRegex(swap.SetupError, "nothing was widened"):
+                    swap.repair_access(self.layout)
+                self.assertEqual(self.layout.system_dir.stat().st_mode & 0o777, directory_mode)
+                self.assertEqual(lock.stat().st_mode & 0o777, lock_mode)
+                self.assertEqual(lock.read_text(), "keep")
+
+    def test_repair_rejects_directory_and_lock_symlinks(self):
+        outside = self.root / "outside-lock"
+        outside.write_bytes(b"keep")
+        lock = self.layout.system_dir / swap.LOCK_NAME
+        lock.symlink_to(outside)
+        with self.assertRaises(OSError):
+            swap.repair_access(self.layout)
+        lock.unlink()
+        moved = self.root / "actual-system"
+        self.layout.system_dir.rename(moved)
+        self.layout.system_dir.symlink_to(moved, target_is_directory=True)
+        with self.assertRaises(OSError):
+            swap.repair_access(self.layout)
+        self.assertEqual(outside.read_bytes(), b"keep")
+
+    def test_repair_rejects_other_directory_owner(self):
+        other = swap.Layout(self.layout.home, self.layout.uid, self.layout.gid,
+                            self.layout.system_dir, system_uid=os.getuid() + 1)
+        self.layout.system_dir.chmod(0o700)
+        with self.assertRaisesRegex(swap.SetupError, "nothing was widened"):
+            swap.repair_access(other)
+        self.assertEqual(self.layout.system_dir.stat().st_mode & 0o777, 0o700)
+
+    def test_repair_waits_for_existing_installer_lock(self):
+        self.layout.system_dir.chmod(0o700)
+        with swap.installation_lock(self.layout):
+            with self.assertRaisesRegex(swap.SetupError, "Another installer"):
+                swap.repair_access(self.layout)
+        self.assertEqual(self.layout.system_dir.stat().st_mode & 0o777, 0o700)
+
     def test_invalid_metadata_does_not_fall_back_to_managed_policy(self):
         self.save(self.meta, {"appliedId": "../other"})
         marker = self.layout.home / "Library/Application Support/Claude/config.json"
