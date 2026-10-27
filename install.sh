@@ -140,7 +140,7 @@ setup_main() {
     [[ -x "$uv_bin" ]] || fail 'The Python environment manager did not install successfully.'
     "$uv_bin" venv --managed-python --python 3.12 "$release_dir/venv"
     "$uv_bin" pip install --python "$release_dir/venv/bin/python" "$release_dir/source"
-    "$release_dir/venv/bin/python" -c 'import team_pool.setup'
+    "$release_dir/venv/bin/python" -I -c 'import team_pool.setup'
     printf '%s\n' "$RELEASE" > "$release_dir/.ready"
   fi
   [[ ! -L "$release_dir/.ready" && "$(<"$release_dir/.ready")" == "$RELEASE" ]] || fail 'The installed release marker is invalid.'
@@ -154,7 +154,7 @@ setup_main() {
   cd "$release_dir"
   local arguments=(--source-dir "$release_dir/source" --account-file "$account_file")
   if (( check == 1 )); then arguments+=(--check); fi
-  "$release_dir/venv/bin/python" -m team_pool.setup "${arguments[@]}"
+  "$release_dir/venv/bin/python" -I -m team_pool.setup "${arguments[@]}"
   note "Client commands: $release_dir/venv/bin/team-pool-client status"
 }
 

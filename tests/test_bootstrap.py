@@ -55,6 +55,9 @@ elif name == "uv":
     elif args[:2] != ["pip", "install"]:
         raise SystemExit("unexpected uv command")
 elif name == "python":
+    if args[:1] != ["-I"]:
+        raise SystemExit("runtime must isolate the pinned installed package")
+    args = args[1:]
     if args[:2] == ["-c", "import team_pool.setup"]:
         pass
     elif args[:2] == ["-m", "team_pool.setup"]:
@@ -189,7 +192,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue((release / "venv/bin/python").is_file())
         self.assertEqual(len(self.events("curl")), 1)
         runtime = self.events("python")[-1]
-        self.assertEqual(runtime["args"], ["-m", "team_pool.setup", "--source-dir", str(release / "source"),
+        self.assertEqual(runtime["args"], ["-I", "-m", "team_pool.setup", "--source-dir", str(release / "source"),
                                            "--account-file", str(self.account)])
         self.assertEqual(runtime["cwd"], str(release))
         self.assertFalse(runtime["gateway_env_present"])
@@ -231,7 +234,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse(failed_marker.exists())
         self.assertTrue((release / ".ready").exists())
         self.assertEqual(len(self.events("curl")), 2)
-        module_runs = [event for event in self.events("python") if event["args"][:1] == ["-m"]]
+        module_runs = [event for event in self.events("python") if event["args"][:2] == ["-I", "-m"]]
         self.assertEqual(len(module_runs), 1)
         self.assert_clean()
 
