@@ -1,33 +1,35 @@
 # Live two-Mac acceptance worksheet
 
-Status: **IN PROGRESS — client 0.1.0a8 active on Mac A; a9 prepared on Mac B**.
-Offline integration tests do not complete this worksheet. Mac B's a7 and a8
-attempts failed. The a9 diagnostic is verified there; administrator repair,
-enrollment, and a successful Desktop conversation remain pending.
+Status: **IN PROGRESS — client 0.1.0a8 active on Mac A; a9 active on Mac B**.
+Mac B completed setup in its own GUI Terminal after the directory repair and
+failed SSH attempts. Its native request and background sync passed, and the user
+reported that it works. Existing-conversation continuity on Mac B, actual menu
+clicks, and the remaining lifecycle checks below are still unverified.
 Use only non-sensitive labels such as Account A / Mac B. Do not paste credentials,
 private prompts, account emails, or session identifiers.
 
 | Check | Mac A | Mac B | Evidence / observed limitation |
 | --- | --- | --- | --- |
-| macOS / Desktop / bundled Code version | 27.0.1 / 3.6556.2 / 2.1.308 | 27.2 / 3.6556.2 / Pending | Cloudflare coordinator; a8 active on Mac A, a9 runtime prepared on Mac B. |
-| Public one-command setup and repeat run | Passed on enrolled Mac | a7 and a8 failed; a9 repair/enrollment pending | Mac A's public a8 activation and exact piped-command rerun preserved device, token, Share identity, backup, native fingerprint, and Desktop profile. Mac B's tagged a9 script and runtime are verified, but full setup has not completed. |
-| Standard Desktop layout without a profile library | Existing profile preserved | a8 blocked by directory permissions | The supported user-scoped launcher policy passed fixtures without changing conversation data. The real a8 retry exposed an additional access failure left by a7; fixture success did not establish successful fresh-Mac setup. |
-| Installer directory access and repair | Existing installation accessible | a9 diagnostic passed; repair pending | Mac B's root-owned ClaudeCode directory is mode 0700. a9 `--check` reports the repair needed before accessing Keychain; the administrator repair has not yet run. |
-| One-time enrollment | Passed | Pending | Original invite enrollment linked to live Paradigm Share membership; same device token retained. |
-| Share membership enrollment without an invitation | Passed | Pending | Saved Share sign-in enrolled a temporary device, delivered an access-only assignment, rejected grant replay, and rejected delivery after test-device revocation. |
-| Membership linking preserves native login and Desktop profile | Passed | Pending | Native fingerprint, device ID, and original Desktop profile unchanged by linking; background sync active. |
+| macOS / Desktop / bundled Code version | 27.0.1 / 3.6556.2 / 2.1.308 | 27.2 / 3.6556.2 / Pending | Cloudflare coordinator; a8 active on Mac A, a9 active on Mac B. Mac B's bundled Code version remains unrecorded. |
+| Public one-command setup and repeat run | Passed on enrolled Mac | Initial setup passed; repeat pending | Mac A's public a8 activation and exact piped-command rerun preserved device, token, Share identity, backup, native fingerprint, and Desktop profile. Mac B's tagged public a9 installer completed in its own GUI Terminal after the repairs below. |
+| Standard Desktop layout without a profile library | Existing profile preserved | Passed | Mac B's native wrapper verified with its original standard Desktop data retained and no optional `_meta.json` created. The system and user policy directories were mode 0755, and the launcher policy was mode 0644. |
+| Installer directory access and repair | Existing installation accessible | Passed | a9 diagnosed the inaccessible root-owned ClaudeCode directory before Keychain access. An authorized repair changed its mode from 0700 to 0755, confirmed on Mac B. |
+| One-time enrollment | Passed | Passed | Mac A's original invite enrollment linked to live Paradigm Share membership with the same token. Mac B enrolled through Share and became active, managed, and linked, without a pending write. |
+| Share membership enrollment without an invitation | Passed | Passed | Mac A's temporary-device check delivered an access-only assignment, rejected grant replay, and rejected delivery after revocation. Mac B completed real enrollment using its saved Share sign-in. |
+| Membership linking preserves native login and Desktop profile | Passed | Not exercised separately | Mac A's native fingerprint, device ID, and Desktop profile were unchanged by linking. Mac B used fresh enrollment, retained its standard Desktop data, and has its original native backup. |
+| Background synchronization after setup | Passed | Passed | Both sync services ran. On Mac B, the recorded sync time advanced by about 59 seconds in a subsequent cycle while the client remained active. |
 | Browser contribution from each Mac | Passed | Pending | Two real accounts contributed from Mac A through fresh authorization. |
 | Contribution preserves native login and Desktop profile | Passed | Pending | Native fingerprint unchanged by contribution; Desktop profile unchanged after activation/restart. |
 | Existing provider sessions survive fresh-lineage authorization | Pending | Pending | |
 | Account contributed by Mac B serves a native turn on Mac A | Pending | Pending | |
 | Contribution status recovers a lost completion response | Pending | Pending | |
 | Pending contribution cancellation | Passed | Pending | Live contribution start/cancel exercised before real authorization. |
-| Full pool catalog and quota through installed menu helper | Passed | Pending | Five accounts returned in 0.24 s initially and 0.39 s after rerun; three eligible and two weekly-exhausted. Actual menu appearance and clicks remain unverified. |
+| Full pool catalog and quota through installed menu helper | Passed | Passed | Mac A returned five accounts in 0.24 s initially and 0.39 s after rerun; three eligible and two weekly-exhausted. Mac B's installed a9 helper returned five accounts, three eligible, in 0.16 s from its GUI context. Actual menu appearance and clicks remain unverified. |
 | Manual account selection through installed menu helper | Passed | Pending | Selection completed in 0.40 s, followed by a native Sonnet OK in 2.72 s. Restoring the original account completed in 0.41 s, followed by native OK in 2.19 s. Auth reported claude.ai / firstParty / max. |
 | Menu contribution start and cancellation | Passed through helper | Pending | Official OAuth start and cancellation succeeded without changing native credentials. No new account was added through the menu in this check; actual GUI clicks remain unverified. |
-| Initial native turn | Passed | Pending | Auth reports claude.ai / firstParty / max. Normal-speed Sonnet returned OK in 2.1 s after the a5 repair; user previously confirmed a successful Desktop message after restart. |
-| Existing conversation retained | Passed | Pending | User confirmed existing conversations remained available and a resumed conversation worked. |
-| No refresh/trusted-device token delivered | Passed | Pending | Assignment and active native-store verification confirm access-only credentials; recovery backup retained separately. |
+| Initial native turn | Passed | Passed | Auth reports claude.ai / firstParty / max. Mac A's normal-speed Sonnet returned OK in 2.1 s after the a5 repair. Mac B's real normal-speed Sonnet request returned exact OK with exit 0 in 2.35 s. |
+| Existing conversation retained | Passed | Pending | Mac A's user confirmed that a resumed conversation worked. The user reported Mac B working, but did not explicitly confirm a resumed existing conversation. |
+| No refresh/trusted-device token delivered | Passed | Passed | Assignment and active native-store verification confirm access-only credentials. Mac B's native fingerprint matched client state, and its original recovery backup was present. |
 | Contributed-account refresh occurs only on coordinator | Pending | Pending | |
 | Real provider-token refresh followed by successful turn | Pending | Pending | |
 | Quota-based account switch in same conversation | Pending | Pending | |
@@ -149,7 +151,7 @@ pool device or native recovery backup. This fixture ran with ordinary directory
 permissions. It missed the bootstrap's inherited restrictive umask, and its
 successful retry did not predict the real Mac B outcome.
 
-Follow-up SSH inspection of Mac B, a Mac Studio running macOS 27.2 and Desktop
+Follow-up SSH inspection of Mac B, running macOS 27.2 and Desktop
 3.6556.2, found the a8 runtime prepared but no pool enrollment or running sync/menu
 services. Its standard Desktop `config.json` was mode 0600 and no optional
 `_meta.json` existed. `/Library/Application Support/ClaudeCode` was owned by
@@ -181,8 +183,46 @@ before native inspection and performs the repair only through an administrator
 step after Share membership verification.
 
 On the physical Mac B, the tagged a9 script was downloaded and its SHA verified,
-and the a9 runtime was prepared. Its `--check` now reports the specific directory
-repair requirement before accessing Keychain. This verifies the corrected
-diagnostic only. The human administrator command is staged; privileged repair,
-full setup, enrollment, running services, and a resumed Desktop conversation
-remain pending.
+and the a9 runtime was prepared. Its `--check` reported the specific directory
+repair requirement before accessing Keychain. The first normal a9 attempt timed
+out waiting for the administrator step; the system directory remained mode 0700
+and no enrollment was created. A subsequent interactive SSH attempt obtained
+administrator authorization with `sudo -v` before setup. The repair then
+succeeded, and the system directory's mode was confirmed as 0755.
+
+That attempt reached native credential inspection but stopped before launcher
+installation or enrollment with this message: `Unlock your login Keychain and
+run setup in Terminal to approve the expected access request. Readiness checks
+never request approval.` This is the setup handler for
+`NativeKeychainAccessError`. It does not establish which Keychain item failed or
+whether the underlying cause was a locked Keychain, denied interaction, or a
+native helper failure. Normal setup does not enable the noninteractive guard
+used by `--check`. The SSH execution context is a hypothesis for this failure,
+not a demonstrated item-specific cause.
+
+The existing a9 setup command was then opened using `/usr/bin/open -a Terminal`
+on Mac B itself. The public installer completed in that logged-in GUI context
+without further code changes. The native wrapper verified, the system and user
+policy directories were mode 0755, and the launcher policy was mode 0644. Its
+ordinary Desktop data remained in place; no optional `_meta.json` was created.
+Enrollment was active, managed, and linked to Share, with no pending native
+write. The sync and menu services had live processes, and the menu helper used
+the persistent a9 Python runtime.
+
+A verification attempt over SSH still failed at native ownership inspection
+with `NativeKeychainAccessError` while the GUI services remained healthy. The
+same verification succeeded when run through Mac B's GUI Terminal: the native
+fingerprint matched client state, its original recovery backup was present, and
+the active native credentials were access-only. The installed menu helper
+returned all five pool accounts, three eligible, in 0.16 s. Authentication
+reported logged in through claude.ai / firstParty / max. A real normal-speed
+Sonnet request returned exact `OK` with exit 0 in 2.35 s. A later background
+cycle advanced the recorded sync time by about 59 seconds while remaining
+active.
+
+These results establish that GUI execution resolved this Mac's initial
+authorization and verification failures; they do not identify the exact item or
+underlying Keychain error in the failed SSH attempts. No credential export or
+permission bypass was used. The user subsequently reported, "ok it works now".
+That is confirmation of working setup, not an explicit existing-conversation
+continuity test or evidence of actual menu clicks. Those checks remain pending.

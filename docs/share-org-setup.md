@@ -9,7 +9,8 @@ inference goes directly to Anthropic.
 
 In a local Claude Desktop Code conversation, run `/team`, sign in to Claude
 Share, and confirm that **Paradigm** is listed. A shared session link alone does
-not establish team membership. Then paste this command into Terminal:
+not establish team membership. Then paste this command into Terminal on the Mac
+you are setting up:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/codex/team-pool/install.sh | /bin/bash
@@ -17,8 +18,11 @@ curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/
 
 Run it as your ordinary Mac user, without `sudo` in front of the command. The
 installer uses the tested `v0.1.0a9` package and prepares its own Python runtime;
-Git, Python and uv do not need to be installed beforehand. If Apple Command Line
-Tools are missing, it opens their installer and continues when you finish it.
+Git, Python and uv do not need to be installed beforehand. Use that Mac’s
+logged-in desktop Terminal, including when helping through Screen Sharing. An
+SSH shell can lack access to its login Keychain even when the desktop services
+work. If Apple Command Line Tools are missing, setup opens their installer and
+continues when you finish it.
 
 Setup checks your saved Share sign-in and current Paradigm membership, installs
 the native launcher if needed, enrolls or links this Mac, starts background sync,
@@ -37,8 +41,9 @@ of repeatedly prompting. See [Keychain recovery](keychain-access.md).
 
 After setup, resume an existing local Code conversation and send a normal-speed
 message. The menu bar lists all shared accounts, their 5-hour and weekly usage, and the account assigned to this Mac. Open an available account’s submenu to switch this Mac; automatic quota failover continues. Choose **Add Account to Shared Pool…** to authorize another subscription in the browser, then **Enter Authorization Code…** to finish in its hidden field. See the [menu guide](team-status-menu.md). Fast mode retains
-its separate paid-credit requirements. A second physical Mac still needs live
-verification in the [pilot acceptance worksheet](team-pilot-acceptance.md).
+its separate paid-credit requirements. Two physical Macs have completed native
+pool activation; remaining continuity and failover checks are recorded in the
+[pilot acceptance worksheet](team-pilot-acceptance.md).
 
 ## If an older setup reported “Missing _meta.json”
 
