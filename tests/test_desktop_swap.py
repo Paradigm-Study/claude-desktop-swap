@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,7 @@ class InstallationTests(unittest.TestCase):
         self.layout = swap.Layout(
             self.root / "home", os.getuid(), os.getgid(), self.root / "system",
             system_uid=os.getuid(), system_gid=os.getgid(),
+            managed_root=self.root / "Managed Preferences", username="fixture-user",
         )
         self.layout.profiles.mkdir(parents=True)
         self.layout.system_dir.mkdir()
@@ -209,7 +211,7 @@ class InstallationTests(unittest.TestCase):
         outside.write_text('{"untouched": true}')
         self.profile.unlink()
         self.profile.symlink_to(outside)
-        with self.assertRaises(OSError):
+        with self.assertRaises(swap.SetupError):
             swap.install(self.layout)
         self.assertEqual(outside.read_text(), '{"untouched": true}')
         self.profile.unlink()
@@ -218,7 +220,7 @@ class InstallationTests(unittest.TestCase):
         moved = directory.with_name("real-configLibrary")
         directory.rename(moved)
         directory.symlink_to(moved, target_is_directory=True)
-        with self.assertRaises(OSError):
+        with self.assertRaises(swap.SetupError):
             swap.install(self.layout)
         self.assertFalse(self.layout.managed.exists())
 
@@ -246,6 +248,256 @@ class InstallationTests(unittest.TestCase):
         swap.uninstall(self.layout)
         self.assertEqual(self.load(other_profile), {"leave": "alone"})
         self.assertNotIn(swap.FLAG, self.load(self.profile))
+
+    def standard_layout(self):
+        self.meta.unlink()
+        self.profile.unlink()
+        marker = self.layout.home / "Library/Application Support/Claude/config.json"
+        marker.parent.mkdir(parents=True)
+        self.save(marker, {"locale": "en-US", "appState": "keep"})
+        return marker
+
+    def test_standard_layout_uses_scoped_policy_without_creating_a_profile(self):
+        marker = self.standard_layout()
+        before = marker.read_bytes()
+        swap.install(self.layout)
+        target = swap.desktop_target(self.layout)
+        self.assertEqual(target.kind, "managed")
+        self.assertEqual(target.path, self.layout.managed_root / "fixture-user" / "com.anthropic.claudefordesktop.plist")
+        self.assertEqual(plistlib.loads(target.path.read_bytes()), {swap.FLAG: True})
+        self.assertEqual(marker.read_bytes(), before)
+        self.assertFalse(self.meta.exists())
+        state = self.load(self.layout.state)
+        self.assertEqual(state["schema"], 2)
+        self.assertFalse(state["policy_existed"])
+        self.assertIn("Already installed", swap.install(self.layout))
+        self.assertIn("verified", swap.status(self.layout))
+        swap.uninstall(self.layout)
+        self.assertFalse(target.path.exists())
+        self.assertEqual(marker.read_bytes(), before)
+        self.assertFalse(self.meta.exists())
+
+    def test_standard_uninstall_preserves_new_unrelated_policy_values(self):
+        self.standard_layout()
+        swap.install(self.layout)
+        target = swap.desktop_target(self.layout)
+        target.path.write_bytes(plistlib.dumps({swap.FLAG: True, "disableNonessentialTelemetry": True}))
+        swap.uninstall(self.layout)
+        self.assertEqual(plistlib.loads(target.path.read_bytes()), {"disableNonessentialTelemetry": True})
+
+    def test_standard_reinstall_keeps_original_policy_after_desktop_creates_profiles(self):
+        self.standard_layout()
+        swap.install(self.layout)
+        before = self.layout.state.read_bytes()
+        self.save(self.meta, {"appliedId": "later-profile"})
+        later = self.layout.profiles / "later-profile.json"
+        self.save(later, {"keep": "unchanged"})
+        self.assertIn("Already installed", swap.install(self.layout))
+        self.assertEqual(self.layout.state.read_bytes(), before)
+        swap.uninstall(self.layout)
+        self.assertEqual(self.load(later), {"keep": "unchanged"})
+
+    def test_standard_uninstall_refuses_policy_drift_without_other_writes(self):
+        self.standard_layout()
+        swap.install(self.layout)
+        target = swap.desktop_target(self.layout)
+        before = {p: p.read_bytes() for p in (self.layout.managed, self.layout.launcher, self.layout.state)}
+        target.path.write_bytes(plistlib.dumps({swap.FLAG: False}))
+        with self.assertRaisesRegex(swap.SetupError, "flag changed"):
+            swap.uninstall(self.layout)
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+
+    def test_standard_uninstall_refuses_newly_unsafe_policy_directory(self):
+        self.standard_layout()
+        swap.install(self.layout)
+        target = swap.desktop_target(self.layout)
+        target.path.parent.chmod(0o777)
+        with self.assertRaisesRegex(swap.SetupError, "unsafe directory"):
+            swap.uninstall(self.layout)
+        self.assertTrue(self.layout.state.exists())
+        self.assertTrue(target.path.exists())
+
+    def test_standard_failed_write_rolls_back_launcher_settings_and_policy(self):
+        self.standard_layout()
+        target = swap.desktop_target(self.layout)
+        real_write = swap.write_file
+        def fail_state(path, data, mode, owner):
+            if path == self.layout.state:
+                raise OSError("simulated state write failure")
+            return real_write(path, data, mode, owner)
+        with patch.object(swap, "write_file", side_effect=fail_state):
+            with self.assertRaises(OSError):
+                swap.install(self.layout)
+        self.assertFalse(target.path.exists())
+        self.assertFalse(self.layout.managed.exists())
+        self.assertFalse(self.layout.launcher.exists())
+        self.assertFalse(self.layout.state.exists())
+
+    def test_missing_standard_data_is_actionable_before_any_writes(self):
+        self.meta.unlink()
+        with self.assertRaisesRegex(swap.SetupError, "first sign-in.*no profile needs to be created"):
+            swap.install(self.layout)
+        self.assertFalse(self.layout.managed.exists())
+        self.assertFalse(self.layout.launcher.exists())
+        self.assertFalse(self.layout.state.exists())
+
+    def test_profile_installs_retain_compatible_schema_one(self):
+        swap.install(self.layout)
+        state = self.load(self.layout.state)
+        self.assertEqual(state["schema"], 1)
+        self.assertNotIn("target_kind", state)
+        self.assertNotIn("policy_existed", state)
+
+    def test_created_directories_ignore_private_umask_and_files_stay_private(self):
+        self.standard_layout()
+        self.layout.system_dir.rmdir()
+        previous_umask = os.umask(0o077)
+        try:
+            swap.make_system_directory(self.layout)
+            with swap.installation_lock(self.layout):
+                swap.install(self.layout)
+        finally:
+            os.umask(previous_umask)
+        target = swap.desktop_target(self.layout)
+        for path in (self.layout.system_dir, self.layout.managed_root, target.path.parent):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o755)
+        for path in (self.layout.state, self.layout.system_dir / swap.LOCK_NAME):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        for path in (self.layout.managed, target.path):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+
+    def test_existing_safe_directories_are_not_automatically_widened(self):
+        self.standard_layout()
+        self.layout.system_dir.chmod(0o700)
+        self.layout.managed_root.mkdir(mode=0o700)
+        user_directory = self.layout.managed_root / "fixture-user"
+        user_directory.mkdir(mode=0o700)
+        swap.make_system_directory(self.layout)
+        swap.make_policy_directory(self.layout, swap.desktop_target(self.layout))
+        for path in (self.layout.system_dir, self.layout.managed_root, user_directory):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+
+    def test_a7_lock_only_leftover_repair_then_standard_install(self):
+        marker = self.standard_layout()
+        before = marker.read_bytes()
+        self.layout.system_dir.chmod(0o700)
+        lock = self.layout.system_dir / swap.LOCK_NAME
+        lock.write_bytes(b"501")
+        lock.chmod(0o600)
+        self.assertIn("Repaired", swap.repair_access(self.layout))
+        self.assertEqual(self.layout.system_dir.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(lock.read_bytes(), b"501")
+        self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+        with swap.installation_lock(self.layout):
+            swap.install(self.layout)
+        self.assertTrue(self.layout.state.exists())
+        self.assertEqual(self.layout.state.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(marker.read_bytes(), before)
+        self.assertFalse(self.meta.exists())
+        self.assertIn("already readable", swap.repair_access(self.layout))
+
+    def test_empty_leftover_repair_creates_private_lock(self):
+        self.layout.system_dir.chmod(0o700)
+        self.assertIn("Repaired", swap.repair_access(self.layout))
+        self.assertEqual((self.layout.system_dir / swap.LOCK_NAME).stat().st_mode & 0o777, 0o600)
+        self.assertIn("already readable", swap.repair_access(self.layout))
+
+    def test_repair_fixes_group_denial_even_when_other_users_can_read(self):
+        self.layout.system_dir.chmod(0o705)
+        self.assertIn("Repaired", swap.repair_access(self.layout))
+        self.assertEqual(self.layout.system_dir.stat().st_mode & 0o777, 0o755)
+
+    def test_intact_owned_install_repairs_only_public_directory_modes(self):
+        self.standard_layout()
+        with swap.installation_lock(self.layout):
+            swap.install(self.layout)
+        target = swap.desktop_target(self.layout)
+        directories = (self.layout.system_dir, self.layout.managed_root, target.path.parent)
+        files = (self.layout.state, self.layout.managed, self.layout.launcher,
+                 self.layout.system_dir / swap.LOCK_NAME, target.path)
+        before = {path: (path.read_bytes(), path.stat().st_mode) for path in files}
+        for path in directories:
+            path.chmod(0o700)
+        self.assertIn("Repaired", swap.repair_access(self.layout))
+        for path in directories:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(before, {path: (path.read_bytes(), path.stat().st_mode) for path in files})
+
+    def test_repair_does_not_widen_shared_policy_root_with_other_contents(self):
+        self.standard_layout()
+        with swap.installation_lock(self.layout):
+            swap.install(self.layout)
+        target = swap.desktop_target(self.layout)
+        (self.layout.managed_root / "another-user").mkdir()
+        directories = (self.layout.system_dir, self.layout.managed_root, target.path.parent)
+        for path in directories:
+            path.chmod(0o700)
+        with self.assertRaisesRegex(swap.SetupError, "nothing was widened"):
+            swap.repair_access(self.layout)
+        for path in directories:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+
+    def test_repair_rejects_unknown_files_before_any_widening(self):
+        self.layout.system_dir.chmod(0o700)
+        unknown = self.layout.system_dir / "unrelated.json"
+        unknown.write_text('{"preserve":true}')
+        with self.assertRaisesRegex(swap.SetupError, "nothing was widened"):
+            swap.repair_access(self.layout)
+        self.assertEqual(self.layout.system_dir.stat().st_mode & 0o777, 0o700)
+        self.assertFalse((self.layout.system_dir / swap.LOCK_NAME).exists())
+        self.assertEqual(unknown.read_text(), '{"preserve":true}')
+
+    def test_repair_rejects_unsafe_directory_and_lock_modes(self):
+        lock = self.layout.system_dir / swap.LOCK_NAME
+        lock.write_text("keep")
+        for directory_mode, lock_mode in ((0o777, 0o600), (0o700, 0o644)):
+            with self.subTest(directory_mode=directory_mode, lock_mode=lock_mode):
+                self.layout.system_dir.chmod(directory_mode)
+                lock.chmod(lock_mode)
+                with self.assertRaisesRegex(swap.SetupError, "nothing was widened"):
+                    swap.repair_access(self.layout)
+                self.assertEqual(self.layout.system_dir.stat().st_mode & 0o777, directory_mode)
+                self.assertEqual(lock.stat().st_mode & 0o777, lock_mode)
+                self.assertEqual(lock.read_text(), "keep")
+
+    def test_repair_rejects_directory_and_lock_symlinks(self):
+        outside = self.root / "outside-lock"
+        outside.write_bytes(b"keep")
+        lock = self.layout.system_dir / swap.LOCK_NAME
+        lock.symlink_to(outside)
+        with self.assertRaises(OSError):
+            swap.repair_access(self.layout)
+        lock.unlink()
+        moved = self.root / "actual-system"
+        self.layout.system_dir.rename(moved)
+        self.layout.system_dir.symlink_to(moved, target_is_directory=True)
+        with self.assertRaises(OSError):
+            swap.repair_access(self.layout)
+        self.assertEqual(outside.read_bytes(), b"keep")
+
+    def test_repair_rejects_other_directory_owner(self):
+        other = swap.Layout(self.layout.home, self.layout.uid, self.layout.gid,
+                            self.layout.system_dir, system_uid=os.getuid() + 1)
+        self.layout.system_dir.chmod(0o700)
+        with self.assertRaisesRegex(swap.SetupError, "nothing was widened"):
+            swap.repair_access(other)
+        self.assertEqual(self.layout.system_dir.stat().st_mode & 0o777, 0o700)
+
+    def test_repair_waits_for_existing_installer_lock(self):
+        self.layout.system_dir.chmod(0o700)
+        with swap.installation_lock(self.layout):
+            with self.assertRaisesRegex(swap.SetupError, "Another installer"):
+                swap.repair_access(self.layout)
+        self.assertEqual(self.layout.system_dir.stat().st_mode & 0o777, 0o700)
+
+    def test_invalid_metadata_does_not_fall_back_to_managed_policy(self):
+        self.save(self.meta, {"appliedId": "../other"})
+        marker = self.layout.home / "Library/Application Support/Claude/config.json"
+        marker.parent.mkdir(parents=True)
+        self.save(marker, {})
+        with self.assertRaisesRegex(swap.SetupError, "selected profile identifier is invalid"):
+            swap.install(self.layout)
+        self.assertFalse(self.layout.managed_root.exists())
 
 
 class LauncherTests(unittest.TestCase):

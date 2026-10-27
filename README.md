@@ -4,6 +4,31 @@ Use your native Claude subscriptions in **local Claude Desktop Code sessions**, 
 
 This companion project connects Desktop's process launcher to the native Claude Code credential store. Desktop keeps its existing login and conversation index while `cswap` manages the account used for Code requests. It also includes an optional correction for stale quota readings in `claude-swap` 0.26.0.
 
+**Shared native pool pilot:** Paradigm members sign into Claude Share with
+`/team`, then run this one-time Mac setup command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/codex/team-pool/install.sh | /bin/bash
+```
+
+No invitation token is needed. The installer handles prerequisites, enrollment,
+background sync and the Claude Swap menu bar. The menu shows every account and
+quota, switches this Mac to an available account, and adds accounts through
+browser authorization. Run it again to upgrade or link an
+existing invite enrollment. macOS may request administrator or Keychain approval.
+See the [organization setup guide](docs/share-org-setup.md) for the complete flow.
+Inference stays directly on native subscriptions. Teammates can contribute new
+accounts from their own Macs; the coordinator owns their refresh credentials.
+The [acceptance worksheet](docs/team-pilot-acceptance.md) records the first Mac's
+live results; a second physical Mac remains to be verified. Local `cswap add`
+does not upload an account to the shared pool.
+
+The coordinator can also use [Cloudflare Workers and a SQLite Durable Object](docs/cloudflare-pool.md),
+with its own storage and secrets in an existing Cloudflare account. Teammates use
+the same Mac client and native subscription mode; no always-on Mac is required.
+The team client has a separate [Claude Swap status menu bar](docs/team-status-menu.md);
+keep the personal `cswap` rotator stopped while using the shared pool.
+
 **Experimental, unofficial, and macOS only.** The integration was exercised with Desktop's bundled Claude Code 2.1.293 and 2.1.295. Its launcher configuration is version-sensitive; compatibility with future Desktop releases is not guaranteed. This project is not affiliated with Anthropic or the upstream claude-swap maintainers.
 
 ## What it does
@@ -66,11 +91,11 @@ The wrapper normally leaves Desktop's Fast-mode restriction in place. To restore
 
 ## How it works
 
-Desktop can launch its bundled Code process through the system managed `processWrapper`. This installer sets that wrapper and enables `claudeCodeProcessWrapperEnabled` in the selected profile under `~/Library/Application Support/Claude-3p/configLibrary/`.
+Desktop can launch its bundled Code process through the system managed `processWrapper`. This installer sets that wrapper and enables `claudeCodeProcessWrapperEnabled` in the existing selected profile when its optional configuration library is present. An initialized standard Desktop installation uses its supported user-scoped macOS preference instead. Neither path creates a replacement Desktop profile or moves conversation data.
 
 The wrapper removes host-pinned OAuth, API-key, and gateway environment values for the selected macOS user, then executes the original command and arguments. Claude Code can consequently read the native credential store that `cswap` updates. Other macOS users pass through the wrapper unchanged. The integration also removes the host's blanket nonessential-traffic restriction, which otherwise suppresses some account capabilities.
 
-No proxy or API server is introduced. No application bundle or Anthropic binary is modified. The repository contains no account exports, credentials, session histories, or Anthropic source code.
+The Desktop launcher introduces no proxy or API server. The optional team coordinator exchanges credentials; inference still goes directly to Anthropic. No application bundle or Anthropic binary is modified. The repository contains no account exports, credentials, session histories, or Anthropic source code.
 
 See [architecture and limitations](docs/architecture.md) for the exact state boundaries and modified files.
 
@@ -107,10 +132,14 @@ The uninstaller restores the settings it owns and refuses conflicting edits. Reo
 
 ## Development
 
-The installer tests use temporary directories and synthetic settings; they do not touch your installed Claude setup:
+The tests use temporary directories, synthetic credentials, and local HTTPS;
+they do not touch your installed Claude setup or call Anthropic. Install the
+pilot's test/runtime dependencies in an isolated Python 3.12+ environment:
 
 ```sh
-python3 -m unittest discover -s tests -v
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -e .
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
 The quota regression tests require `claude-swap==0.26.0` in an isolated environment; see the patch instructions. CI exercises the installer on macOS and Linux fixtures and the quota behavior against the pinned upstream package. Live Desktop authentication is a manual integration check, not covered by fixture tests.
