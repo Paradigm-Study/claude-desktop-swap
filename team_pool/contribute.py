@@ -8,7 +8,7 @@ import urllib.parse
 import warnings
 import webbrowser
 
-from .client import ClientError, DEVICE_SECRET, RequestError, _lock, _number, _safe_string
+from .client import ClientError, DEVICE_SECRET, RequestError, _number, _safe_string
 from .provider import CLIENT_ID
 
 AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
@@ -85,7 +85,7 @@ class Contribution:
         self.client._save(state)
 
     def start(self):
-        with _lock(self.client.config):
+        with self.client.locked():
             state, token = self._context()
             last = state.get("contribution")
             if last and last.get("state") in ("submitted", "exchanging"):
@@ -95,7 +95,7 @@ class Contribution:
             return result
 
     def inspect(self, *, cancel=False):
-        with _lock(self.client.config):
+        with self.client.locked():
             state, token = self._context()
             last = state.get("contribution")
             if not last:
@@ -112,7 +112,7 @@ class Contribution:
         if not (valid and 1 <= len(raw) <= 4096 and all(33 <= ord(c) <= 126 for c in raw)
                 and re.fullmatch(r"[A-Za-z0-9_-]{32,128}", state_value)):
             raise ClientError("Paste the complete authorization code, including #state, at the hidden prompt.")
-        with _lock(self.client.config):
+        with self.client.locked():
             state, token = self._context()
             last = state.get("contribution")
             if not last or last["contribution_id"] != contribution_id or last["state"] != "pending":

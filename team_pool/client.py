@@ -89,7 +89,7 @@ class Transport:
         self.opener = urllib.request.build_opener(*handlers)
 
     def post(self, path, body, token=None):
-        if path not in ("/v1/enroll", "/v1/enroll/share", "/v1/link/share", "/v1/assignment", "/v1/contributions/start",
+        if path not in ("/v1/enroll", "/v1/enroll/share", "/v1/link/share", "/v1/assignment", "/v1/accounts/list", "/v1/contributions/start",
                         "/v1/contributions/complete", "/v1/contributions/status",
                         "/v1/contributions/cancel"):
             raise ClientError("Unknown coordinator endpoint.")
@@ -158,7 +158,7 @@ def _private_write(path, raw):
 
 
 @contextmanager
-def _lock(path):
+def _lock(path, *, timeout=None):
     path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     stream = None
     try:
@@ -167,7 +167,19 @@ def _lock(path):
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise ClientError("Unsafe client lock file.")
-        fcntl.flock(stream, fcntl.LOCK_EX)
+        if timeout is None:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        stream.close()
+                        raise ClientError("Pool synchronization is in progress. Try again shortly; no account was changed.") from None
+                    time.sleep(min(0.05, max(0, deadline - time.monotonic())))
     except OSError:
         if stream:
             stream.close()
@@ -199,16 +211,16 @@ def _configuration(path):
         raise ClientError("Desktop native launcher configuration is missing or invalid; check the desktop-swap installation.") from None
 
 
-def verify_desktop_wrapper(*, home=None, system_dir=None):
+def verify_desktop_wrapper(*, home=None, system_dir=None, managed_root=None, system_uid=0):
+    from .desktop_profile import DesktopProfileError, launcher_enabled, resolve_target
     home = Path(home or Path.home())
     system_dir = Path(system_dir or "/Library/Application Support/ClaudeCode")
-    profiles = home / "Library/Application Support/Claude-3p/configLibrary"
-    selected = _configuration(profiles / "_meta.json").get("appliedId")
-    if not isinstance(selected, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", selected):
-        raise ClientError("Select a supported Claude Desktop profile before starting the native pilot.")
-    profile = _configuration(profiles / (selected + ".json"))
-    if profile.get("claudeCodeProcessWrapperEnabled") is not True:
-        raise ClientError("Enable the desktop-swap launcher for the selected Desktop profile first.")
+    try:
+        target = resolve_target(home, managed_root=managed_root, system_uid=system_uid)
+        if not launcher_enabled(target, system_uid=system_uid):
+            raise ClientError("Enable the desktop-swap launcher with the setup command first.")
+    except DesktopProfileError as error:
+        raise ClientError(str(error)) from None
     launcher = system_dir / "native-subscription-launcher"
     wrapper = _configuration(system_dir / "managed-settings.json").get("processWrapper")
     try:
@@ -258,7 +270,7 @@ class Client:
     """Stateful client; inject native/transport/preflight/clock for offline tests."""
 
     def __init__(self, config=DEFAULT_CONFIG, *, native=None, transport=None,
-                 clock=time.time, preflight=native_preflight):
+                 clock=time.time, preflight=native_preflight, lock_timeout=None):
         self.config = Path(config).expanduser().absolute()
         if native is None:
             from .native import NativeStore
@@ -267,6 +279,10 @@ class Client:
         self.transport = transport
         self.clock = clock
         self.preflight = preflight
+        self.lock_timeout = lock_timeout
+
+    def locked(self):
+        return _lock(self.config, timeout=self.lock_timeout)
 
     def _load(self, optional=False):
         if optional and not self.config.exists() and not self.config.is_symlink():
@@ -323,7 +339,7 @@ class Client:
         server = server_url(server, allow_loopback_http)
         if not _safe_string(device_name, maximum=128) or not _safe_string(invitation):
             raise ClientError("A device name and valid invitation are required.")
-        with _lock(self.config):
+        with self.locked():
             if self._load(optional=True) is not None:
                 raise ClientError("Enrollment or recovery state already exists. Complete leave --restore before enrolling again.")
             self._preflight()
@@ -340,10 +356,15 @@ class Client:
                 raise
             return self._status(state)
 
-    def sync(self, *, take_over_native_store=False):
+    def sync(self, *, take_over_native_store=False, account_id=None):
         from .native import NativeDriftError, NativeKeychainAccessError, NativePayloadError, NativePolicyError, NativeStoreError
-        with _lock(self.config):
+        if account_id is not None and (not isinstance(account_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", account_id)):
+            raise ClientError("Select a valid account from the shared pool.")
+        with self.locked():
             state = self._load()
+            if account_id is not None and not state.get("managed"):
+                raise ClientError("Complete native pool setup before switching accounts.")
             if state["state"] in ("revoked", "left"):
                 raise PausedError("Enrollment was revoked or left. Inspect status and follow the recovery runbook.")
             if state["state"] == "paused":
@@ -372,8 +393,11 @@ class Client:
             if not _safe_string(token):
                 raise ClientError("Device credential is missing. Leave and enroll with a new invitation.")
             try:
-                assignment = self._transport(state).post("/v1/assignment", {}, token=token)
+                body = {} if account_id is None else {"account_id": account_id}
+                assignment = self._transport(state).post("/v1/assignment", body, token=token)
             except RequestError as error:
+                if account_id is not None and error.status == 409:
+                    raise ClientError("That account is unavailable or has reached the quota threshold. Refresh the pool and choose an available account; your native login was not changed.") from None
                 if error.status == 401:
                     state.update(state="revoked", reason="device_revoked")
                 else:
@@ -381,6 +405,8 @@ class Client:
                 self._save(state)
                 raise
             self._validate_assignment(assignment)
+            if account_id is not None and (assignment["account_id"] != account_id or assignment.get("state", "fresh") != "fresh"):
+                raise ClientError("The coordinator did not confirm the selected account; your native login was not changed.")
             expected = snapshot["fingerprint"] if initialize else state["fingerprint"]
             try:
                 plan = self.native.plan(assignment, expected, initialize=initialize)
@@ -499,14 +525,49 @@ class Client:
         return result
 
     def status(self):
-        with _lock(self.config):
+        with self.locked():
             state = self._load(optional=True)
             return self._status(state) if state else {"state": "not_enrolled"}
+
+    def list_accounts(self):
+        """Read member-visible metadata; never request an assignment or native write."""
+        from .catalog import validate_catalog
+        with self.locked():
+            state = self._load()
+            if state["state"] in ("revoked", "left"):
+                raise ClientError("This Mac no longer has shared pool access.")
+            token = self.native.get_secret(DEVICE_SECRET)
+            if not _safe_string(token):
+                raise ClientError("The device credential is missing. Repeat setup before viewing the pool.")
+        try:
+            value = self._transport(state).post("/v1/accounts/list", {}, token=token)
+        except RequestError as error:
+            if error.status == 404:
+                raise ClientError("The coordinator is still updating. Refresh the pool shortly.") from None
+            if error.status == 401:
+                with self.locked():
+                    current = self._load()
+                    if (current["device_id"], current["server"]) == (state["device_id"], state["server"]) and current["state"] != "left":
+                        current.update(state="revoked", reason="device_revoked")
+                        self._save(current)
+                raise ClientError("This Mac no longer has shared pool access. Check your Claude Share membership.") from None
+            raise
+        catalog = validate_catalog(value)
+        with self.locked():
+            current = self._load()
+            if ((current["device_id"], current["server"]) != (state["device_id"], state["server"])
+                    or current["state"] in ("revoked", "left")):
+                raise ClientError("Pool enrollment changed while loading accounts. Refresh after setup completes.")
+            # The checkmark describes the credential actually installed on this
+            # Mac, even if a server decision has not yet been committed locally.
+            catalog.update(account_id=current.get("account_id"), client_state=current["state"],
+                           synced_at=current.get("synced_at"), catalog_at=self.clock())
+        return catalog
 
     def resume(self):
         """Acknowledge repaired setup; never overwrite or accept native-login drift."""
         from .native import NativeKeychainAccessError
-        with _lock(self.config):
+        with self.locked():
             state = self._load()
             if state["state"] in ("revoked", "left"):
                 raise ClientError("Revoked or departed enrollment cannot be resumed.")
@@ -528,7 +589,7 @@ class Client:
 
     def leave(self, *, restore=False):
         from .native import NativeStoreError
-        with _lock(self.config):
+        with self.locked():
             state = self._load(optional=True)
             restored = False
             if restore and state and (state.get("managed") or state.get("pending_write")):
@@ -664,8 +725,10 @@ def main(argv=None):
     sync = commands.add_parser("sync")
     sync.add_argument("--once", action="store_true", required=True)
     sync.add_argument("--take-over-native-store", action="store_true")
-    for command in ("run", "status", "resume", "service-install", "service-remove"):
+    for command in ("run", "status", "accounts", "resume", "service-install", "service-remove"):
         commands.add_parser(command)
+    switch = commands.add_parser("switch-account", help="Select an available account for this Mac; quota failover continues")
+    switch.add_argument("account_id")
     leave = commands.add_parser("leave")
     leave.add_argument("--restore", action="store_true")
     contribute = commands.add_parser("contribute-account", help="Share a fresh subscription login with the enrolled pool")
@@ -690,6 +753,10 @@ def main(argv=None):
             result = client.sync(take_over_native_store=args.take_over_native_store)
         elif args.command == "status":
             result = client.status()
+        elif args.command == "accounts":
+            result = client.list_accounts()
+        elif args.command == "switch-account":
+            result = client.sync(account_id=args.account_id)
         elif args.command == "resume":
             result = client.resume()
         elif args.command == "contribute-account":

@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 from team_pool.client import Client, ClientError, DEVICE_SECRET, SERVICE, service_path
 from team_pool.setup import Setup, TEAM_ID, inspect_state, setup_lock, share_membership
 from team_pool.share_enrollment import DEFAULT_SHARE_SERVER
+from team_pool.desktop_profile import DesktopProfileError
 from test_team_client import FakeNative, FakeTransport
 
 
@@ -41,11 +42,13 @@ class SetupTests(unittest.TestCase):
         self.membership = Mock(return_value="account001")
         self.enroll_calls = []
         self.check_wrapper = Mock(return_value=None)
+        self.desktop_preflight = Mock(return_value=None)
         self.output = []
         self.setup = Setup(self.source, client=self.client, account_file=self.auth,
                            home=self.home, runner=self.runner, membership=self.membership,
                            enroll=self.enroll, installer=self.install,
                            verify_wrapper=self.check_wrapper, output=self.output.append,
+                           desktop_preflight=self.desktop_preflight,
                            sleep=lambda _: None, clock=lambda: next(self.ticks))
         self.platform = patch("team_pool.setup.sys.platform", "darwin")
         self.platform.start()
@@ -140,6 +143,21 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(self.mutations(), [])
         self.assertEqual(self.enroll_calls, [])
         self.assertEqual(self.native.writes, [])
+
+    def test_uninitialized_desktop_fails_before_prompts_or_service_stop(self):
+        self.active()
+        self.install(self.client)
+        self.commands.clear()
+        self.native.writes.clear()
+        self.desktop_preflight.side_effect = DesktopProfileError("Open Claude Desktop and finish its first sign-in")
+        with self.assertRaisesRegex(ClientError, "first sign-in"):
+            self.setup.run()
+        self.assertTrue(self.loaded)
+        self.assertEqual(self.output, [])
+        self.assertEqual(self.mutations(), [])
+        self.assertEqual(self.enroll_calls, [])
+        self.assertEqual(self.native.writes, [])
+        self.membership.assert_not_called()
 
     def test_changed_share_identity_is_rejected_before_disruption(self):
         self.active()

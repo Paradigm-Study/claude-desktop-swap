@@ -256,8 +256,189 @@ test('admin account diagnostics expose cached actual usage and a safe label with
   }
   await h.request('/admin/accounts/list', {}, device.device_token, { expected: 401 });
   const health = await h.mf.dispatchFetch('https://pool.example.test/health');
-  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a6' });
+  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a8' });
   assert.equal(h.provider.calls.length, calls);
+});
+
+test('member pool listing polls due quota, returns only safe fields, and never assigns or touches a device', async () => {
+  const value = await h.add('measured');
+  await h.add('spent', undefined, 100);
+  const device = await h.shareEnroll();
+  const before = (await h.admin('devices/list')).devices;
+  await h.advance(30);
+  const result = await h.request('/v1/accounts/list', {}, device.device_token);
+  assert.equal(result.account_id, null);
+  assert.equal(result.threshold, 98);
+  assert.equal(h.provider.count('usage'), 2);
+  assert.deepEqual((await h.admin('devices/list')).devices, before);
+  assert.deepEqual(Object.keys(result).sort(), ['account_id', 'accounts', 'threshold']);
+  assert.deepEqual(result.accounts[0], {
+    id: 'measured', account: { emailAddress: 'measured@example.test', subscriptionType: 'max' },
+    usage: { five_hour: 10, seven_day: 10 }, fetched: h.now, expires_at: value.expires_at,
+    state: 'ready', eligible: true, reason: null,
+  });
+  assert.equal(result.accounts[1].eligible, false);
+  assert.equal(result.accounts[1].reason, 'quota-exhausted');
+  const raw = JSON.stringify(result);
+  const encrypted = (await h.sql('SELECT secret FROM accounts WHERE id=?', 'measured'))[0].secret;
+  for (const forbidden of [value.access_token, value.refresh_token, encrypted, device.device_token,
+    'access_token', 'refresh_token', 'accountUuid', 'organizationUuid', 'rateLimitTier', 'scopes',
+    'secret', 'generation', 'token_hash', 'share_account_id', 'share_team_id']) {
+    assert.equal(raw.includes(forbidden), false, `member listing must not expose ${forbidden}`);
+  }
+  await h.request('/v1/accounts/list', {}, device.device_token);
+  assert.equal(h.provider.count('usage'), 2, 'fresh listing must reuse quota instead of polling every menu open');
+  await h.assignment(device);
+  const assigned = (await h.admin('devices/list')).devices;
+  assert.equal((await h.request('/v1/accounts/list', {}, device.device_token)).account_id, 'measured');
+  assert.deepEqual((await h.admin('devices/list')).devices, assigned);
+});
+
+test('member menu endpoints reject absent, admin, revoked, and removed-member credentials before provider calls', async () => {
+  await h.add();
+  for (const [path, body] of [['/v1/accounts/list', {}], ['/v1/assignment', { account_id: 'a' }]]) {
+    for (const token of [undefined, ADMIN, 'unknown-bearer-which-is-more-than-thirty-two-bytes']) {
+      await h.request(path, body, token, { expected: 401 });
+    }
+  }
+  const revoked = await h.enroll();
+  await h.admin('devices/revoke', { device_id: revoked.device_id });
+  await h.request('/v1/accounts/list', {}, revoked.device_token, { expected: 401 });
+  await h.request('/v1/assignment', { account_id: 'a' }, revoked.device_token, { expected: 401 });
+  const removed = await h.shareEnroll();
+  await h.shareMember(false);
+  assert.deepEqual(await h.request('/v1/accounts/list', {}, removed.device_token, { expected: 401 }),
+    { error: 'share-membership-required' });
+  await h.request('/v1/assignment', { account_id: 'a' }, removed.device_token, { expected: 401 });
+  assert.equal(h.provider.calls.length, 0);
+});
+
+test('member menu schemas reject extra fields and malformed requested account IDs without polling', async () => {
+  const device = await h.shareEnroll();
+  await h.add();
+  await h.request('/v1/accounts/list', { account_id: 'a' }, device.device_token, { expected: 400 });
+  for (const account_id of [null, 0, {}, '', 'a b', 'a\n', 'a'.repeat(65)]) {
+    assert.deepEqual(await h.request('/v1/assignment', { account_id }, device.device_token, { expected: 400 }),
+      { error: 'invalid-account-id' });
+  }
+  await h.request('/v1/assignment', { account_id: 'a', force: true }, device.device_token, { expected: 400 });
+  assert.equal(h.provider.calls.length, 0);
+});
+
+test('concurrent menu listing and selection share the single refresh owner', async () => {
+  await h.add('a', h.now + 1);
+  const device = await h.shareEnroll();
+  const responses = await Promise.all([
+    h.request('/v1/accounts/list', {}, device.device_token),
+    h.request('/v1/assignment', { account_id: 'a' }, device.device_token),
+    h.request('/v1/accounts/list', {}, device.device_token),
+  ]);
+  assert.equal(h.provider.count('refresh'), 1);
+  assert.equal(h.provider.count('usage'), 1);
+  assert.equal(responses[1].generation, 2);
+  assert.equal(responses[1].access_token, 'renewed-access-secret-a');
+  assert.equal(responses[0].accounts[0].eligible, true);
+  assert.equal(responses[2].accounts[0].eligible, true);
+  await h.restart();
+  assert.equal((await h.assignment(device)).generation, 2);
+  assert.equal(h.provider.count('refresh'), 1);
+});
+
+test('manual account selection overrides balancing, stays sticky, and resumes normal quota failover', async () => {
+  await h.add('a', undefined, 10);
+  await h.add('b', undefined, 20);
+  const device = await h.shareEnroll();
+  assert.equal((await h.assignment(device)).account_id, 'a');
+  const selected = await h.request('/v1/assignment', { account_id: 'b' }, device.device_token);
+  assert.equal(selected.account_id, 'b');
+  assert.equal(selected.state, 'fresh');
+  assert.equal(selected.access_token, 'access-secret-b');
+  assert.equal(Object.hasOwn(selected, 'refresh_token'), false);
+  assert.equal((await h.assignment(device)).account_id, 'b');
+  assert.equal((await h.request('/v1/assignment', { account_id: 'b' }, device.device_token)).account_id, 'b');
+  assert.equal((await h.sql("SELECT * FROM audit WHERE event='assignment-changed'")).length, 2);
+  h.provider.quotas.set('b', { five_hour: 98, seven_day: 20 });
+  await h.advance(121);
+  assert.equal((await h.assignment(device)).account_id, 'a');
+});
+
+test('unknown and exhausted manual selections refuse without changing assignment, liveness, or its audit', async () => {
+  await h.add('a', undefined, 10);
+  await h.add('spent', undefined, 98);
+  const device = await h.shareEnroll();
+  await h.assignment(device);
+  const before = (await h.admin('devices/list')).devices;
+  const audit = await h.sql("SELECT * FROM audit WHERE event='assignment-changed'");
+  await h.advance(30);
+  for (const account_id of ['missing', 'spent']) {
+    assert.deepEqual(await h.request('/v1/assignment', { account_id }, device.device_token, { expected: 409 }),
+      { error: 'account-unavailable' });
+  }
+  assert.deepEqual((await h.admin('devices/list')).devices, before);
+  assert.deepEqual(await h.sql("SELECT * FROM audit WHERE event='assignment-changed'"), audit);
+  const newcomer = await h.enroll('New Mac');
+  await h.request('/v1/assignment', { account_id: 'spent' }, newcomer.device_token, { expected: 409 });
+  assert.equal((await h.admin('devices/list')).devices.find(row => row.id === newcomer.device_id).account_id, null);
+});
+
+test('stale manual selection fails even for the current account while automatic renewal remains compatible', async () => {
+  await h.add();
+  const device = await h.shareEnroll();
+  await h.assignment(device);
+  h.provider.usageFailure = 429;
+  await h.advance(301);
+  const before = (await h.admin('devices/list')).devices;
+  const listed = await h.request('/v1/accounts/list', {}, device.device_token);
+  assert.equal(listed.accounts[0].reason, 'quota-stale');
+  assert.equal(listed.accounts[0].eligible, false);
+  assert.deepEqual(await h.request('/v1/assignment', { account_id: 'a' }, device.device_token, { expected: 409 }),
+    { error: 'account-unavailable' });
+  assert.deepEqual((await h.admin('devices/list')).devices, before);
+  assert.equal((await h.assignment(device)).state, 'quota_stale');
+});
+
+test('member listing labels quarantined and unverified accounts unavailable and cannot select them', async () => {
+  await h.add('broken', h.now + 1);
+  await h.add('unknown');
+  await h.sql('UPDATE accounts SET next_poll=? WHERE id=?', h.now + 600, 'unknown');
+  h.provider.refreshFailure = 500;
+  const device = await h.shareEnroll();
+  const result = await h.request('/v1/accounts/list', {}, device.device_token);
+  assert.deepEqual(result.accounts.map(({ id, state, reason, eligible }) => ({ id, state, reason, eligible })), [
+    { id: 'broken', state: 'quarantined', reason: 'quarantined', eligible: false },
+    { id: 'unknown', state: 'ready', reason: 'unverified', eligible: false },
+  ]);
+  for (const account_id of ['broken', 'unknown']) {
+    await h.request('/v1/assignment', { account_id }, device.device_token, { expected: 409 });
+  }
+  assert.equal((await h.admin('devices/list')).devices[0].account_id, null);
+});
+
+test('membership removal during menu quota refresh prevents pool disclosure and manual selection', async () => {
+  await h.add();
+  const first = await h.shareEnroll();
+  h.provider.beforeUsage = () => h.shareMember(false);
+  assert.deepEqual(await h.request('/v1/accounts/list', {}, first.device_token, { expected: 401 }),
+    { error: 'share-membership-required' });
+  assert.equal((await h.admin('devices/list')).devices[0].revoked, 1);
+  await h.shareMember(true);
+  const second = await h.shareEnroll();
+  await h.advance(121);
+  assert.deepEqual(await h.request('/v1/assignment', { account_id: 'a' }, second.device_token, { expected: 401 }),
+    { error: 'share-membership-required' });
+  assert.equal((await h.admin('devices/list')).devices.find(row => row.id === second.device_id).account_id, null);
+});
+
+test('directory outage during menu quota refresh withholds labels and preserves the recoverable device', async () => {
+  await h.add();
+  const device = await h.shareEnroll();
+  h.provider.beforeUsage = () => h.shareOutage(true);
+  assert.deepEqual(await h.request('/v1/accounts/list', {}, device.device_token, { expected: 503 }),
+    { error: 'share-directory-unavailable' });
+  assert.equal((await h.admin('devices/list')).devices[0].revoked, 0);
+  h.provider.beforeUsage = undefined;
+  await h.shareOutage(false);
+  assert.equal((await h.request('/v1/accounts/list', {}, device.device_token)).accounts.length, 1);
 });
 
 test('stale quota preserves an existing assignment and refuses new device assignment', async () => {
@@ -506,7 +687,7 @@ test('production entry enforces HTTPS, configuration and enrollment throttling t
   h.production = true; await h.restart();
   const health = await h.mf.dispatchFetch('https://pool.example.test/health');
   assert.equal(health.status, 200);
-  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a6' });
+  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a8' });
   assert.equal(health.headers.get('cache-control'), 'no-store');
   const insecure = await h.mf.dispatchFetch('http://pool.example.test/health');
   assert.equal(insecure.status, 400); assert.equal((await insecure.json()).error, 'https-required');

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, install, or remove the read-only Claude Swap menu bar on macOS."""
+"""Build, install, or remove the Claude Swap shared-pool menu bar on macOS."""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,7 @@ APP_NAME = "Claude Swap Status.app"
 EXECUTABLE = "ClaudeSwapStatus"
 MARKER = {"owner": LABEL, "format": 1}
 SOURCE = Path(__file__).resolve().parent.parent / "macos/TeamPoolStatus.swift"
+HELPER_MODULE = "team_pool.menu_bridge"
 
 
 class InstallError(Exception):
@@ -40,16 +42,43 @@ def specification(app):
             "RunAtLoad": True, "ProcessType": "Interactive"}
 
 
+def helper_specification(python=None):
+    # Keep the virtualenv's lexical path: resolving its Python symlink would lose
+    # the installed package environment and break the bridge after installation.
+    executable = Path(python or sys.executable)
+    try:
+        value = executable.stat()
+        if (not executable.is_absolute() or "\x00" in str(executable)
+                or not stat.S_ISREG(value.st_mode) or not os.access(executable, os.X_OK)
+                or value.st_uid not in (0, os.getuid()) or value.st_mode & 0o022):
+            raise ValueError
+    except (OSError, ValueError):
+        raise InstallError("Install the menu using the persistent Claude Swap Python runtime.") from None
+    return {"python": str(executable), "module": HELPER_MODULE, "version": 1}
+
+
+def verify_helper(value):
+    # The old runtime may no longer exist. Recognize an owned configuration so a
+    # new install can repair it, without executing or trusting the old path.
+    return (isinstance(value, dict) and set(value) == {"python", "module", "version"}
+            and value["module"] == HELPER_MODULE and type(value["version"]) is int
+            and value["version"] == 1 and isinstance(value["python"], str)
+            and value["python"].startswith("/") and "\x00" not in value["python"]
+            and len(value["python"]) <= 4096)
+
+
 def verify_app(app):
     if not exists(app):
         return
     try:
-        if app.is_symlink() or not app.is_dir() or app.stat().st_uid != os.getuid():
+        if (app.is_symlink() or not app.is_dir() or app.stat().st_uid != os.getuid()
+                or app.stat().st_mode & 0o022):
             raise ValueError
         for folder, directories, files in os.walk(app):
             for name in directories + files:
                 child = Path(folder) / name
-                if child.is_symlink() or child.stat().st_uid != os.getuid():
+                if (child.is_symlink() or child.stat().st_uid != os.getuid()
+                        or child.stat().st_mode & 0o022):
                     raise ValueError
         marker = json.loads((app / "Contents/Resources/claude-swap-status.json").read_text())
         info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
@@ -57,6 +86,12 @@ def verify_app(app):
                 or info.get("CFBundleExecutable") != EXECUTABLE
                 or not (app / "Contents/MacOS" / EXECUTABLE).is_file()):
             raise ValueError
+        helper = app / "Contents/Resources/helper.json"
+        if exists(helper):
+            if (not helper.is_file() or helper.stat().st_size > 8192
+                    or helper.stat().st_mode & 0o022
+                    or not verify_helper(json.loads(helper.read_text()))):
+                raise ValueError
     except (OSError, ValueError, plistlib.InvalidFileException):
         raise InstallError(f"Refusing to change an unrecognized app: {app}") from None
 
@@ -98,16 +133,20 @@ def stop():
 
 
 def build_bundle(destination):
+    helper = helper_specification()
     contents = destination / "Contents"
     (contents / "MacOS").mkdir(parents=True)
     (contents / "Resources").mkdir()
     info = {"CFBundleIdentifier": LABEL, "CFBundleExecutable": EXECUTABLE,
             "CFBundleName": "Claude Swap Status", "CFBundleDisplayName": "Claude Swap",
-            "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "1.0.0",
-            "CFBundleVersion": "1", "LSUIElement": True, "LSMinimumSystemVersion": "12.0",
+            "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "1.1.0",
+            "CFBundleVersion": "2", "LSUIElement": True, "LSMinimumSystemVersion": "12.0",
             "NSHighResolutionCapable": True}
     (contents / "Info.plist").write_bytes(plistlib.dumps(info))
     (contents / "Resources/claude-swap-status.json").write_text(json.dumps(MARKER) + "\n")
+    helper_path = contents / "Resources/helper.json"
+    helper_path.write_text(json.dumps(helper) + "\n")
+    helper_path.chmod(0o600)
     try:
         subprocess.run(["/usr/bin/xcrun", "swiftc", "-O", "-framework", "AppKit",
                         str(SOURCE), "-o", str(contents / "MacOS" / EXECUTABLE)], check=True)

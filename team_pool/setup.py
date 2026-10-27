@@ -22,6 +22,7 @@ import uuid
 from .client import (Client, ClientError, SERVICE, _lock, _private_read, _private_write,
                      install_service, service_path, verify_desktop_wrapper)
 from .native import NativeKeychainAccessError, NativePolicyError, NativeStoreError
+from .desktop_profile import DesktopProfileError, resolve_target
 from .share_enrollment import (DEFAULT_ACCOUNT_FILE, DEFAULT_SHARE_SERVER,
                                ShareTransport, enroll_from_share, saved_token)
 
@@ -122,6 +123,7 @@ class Setup:
                  home=None, runner=subprocess.run, sleep=time.sleep, clock=time.monotonic,
                  membership=share_membership, enroll=enroll_from_share,
                  installer=install_service, verify_wrapper=verify_desktop_wrapper,
+                 desktop_preflight=resolve_target,
                  output=print):
         self.source = Path(source_dir).expanduser()
         self.home = Path(home or Path.home())
@@ -130,6 +132,7 @@ class Setup:
         self.runner, self.sleep, self.clock = runner, sleep, clock
         self.membership, self.enroll, self.installer = membership, enroll, installer
         self.verify_wrapper, self.output = verify_wrapper, output
+        self.desktop_preflight = desktop_preflight
         self.uid = os.getuid()
         self.domain = f"gui/{self.uid}"
         self.service = self.domain + "/" + SERVICE
@@ -289,6 +292,12 @@ class Setup:
             return self._run(check=False)
 
     def _run(self, *, check):
+        # Catch an uninitialized or unsupported Desktop layout before any
+        # Keychain prompt, sudo request, app quit, or service interruption.
+        try:
+            self.desktop_preflight(self.home)
+        except DesktopProfileError as error:
+            raise ClientError(str(error)) from None
         self.output(KEYCHAIN_GUIDANCE)
         with self.client.native.noninteractive() if check else _lock(self.client.config):
             state = inspect_state(self.client)

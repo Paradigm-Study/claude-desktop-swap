@@ -12,7 +12,9 @@ curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/
 ```
 
 No invitation token is needed. The installer handles prerequisites, enrollment,
-background sync and the Claude Swap menu bar. Run it again to upgrade or link an
+background sync and the Claude Swap menu bar. The menu shows every account and
+quota, switches this Mac to an available account, and adds accounts through
+browser authorization. Run it again to upgrade or link an
 existing invite enrollment. macOS may request administrator or Keychain approval.
 See the [organization setup guide](docs/share-org-setup.md) for the complete flow.
 Inference stays directly on native subscriptions. Teammates can contribute new
@@ -89,7 +91,7 @@ The wrapper normally leaves Desktop's Fast-mode restriction in place. To restore
 
 ## How it works
 
-Desktop can launch its bundled Code process through the system managed `processWrapper`. This installer sets that wrapper and enables `claudeCodeProcessWrapperEnabled` in the selected profile under `~/Library/Application Support/Claude-3p/configLibrary/`.
+Desktop can launch its bundled Code process through the system managed `processWrapper`. This installer sets that wrapper and enables `claudeCodeProcessWrapperEnabled` in the existing selected profile when its optional configuration library is present. An initialized standard Desktop installation uses its supported user-scoped macOS preference instead. Neither path creates a replacement Desktop profile or moves conversation data.
 
 The wrapper removes host-pinned OAuth, API-key, and gateway environment values for the selected macOS user, then executes the original command and arguments. Claude Code can consequently read the native credential store that `cswap` updates. Other macOS users pass through the wrapper unchanged. The integration also removes the host's blanket nonessential-traffic restriction, which otherwise suppresses some account capabilities.
 

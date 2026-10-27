@@ -278,11 +278,11 @@ export class PoolObject extends DurableObject {
     const url = new URL(request.url);
     if (url.search) throw new PoolError('not-found', 404);
     if (request.method === 'GET' && url.pathname === '/health') {
-      return reply(200, { ok: true, mode: 'native-subscription', version: '0.1.0a6' });
+      return reply(200, { ok: true, mode: 'native-subscription', version: '0.1.0a8' });
     }
     if (request.method !== 'POST') throw new PoolError('not-found', 404);
     const routes = new Set([
-      '/v1/enroll', '/v1/enroll/share', '/v1/link/share', '/v1/assignment', '/v1/contributions/start', '/v1/contributions/complete',
+      '/v1/enroll', '/v1/enroll/share', '/v1/link/share', '/v1/assignment', '/v1/accounts/list', '/v1/contributions/start', '/v1/contributions/complete',
       '/v1/contributions/status', '/v1/contributions/cancel', '/admin/invites',
       '/admin/accounts/list', '/admin/accounts/import', '/admin/devices/list', '/admin/devices/revoke',
     ]);
@@ -311,8 +311,14 @@ export class PoolObject extends DurableObject {
         result = await this.enrollShare(body, device);
         break;
       case '/v1/assignment':
+        this.requireKeys(body, [], ['account_id']);
+        if (Object.hasOwn(body, 'account_id') && (typeof body.account_id !== 'string'
+            || !/^[a-zA-Z0-9_-]{1,64}(?![\s\S])/.test(body.account_id))) throw new PoolError('invalid-account-id');
+        result = await this.assignment(device, body.account_id);
+        break;
+      case '/v1/accounts/list':
         this.requireKeys(body, []);
-        result = await this.assignment(device);
+        result = await this.memberAccounts(device);
         break;
       case '/v1/contributions/start':
         this.requireKeys(body, []);
@@ -545,6 +551,53 @@ export class PoolObject extends DurableObject {
     return accounts;
   }
 
+  accountAvailability(row, credentials, now) {
+    const usage = row.usage === null ? null : JSON.parse(row.usage);
+    let reason = null;
+    if (row.state !== 'ready') reason = row.state === 'refreshing' ? 'refreshing' : 'quarantined';
+    else if (!row.verified) reason = 'unverified';
+    else if (credentials.expires_at <= now + EXPIRY_MARGIN) reason = 'token-expiring';
+    else if (row.fetched === null || usage === null) reason = 'quota-unavailable';
+    else if (now - row.fetched < 0 || now - row.fetched > FRESH_SECONDS) reason = 'quota-stale';
+    else if (Object.values(usage).some(value => value >= this.threshold)) reason = 'quota-exhausted';
+    return {
+      usage, reason, eligible: reason === null,
+      usable: row.state === 'ready' && Boolean(row.verified) && credentials.expires_at > now + EXPIRY_MARGIN,
+    };
+  }
+
+  async accountSnapshots(readyOnly = false) {
+    const accounts = [];
+    const statement = readyOnly
+      ? "SELECT * FROM accounts WHERE state='ready' AND verified=1 ORDER BY id"
+      : 'SELECT * FROM accounts ORDER BY id';
+    for (const row of this.query(statement)) {
+      accounts.push({ row, credentials: await this.decrypt(row.secret) });
+    }
+    return accounts;
+  }
+
+  async memberAccounts(device) {
+    await this.poll();
+    const snapshots = await this.accountSnapshots();
+    // Membership may change while provider quota or encrypted storage is read.
+    // Check again before releasing any pool labels, without changing assignment.
+    await this.checkShareMembership(device);
+    const now = this.now();
+    return {
+      accounts: snapshots.map(({ row, credentials }) => {
+        const { usage, eligible, reason } = this.accountAvailability(row, credentials, now);
+        return {
+          id: row.id,
+          account: { emailAddress: credentials.account.emailAddress, subscriptionType: credentials.account.subscriptionType },
+          usage, fetched: row.fetched, expires_at: credentials.expires_at,
+          state: row.state, eligible, reason,
+        };
+      }),
+      account_id: device.account_id, threshold: this.threshold,
+    };
+  }
+
   async addAccount(id, credentials, exclusiveOwner = false, replaceQuarantined = false) {
     if (exclusiveOwner !== true) throw new PoolError('exclusive-refresh-ownership-required');
     if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,64}(?![\s\S])/.test(id)) throw new PoolError('invalid-account-id');
@@ -747,24 +800,26 @@ export class PoolObject extends DurableObject {
     }
   }
 
-  async assignment(device) {
+  async assignment(device, requestedAccount) {
     await this.poll();
+    const snapshots = await this.accountSnapshots(true);
+    await this.checkShareMembership(device);
     const now = this.now();
-    const rows = this.query("SELECT * FROM accounts WHERE state='ready' AND verified=1");
     const loads = new Map(this.query('SELECT account_id,count(*) n FROM devices WHERE revoked=0 AND last_seen>? GROUP BY account_id', now - DEVICE_ACTIVE_SECONDS).map(row => [row.account_id, row.n]));
     const usable = new Map(), eligible = [];
-    for (const row of rows) {
-      const credentials = await this.decrypt(row.secret);
-      if (credentials.expires_at <= now + EXPIRY_MARGIN) continue;
-      usable.set(row.id, { row, credentials });
-      if (row.fetched !== null && now - row.fetched >= 0 && now - row.fetched <= FRESH_SECONDS) {
-        const usage = JSON.parse(row.usage);
-        if (Object.values(usage).every(value => value < this.threshold)) eligible.push([loads.get(row.id) || 0, Math.max(...Object.values(usage)), row.id]);
-      }
+    for (const snapshot of snapshots) {
+      const { row, credentials } = snapshot;
+      const availability = this.accountAvailability(row, credentials, now);
+      if (availability.usable) usable.set(row.id, snapshot);
+      if (availability.eligible) eligible.push([loads.get(row.id) || 0, Math.max(...Object.values(availability.usage)), row.id]);
     }
     const current = device.account_id;
     let chosen, state;
-    if (eligible.some(candidate => candidate[2] === current)) {
+    if (requestedAccount !== undefined) {
+      if (!eligible.some(candidate => candidate[2] === requestedAccount)) throw new PoolError('account-unavailable', 409);
+      chosen = requestedAccount;
+      state = 'fresh';
+    } else if (eligible.some(candidate => candidate[2] === current)) {
       chosen = current;
       state = 'fresh';
     } else if (eligible.length) {
@@ -779,7 +834,6 @@ export class PoolObject extends DurableObject {
       throw new PoolError('no-eligible-account', 503);
     }
     const { row, credentials } = usable.get(chosen);
-    await this.checkShareMembership(device);
     this.transaction(() => {
       this.query('UPDATE devices SET account_id=?,last_seen=? WHERE id=?', chosen, now, device.id);
       if (current !== chosen) this.audit('assignment-changed', device.id);

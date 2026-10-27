@@ -16,7 +16,7 @@ curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/
 ```
 
 Run it as your ordinary Mac user, without `sudo` in front of the command. The
-installer uses the tested `v0.1.0a7` package and prepares its own Python runtime;
+installer uses the tested `v0.1.0a8` package and prepares its own Python runtime;
 Git, Python and uv do not need to be installed beforehand. If Apple Command Line
 Tools are missing, it opens their installer and continues when you finish it.
 
@@ -36,9 +36,25 @@ background sync before reporting success and pauses on access failures instead
 of repeatedly prompting. See [Keychain recovery](keychain-access.md).
 
 After setup, resume an existing local Code conversation and send a normal-speed
-message. The menu bar shows the pool account and sync status. Fast mode retains
+message. The menu bar lists all shared accounts, their 5-hour and weekly usage, and the account assigned to this Mac. Open an available account’s submenu to switch this Mac; automatic quota failover continues. Choose **Add Account to Shared Pool…** to authorize another subscription in the browser, then **Enter Authorization Code…** to finish in its hidden field. See the [menu guide](team-status-menu.md). Fast mode retains
 its separate paid-credit requirements. A second physical Mac still needs live
 verification in the [pilot acceptance worksheet](team-pilot-acceptance.md).
+
+## If an older setup reported “Missing _meta.json”
+
+That error came from assuming Desktop's optional profile library existed. The
+`v0.1.0a8` installer supports an initialized ordinary Claude Desktop installation
+without that library. Open Claude Desktop, finish its normal first sign-in if
+needed, and run the same one-command setup again. Do not create a replacement
+profile or delete your existing app data.
+
+For a standard installation, setup enables Desktop's supported user-scoped
+launcher preference. Existing profile installations keep their current profile.
+It preserves the app's sign-in, conversation index and deployment mode. A managed
+policy that disables the launcher must be resolved by its administrator. Setup
+now checks these conditions before stopping sync, closing Desktop or asking for
+administrator approval. The Terminal `Password:` prompt is the Mac administrator
+password requested by `sudo`; it is separate from Claude sign-in and Keychain.
 
 ## Repeat setup, upgrade, or link an existing device
 
@@ -56,13 +72,13 @@ credential store only and refuses a `CLAUDE_CONFIG_DIR` override or conflicting
 native provider configuration.
 
 The package and runtime stay under
-`~/.local/share/claude-desktop-swap/releases/v0.1.0a7/`. Keep that directory in
+`~/.local/share/claude-desktop-swap/releases/v0.1.0a8/`. Keep that directory in
 place while the service uses it. Setup prints the installed client path; for this
 release, status and contribution commands are:
 
 ```sh
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a7/venv/bin/team-pool-client status
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a7/venv/bin/team-pool-client contribute-account
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a8/venv/bin/team-pool-client status
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a8/venv/bin/team-pool-client contribute-account
 ```
 
 If Share saves its sign-in elsewhere, use the same installer with its account

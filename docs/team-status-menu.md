@@ -1,39 +1,65 @@
-# Claude Swap shared-pool menu bar
+# Claude Swap shared-pool menu
 
-The shared pool uses its own background service to update the native Claude Code
-sign-in. The original `cswap` menu bar also rotates accounts, so it must remain
-stopped while the shared service owns that sign-in.
+The **Claude Swap** menu lists every shared account, its 5-hour and weekly quota
+used, and a checkmark for the account installed on this Mac. Open an account's
+submenu for model-specific usage, when usage was checked, and its availability.
+The menu displays the coordinator's latest reported usage, not a live billing
+counter. It refreshes the catalog approximately once a minute; **Refresh Pool
+and Status** requests an earlier refresh.
 
-This optional **Claude Swap** menu bar reads local status and checks whether the
-shared background service is running. It shows the last successful sync, access
-expiry, and any paused or degraded state. It never reads Keychain, calls the
-coordinator, changes credentials, or starts or stops account rotation. Account
-names appear only when the client has included a safe label in its status file.
+## Switch this Mac
 
-On macOS, with Xcode Command Line Tools installed, run from this repository:
+Open an available account's submenu and choose **Switch This Mac to This
+Account**. The coordinator confirms current eligibility, then the normal native
+client writes the assignment with its existing policy, ownership and recovery
+checks. The menu reports success only after the local commit. Other devices are
+not switched. The selected account remains assigned until automatic quota
+failover is needed; the configured threshold still applies.
 
-```sh
-python3 scripts/install_team_status.py install
-python3 scripts/install_team_status.py status
-```
+Unavailable accounts cannot be selected. If the pool refresh fails, prior rows
+remain visible with a stale-data message and selection is disabled. Paused sync,
+a manual Claude login, or an interrupted credential write requires recovery;
+the menu does not overwrite those conditions. A busy background sync returns a
+short retry message instead of queuing another native writer indefinitely.
 
-The installer compiles an AppKit app into `~/Applications/Claude Swap Status.app`
-and starts it with the separate LaunchAgent
-`study.paradigm.claude-desktop-swap.status`. It appears on the menu bar now and at
-login. The installer refuses to replace an app or LaunchAgent it does not
-recognize. Running `install` again updates this app.
+Native inference continues directly to Anthropic. Switching does not restart
+Desktop, replace its profile, retry a failed request, or change credentials
+already cached by an in-flight turn or subagent. Resume the conversation normally
+after the switch. Fast mode keeps its separate paid-credit requirements.
 
-The menu refreshes every 15 seconds and when opened. **Automatic switching
-paused** means the shared rotation service is stopped or the client reported a
-condition that needs attention. Check `team-pool-client status` and follow the
-[shared pool setup guide](cloudflare-pool.md) to resolve the client condition.
-The menu does not attempt repairs or ask for a Keychain password.
+## Add an account
 
-**Quit Menu Bar** closes only the menu bar for the current login session. It does
-not stop automatic account switching. To remove the menu bar and its login item:
+Choose **Add Account to Shared Pool…**, confirm that you intend to share that
+subscription, and sign in on the official Claude authorization page. Back in the
+menu, choose **Enter Authorization Code…** and paste the complete code, including
+`#state`, into the hidden field. No Terminal command is needed.
 
-```sh
-python3 scripts/install_team_status.py uninstall
-```
+The coordinator receives a fresh authorization and owns the resulting refresh
+credentials. This does not change the Mac's current native login. Authorization
+codes go to the helper through stdin, never process arguments, temporary files
+or application logs. The menu does not receive provider access/refresh tokens or
+an administrator token.
 
-This leaves the shared pool client, its native sign-in, and Claude Desktop alone.
+Pending additions offer **Check Account Addition** and **Cancel Account Addition**.
+If a completion response was lost, check status before continuing; the code is
+never replayed automatically. An uncertain result offers a fresh authorization
+flow with a new code. A completed account appears on the next successful pool
+refresh. Existing personal `cswap` accounts are not uploaded automatically.
+
+## Install and recover
+
+Use the [one-command setup](share-org-setup.md) to install or update the menu,
+client and persistent runtime together. It installs
+`~/Applications/Claude Swap Status.app` with the LaunchAgent
+`study.paradigm.claude-desktop-swap.status`. The menu's private helper configuration
+points to that release's runtime; keep the release directory in place.
+
+The original personal `cswap` menu stays disabled because it would compete for
+the same native credential store. The shared menu calls the existing pool client
+and coordinator rather than becoming a separate account-rotation service.
+
+Keychain failures return instructions for foreground setup and do not repeatedly
+request passwords. Read [Keychain recovery](keychain-access.md) when needed.
+Long or interrupted operations retain the client's write journal or contribution
+receipt; check status before retrying. **Quit Menu Bar** closes only the menu,
+leaving the independent automatic sync service running.

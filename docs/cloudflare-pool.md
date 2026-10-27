@@ -146,8 +146,9 @@ python3 scripts/install_team_status.py install
 
 Reopen Desktop and resume an existing local Code conversation. Verify a harmless
 normal-speed turn. A running service alone does not prove Desktop interoperability.
-The separate [Claude Swap menu bar](team-status-menu.md) shows shared-pool status
-without accessing credentials or running a second account selector.
+The separate [Claude Swap menu bar](team-status-menu.md) shows all shared accounts and quota, switches this Mac through the coordinator,
+and starts browser account contribution. Its helper uses the existing guarded
+client; it does not run a second account selector.
 Use client 0.1.0a5 or newer; earlier pilot clients could repeatedly undo Keychain
 approval. See [Keychain recovery and writer limits](keychain-access.md).
 
@@ -172,6 +173,21 @@ Existing personal `cswap` credentials are not uploaded automatically. A delibera
 transfer must stop every other refresh writer and replace refresh-capable local
 material. After the server rotates a token, an old local backup may no longer be
 usable; rollback must use current authoritative credentials or a fresh login.
+
+## Member menu API
+
+Enrolled devices use `POST /v1/accounts/list` for an explicit credential-free list
+of account labels, quota, freshness and eligibility. Current Share membership is
+checked before and after provider waits. The list does not change assignment.
+
+`POST /v1/assignment` still accepts `{}` for automatic selection. A request with
+`account_id` selects that account only if fresh usage and token validity make it
+eligible. Unavailable selections return HTTP 409 without changing the assignment.
+Manual selection applies only to that device and stays sticky until normal quota
+failover; it does not override the pool threshold or reserve quota exclusively.
+The native client commits through the same ownership checks and recovery journal.
+Changing credentials does not retry a failed turn or replace credentials already
+cached inside an in-flight turn or subagent.
 
 ## Operations and limits
 

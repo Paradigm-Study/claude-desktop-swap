@@ -541,8 +541,8 @@ class ClientLifecycleTests(unittest.TestCase):
 class InputAndTransportTests(unittest.TestCase):
     def test_wrapper_preflight_accepts_grouped_unsets_and_rejects_changed_profile(self):
         with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory) / "home"
-            system = Path(directory) / "system"
+            home = Path(directory).resolve() / "home"
+            system = Path(directory).resolve() / "system"
             profiles = home / "Library/Application Support/Claude-3p/configLibrary"
             profiles.mkdir(parents=True)
             system.mkdir()
@@ -560,11 +560,36 @@ class InputAndTransportTests(unittest.TestCase):
             (system / "managed-settings.json").write_text(json.dumps({"processWrapper": json.dumps([str(launcher)])}))
             client.verify_desktop_wrapper(home=home, system_dir=system)
             profile.write_text(json.dumps({"claudeCodeProcessWrapperEnabled": False}))
-            with self.assertRaisesRegex(client.ClientError, "selected Desktop profile"):
+            with self.assertRaisesRegex(client.ClientError, "setup command"):
                 client.verify_desktop_wrapper(home=home, system_dir=system)
             (profiles / "_meta.json").write_text(json.dumps({"appliedId": "../../outside"}))
             with self.assertRaises(client.ClientError):
                 client.verify_desktop_wrapper(home=home, system_dir=system)
+
+    def test_wrapper_preflight_supports_initialized_standard_desktop_policy(self):
+        import pwd
+        from team_pool.desktop_profile import DOMAIN, FLAG
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home, system, managed = root / "home", root / "system", root / "managed"
+            marker = home / "Library/Application Support/Claude/config.json"
+            marker.parent.mkdir(parents=True)
+            marker.write_text('{"preserve":"conversation profile"}')
+            policy = managed / pwd.getpwuid(os.getuid()).pw_name / DOMAIN
+            policy.parent.mkdir(parents=True)
+            policy.write_bytes(plistlib.dumps({FLAG: True}))
+            system.mkdir()
+            launcher = system / "native-subscription-launcher"
+            launcher.write_text('#!/bin/sh\nif [ "$(/usr/bin/id -u)" = "' + str(os.getuid()) + '" ]; then\n'
+                'unset CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST CLAUDE_CODE_HOST_AUTH_ENV_VAR CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL\nfi\nexec "$@"\n')
+            launcher.chmod(0o755)
+            (system / "managed-settings.json").write_text(json.dumps({"processWrapper": json.dumps([str(launcher)])}))
+            client.verify_desktop_wrapper(home=home, system_dir=system, managed_root=managed, system_uid=os.getuid())
+            self.assertFalse((home / "Library/Application Support/Claude-3p").exists())
+            self.assertEqual(marker.read_text(), '{"preserve":"conversation profile"}')
+            policy.write_bytes(plistlib.dumps({FLAG: False}))
+            with self.assertRaises(client.ClientError):
+                client.verify_desktop_wrapper(home=home, system_dir=system, managed_root=managed, system_uid=os.getuid())
 
     def test_origin_validation_rejects_credential_leaks_and_insecure_hosts(self):
         for value in ("http://pool.example.invalid", "https://user:pass@example.invalid",
