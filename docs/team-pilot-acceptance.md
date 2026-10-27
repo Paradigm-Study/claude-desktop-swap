@@ -1,16 +1,18 @@
 # Live two-Mac acceptance worksheet
 
-Status: **IN PROGRESS — client 0.1.0a8 on the first Mac**. Offline integration
-tests do not complete this worksheet. The second Mac's a7 setup attempt failed;
-a successful physical rerun and enrollment remain pending.
+Status: **IN PROGRESS — client 0.1.0a8 active on Mac A; a9 prepared on Mac B**.
+Offline integration tests do not complete this worksheet. Mac B's a7 and a8
+attempts failed. The a9 diagnostic is verified there; administrator repair,
+enrollment, and a successful Desktop conversation remain pending.
 Use only non-sensitive labels such as Account A / Mac B. Do not paste credentials,
 private prompts, account emails, or session identifiers.
 
 | Check | Mac A | Mac B | Evidence / observed limitation |
 | --- | --- | --- | --- |
-| macOS / Desktop / bundled Code version | 27.0.1 / 3.6556.2 / 2.1.308 | Pending | Client 0.1.0a8; Cloudflare coordinator. |
-| Public one-command setup and repeat run | Passed on enrolled Mac | a7 failed; a8 rerun pending | Public a8 installer downloaded the tagged runtime; readiness check, activation, and exact piped-command rerun preserved device, token, Share identity, backup, native fingerprint, and Desktop profile. |
-| Standard Desktop layout without a profile library | Existing profile preserved | Physical rerun pending | Exact a7 missing-_meta.json failure reproduced in fixtures. The a8 retry installs a supported user-scoped launcher policy without creating a profile or modifying conversation data. |
+| macOS / Desktop / bundled Code version | 27.0.1 / 3.6556.2 / 2.1.308 | 27.2 / 3.6556.2 / Pending | Cloudflare coordinator; a8 active on Mac A, a9 runtime prepared on Mac B. |
+| Public one-command setup and repeat run | Passed on enrolled Mac | a7 and a8 failed; a9 repair/enrollment pending | Mac A's public a8 activation and exact piped-command rerun preserved device, token, Share identity, backup, native fingerprint, and Desktop profile. Mac B's tagged a9 script and runtime are verified, but full setup has not completed. |
+| Standard Desktop layout without a profile library | Existing profile preserved | a8 blocked by directory permissions | The supported user-scoped launcher policy passed fixtures without changing conversation data. The real a8 retry exposed an additional access failure left by a7; fixture success did not establish successful fresh-Mac setup. |
+| Installer directory access and repair | Existing installation accessible | a9 diagnostic passed; repair pending | Mac B's root-owned ClaudeCode directory is mode 0700. a9 `--check` reports the repair needed before accessing Keychain; the administrator repair has not yet run. |
 | One-time enrollment | Passed | Pending | Original invite enrollment linked to live Paradigm Share membership; same device token retained. |
 | Share membership enrollment without an invitation | Passed | Pending | Saved Share sign-in enrolled a temporary device, delivered an access-only assignment, rejected grant replay, and rejected delivery after test-device revocation. |
 | Membership linking preserves native login and Desktop profile | Passed | Pending | Native fingerprint, device ID, and original Desktop profile unchanged by linking; background sync active. |
@@ -132,9 +134,10 @@ A. Inspection of the installed Desktop established that ordinary `config.json`
 stores app state, while Desktop reads the launcher flag from its profile library
 or macOS managed preferences. The a8 fix uses the supported user-scoped managed
 preference on an initialized standard installation. It does not manufacture a
-profile, change deployment mode, or relocate session data. Initialization is
-checked before Keychain prompts, administrator approval, app shutdown, or
-service interruption.
+profile, change deployment mode, or relocate session data. The a8 change moved
+initialization checks before Keychain prompts, administrator approval, app
+shutdown, or service interruption, but did not account for inaccessible system
+directories left by the failed a7 attempt.
 
 An isolated fixture reproduced the exact a7 failure and confirmed that it left
 only the installer lock in the system directory. The a8 retry reused that lock,
@@ -142,5 +145,44 @@ installed and verified the native launcher, repeated without changing recovery
 state, and uninstalled cleanly. Standard app configuration and conversation
 fixtures remained byte-identical, and no profile library was created. The failed
 launcher step precedes enrollment, so this specific failure did not create a
-pool device or native recovery backup. A physical a8 rerun on Mac B and a resumed
-Desktop conversation are still required to complete that acceptance check.
+pool device or native recovery backup. This fixture ran with ordinary directory
+permissions. It missed the bootstrap's inherited restrictive umask, and its
+successful retry did not predict the real Mac B outcome.
+
+Follow-up SSH inspection of Mac B, a Mac Studio running macOS 27.2 and Desktop
+3.6556.2, found the a8 runtime prepared but no pool enrollment or running sync/menu
+services. Its standard Desktop `config.json` was mode 0600 and no optional
+`_meta.json` existed. `/Library/Application Support/ClaudeCode` was owned by
+`root:admin` with mode 0700. Native preflight reached the `managed-settings.d`
+existence check in `team_pool/native.py` line 291, where `pathlib.exists()` raised
+`PermissionError` before setup could reach the privileged installer. The
+resulting generic setup/Keychain error obscured the filesystem cause.
+
+The bootstrap sets `umask 077`, which the privileged installer inherited.
+Creating a directory with requested mode 0755 therefore produced mode 0700.
+The installer checked ownership and rejected unsafe write permissions, but did
+not require read/traverse access for the client. The failed a7 install left this
+inaccessible directory and its private installer lock; the a8 standard-layout
+correction could not be reached on retry. The same mechanism could also affect
+newly created managed-preference directories.
+
+Client `v0.1.0a9` was released from commit
+[`8ef5cee`](https://github.com/Paradigm-Study/claude-desktop-swap/commit/8ef5cee2eee4138f24bebbbfb65a4db58e297055).
+All six CI checks passed across the
+[push run](https://github.com/Paradigm-Study/claude-desktop-swap/actions/runs/40428664582)
+and [PR run](https://github.com/Paradigm-Study/claude-desktop-swap/actions/runs/40428670924).
+Validation included 311 Python tests with one optional skip. The installer now
+explicitly sets mode 0755 on newly created public directories after validating
+their ownership. Its narrow `repair-access` operation validates existing
+installer-owned contents and acquires the installer lock before correcting
+directory access; unknown contents or unsafe ownership are refused. Private
+lock and recovery files retain their permissions. Setup detects this condition
+before native inspection and performs the repair only through an administrator
+step after Share membership verification.
+
+On the physical Mac B, the tagged a9 script was downloaded and its SHA verified,
+and the a9 runtime was prepared. Its `--check` now reports the specific directory
+repair requirement before accessing Keychain. This verifies the corrected
+diagnostic only. The human administrator command is staged; privileged repair,
+full setup, enrollment, running services, and a resumed Desktop conversation
+remain pending.
