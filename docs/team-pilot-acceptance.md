@@ -1,6 +1,6 @@
 # Live two-Mac acceptance worksheet
 
-Status: **IN PROGRESS — client 0.1.0a10 active on Mac A; a9 last verified on Mac B**.
+Status: **IN PROGRESS — client 0.1.0a10 active on Mac A; a11 active for a second macOS user on Mac B**.
 Mac B completed setup in its own GUI Terminal after the directory repair and
 failed SSH attempts. Its native request and background sync passed, and the user
 reported that it works. Existing-conversation continuity on Mac B, actual menu
@@ -267,3 +267,49 @@ Local validation completed 320 Python tests with one optional dependency skip,
 deployed worker version is `17d93825-9191-42bd-a307-15c92e6f8522`. Direct GUI clicks
 and same-conversation switching remain distinct, unverified acceptance checks;
 the live selection test exercised the installed menu's helper/action path.
+
+## November 3: shared-Mac ownership and SSH Keychain context
+
+A Desktop SSH conversation on Mac B failed immediately with the organization's
+launcher/no-credential error. The host's global launcher belonged to its earlier
+macOS user, while the actual SSH user had no pool enrollment or native account
+credential. Shipped Desktop 4.16336.0 client code confirmed that detecting a
+remote managed launcher withholds Desktop's usual OAuth handoff before the
+wrapper runs. Keeping another user's environment unchanged inside the wrapper
+therefore does not make that remote user transparent to launcher detection.
+
+A separate, non-secret Keychain probe established a second cause: the same
+`security` executable and item were readable in the logged-in user's GUI audit
+context but failed with exit 36 in plain SSH. The temporary probe was removed.
+Matching default Keychain paths alone did not establish credential access.
+
+Release `v0.1.0a11` (commit `13c4b33`) adds validated multi-user launcher ownership.
+Second-user installation migrates legacy recovery state while preserving each
+user's original policy and the machine's original settings. Removing one user
+retains the others; final removal restores the machine originals. Older pool
+clients can read the resulting launcher, but installer maintenance requires a11
+or newer. The missing, previously recorded first user's managed flag was
+restored; its paused enrollment was not resumed or rebound.
+
+The new user's three MCP sign-ins were migrated from an MCP-only credential-file
+fallback into the native Keychain, with an unchanged private recovery copy.
+Their own existing Share membership authorized a new enrollment. The tagged a11
+setup completed, verified background synchronization, and installed the menu.
+Native ownership matched the client state, all three MCP records matched the
+recovery copy, and no refresh token was delivered to the Mac.
+
+The affected user's remote helper was restarted once in its GUI audit context,
+using its existing socket and a private, consumed copy of its authentication
+token. Other users' helpers were not restarted. An isolated child launched
+through that actual helper and the managed launcher reported
+`claude.ai / firstParty / max`. A normal-speed Sonnet request through the same
+helper returned exact OK in 7.8 seconds, exit 0, without persisting a new chat.
+The original conversation transcript remains present; resuming that specific
+conversation still requires user confirmation.
+
+This establishes current helper-child authentication and inference. It does not
+establish persistent SSH lifecycle support: Desktop can replace the helper in
+an SSH context during an upgrade or cold start. No competing KeepAlive loop was
+installed. The GUI-context restart remains a bounded mitigation, with that
+lifecycle gap open. Validation completed 332 Python tests with one optional
+dependency skip; 53 installer tests and an independent ownership review passed.
