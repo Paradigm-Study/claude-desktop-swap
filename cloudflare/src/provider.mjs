@@ -2,7 +2,7 @@
  *
  * Refresh conventions follow claude-swap's oauth.py (MIT, Copyright (c) 2026
  * Onur Cetinkol); see THIRD_PARTY_NOTICES.md. Endpoints, scopes, and metadata
- * mappings were checked against native Claude Code 2.1.300. This is an observed
+ * mappings were checked against native Claude Code 2.1.309. This is an observed
  * interoperability contract, not a supported public API.
  */
 
@@ -104,6 +104,36 @@ function retryAfter(headers) {
   if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value.trim())) return 0;
   const seconds = Number(value);
   return Number.isFinite(seconds) ? Math.min(86400, Math.max(0, seconds)) : 0;
+}
+
+// Administrator diagnostics contain quota structure only. Never return the raw
+// provider body: future responses may include unrelated account information.
+export function usageDiagnostic(raw) {
+  const type = value => value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+  const numeric = value => ({ type: type(value),
+    ...(typeof value === 'number' && Number.isFinite(value) ? { value } : {}) });
+  const label = value => typeof value === 'string' && /^[a-z][a-z0-9_:-]{0,47}$/.test(value)
+    ? value : `[${type(value)}]`;
+  const windows = {};
+  for (const key of ['five_hour', 'seven_day', ...Object.keys(raw)
+    .filter(key => /^seven_day_[A-Za-z0-9_-]{1,64}$/.test(key)).slice(0, 30)]) {
+    const value = raw[key];
+    windows[key] = { type: type(value), ...(isRecord(value) ? {
+      utilization: numeric(value.utilization), resets_at_type: type(value.resets_at),
+      rows_type: type(value.rows),
+    } : {}) };
+  }
+  return { windows, limits_type: type(raw.limits),
+    limits_count: Array.isArray(raw.limits) ? raw.limits.length : null,
+    limits: Array.isArray(raw.limits) ? raw.limits.slice(0, 50).map(value => ({
+      type: type(value), ...(isRecord(value) ? {
+        kind: label(value.kind), group: label(value.group), percent: numeric(value.percent),
+        is_active: typeof value.is_active === 'boolean' ? value.is_active : null,
+        scope_type: type(value.scope), model_type: type(value.scope?.model),
+        display_name_type: type(value.scope?.model?.display_name),
+        display_name_valid: metadataString(value.scope?.model?.display_name),
+      } : {}),
+    })) : [] };
 }
 
 export class Provider {
@@ -233,44 +263,69 @@ export class Provider {
     return profileIdentity(await this.request(PROFILE_URL, { token: accessToken }));
   }
 
+  async usageDiagnostic(accessToken) {
+    return usageDiagnostic(await this.request(USAGE_URL, { token: accessToken }));
+  }
+
   async usage(accessToken) {
     const raw = await this.request(USAGE_URL, { token: accessToken });
     const result = {};
+    const percent = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
     const keys = new Set(['five_hour', 'seven_day', ...Object.keys(raw).filter(k => k.startsWith('seven_day_'))]);
     for (const key of keys) {
       const value = raw[key];
       const required = key === 'five_hour' || key === 'seven_day';
-      if (!required && (value === null || value === undefined)) continue;
+      if (value === null || value === undefined) continue;
       // The API also returns weekly row aggregates (as_of/rows/window_started_at).
       // Those describe consumption; only quota windows expose utilization. A
       // reset-bearing or otherwise ambiguous object still fails closed below.
       if (!required && isRecord(value) && Array.isArray(value.rows)
         && !Object.hasOwn(value, 'utilization') && !Object.hasOwn(value, 'resets_at')) continue;
       const pct = isRecord(value) ? value.utilization : undefined;
-      if (typeof pct !== 'number' || !Number.isFinite(pct) || pct < 0) {
+      // Native usage permits nullable base meters. Only a valid canonical list
+      // below can establish a replacement or explicitly unreported session meter.
+      if (required && pct === null) continue;
+      if (!percent(pct)) {
         throw new ProviderError('bad-usage');
       }
       result[key] = pct;
     }
-    // Newer responses put per-model weekly quotas in limits[]. Valid observed
-    // quota windows can have is_active=false, so that flag must not remove them
-    // from model-all account selection. Spend is separate.
+    // Newer responses enumerate session, weekly-all and per-model quotas in
+    // limits[]. is_active describes the currently displayed meter, not whether
+    // its budget can constrain requests. Never drop an inactive quota window.
     const limits = raw.limits;
+    let canonicalWeekly = false;
     if (limits !== undefined && limits !== null) {
       if (!Array.isArray(limits)) throw new ProviderError('bad-usage');
       for (const limit of limits) {
         if (!isRecord(limit)) throw new ProviderError('bad-usage');
+        if (limit.kind === 'session' || limit.kind === 'weekly_all') {
+          const weekly = limit.kind === 'weekly_all';
+          if (limit.group !== (weekly ? 'weekly' : 'session') || !percent(limit.percent)) {
+            throw new ProviderError('bad-usage');
+          }
+          const key = weekly ? 'seven_day' : 'five_hour';
+          result[key] = Math.max(result[key] ?? 0, limit.percent);
+          if (weekly) canonicalWeekly = true;
+          continue;
+        }
         if (limit.kind !== 'weekly_scoped') continue;
         const model = isRecord(limit.scope) && isRecord(limit.scope.model) ? limit.scope.model : null;
         const name = model?.display_name;
         const pct = limit.percent;
-        if (limit.group !== 'weekly' || !metadataString(name)
-          || typeof pct !== 'number' || !Number.isFinite(pct) || pct < 0) {
+        if (limit.group !== 'weekly' || !metadataString(name) || !percent(pct)) {
           throw new ProviderError('bad-usage');
         }
         const key = `weekly_scoped:${name.toLowerCase()}`;
         result[key] = Math.max(result[key] ?? 0, pct);
       }
+    }
+    // A complete canonical weekly response may intentionally omit a session
+    // meter. Keep that absence as null, never a fabricated 0% reading. Missing
+    // legacy-only data, empty limits and unmeasured weekly budgets fail closed.
+    if (!Object.hasOwn(result, 'five_hour') && canonicalWeekly) result.five_hour = null;
+    if (!Object.hasOwn(result, 'five_hour') || !percent(result.seven_day)) {
+      throw new ProviderError('bad-usage');
     }
     return result;
   }

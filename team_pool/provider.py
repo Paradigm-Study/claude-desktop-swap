@@ -192,11 +192,17 @@ class Provider:
     def usage(self, access_token):
         raw = self._request(USAGE_URL, token=access_token)
         result = {}
+        def percentage(value):
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ProviderError("bad-usage")
+            return float(value)
+
         keys = {"five_hour", "seven_day"} | {k for k in raw if k.startswith("seven_day_")}
         for key in keys:
             value = raw.get(key)
             required = key in ("five_hour", "seven_day")
-            if value is None and not required:
+            if value is None:
                 continue
             # Weekly row aggregates describe consumption, not a quota window.
             # A reset-bearing or ambiguous object still fails closed below.
@@ -205,31 +211,49 @@ class Provider:
                     and "utilization" not in value and "resets_at" not in value):
                 continue
             pct = value.get("utilization") if isinstance(value, dict) else None
-            if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct) or pct < 0:
-                raise ProviderError("bad-usage")
-            result[key] = float(pct)
+            if required and isinstance(value, dict) and "utilization" in value and pct is None:
+                continue
+            result[key] = percentage(pct)
         # Valid observed quota windows can have is_active=False. Every per-model
         # weekly quota participates in model-all selection regardless of that
         # flag; spending/extra-usage limits deliberately do not.
         limits = raw.get("limits")
+        canonical = set()
         if limits is not None:
             if not isinstance(limits, list):
                 raise ProviderError("bad-usage")
             for limit in limits:
                 if not isinstance(limit, dict):
                     raise ProviderError("bad-usage")
-                if limit.get("kind") != "weekly_scoped":
+                kind = limit.get("kind")
+                if kind in ("session", "weekly_all"):
+                    key, group = (("five_hour", "session") if kind == "session"
+                                  else ("seven_day", "weekly"))
+                    if limit.get("group") != group:
+                        raise ProviderError("bad-usage")
+                    pct = percentage(limit.get("percent"))
+                    result[key] = max(result.get(key, 0), pct)
+                    canonical.add(kind)
+                    continue
+                if kind != "weekly_scoped":
                     continue
                 scope = limit.get("scope")
                 model = scope.get("model") if isinstance(scope, dict) else None
                 name = model.get("display_name") if isinstance(model, dict) else None
-                pct = limit.get("percent")
-                if (limit.get("group") != "weekly" or not self._metadata_string(name)
-                        or isinstance(pct, bool) or not isinstance(pct, (int, float))
-                        or not math.isfinite(pct) or pct < 0):
+                if limit.get("group") != "weekly" or not self._metadata_string(name):
                     raise ProviderError("bad-usage")
+                pct = percentage(limit.get("percent"))
                 key = "weekly_scoped:" + name.lower()
-                result[key] = max(result.get(key, 0), float(pct))
+                result[key] = max(result.get(key, 0), pct)
+        if "seven_day" not in result:
+            raise ProviderError("bad-usage")
+        if "five_hour" not in result:
+            # Current native responses can report weekly meters with no session
+            # meter. Only that explicit canonical shape permits an absent 5h
+            # value; legacy omissions and empty meter lists remain unknown.
+            if "weekly_all" not in canonical:
+                raise ProviderError("bad-usage")
+            result["five_hour"] = None
         return result
 
     def refresh(self, credentials):

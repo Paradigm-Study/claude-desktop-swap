@@ -144,6 +144,29 @@ class CoordinatorTest(unittest.TestCase):
         with self.assertRaises(PoolError):
             self.pool.assignment(self.device())
 
+    def test_absent_session_meter_allows_measured_weekly_assignment_and_rotation(self):
+        self.add('a')
+        self.add('b')
+        weekly = {'a': 11, 'b': 20}
+        self.provider.usage = lambda access: {
+            'five_hour': None, 'seven_day': weekly[access.rsplit('-', 1)[-1]],
+            'weekly_scoped:fable': 8}
+        token = self.device()
+        self.assertEqual(self.pool.assignment(token)['account_id'], 'a')
+        weekly['a'] = 100
+        self.now += 121
+        self.assertEqual(self.pool.assignment(token)['account_id'], 'b')
+
+    def test_only_session_can_be_null_and_scoped_limits_still_block(self):
+        self.add()
+        for usage in ({'five_hour': None, 'seven_day': None},
+                      {'five_hour': None, 'seven_day': 11, 'weekly_scoped:fable': None},
+                      {'five_hour': None, 'seven_day': 11, 'weekly_scoped:fable': 100}):
+            self.provider.usage = lambda _, usage=usage: usage
+            self.now += 4000
+            with self.subTest(usage=usage), self.assertRaises(PoolError):
+                self.pool.assignment(self.device())
+
     def test_revoke_blocks_existing_token_without_provider_call(self):
         self.add()
         enrollment = self.pool.enroll(self.pool.invite(), 'test')

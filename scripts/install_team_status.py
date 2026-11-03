@@ -139,8 +139,8 @@ def build_bundle(destination):
     (contents / "Resources").mkdir()
     info = {"CFBundleIdentifier": LABEL, "CFBundleExecutable": EXECUTABLE,
             "CFBundleName": "Claude Swap Status", "CFBundleDisplayName": "Claude Swap",
-            "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "1.1.0",
-            "CFBundleVersion": "2", "LSUIElement": True, "LSMinimumSystemVersion": "12.0",
+            "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "1.2.0",
+            "CFBundleVersion": "3", "LSUIElement": True, "LSMinimumSystemVersion": "12.0",
             "NSHighResolutionCapable": True}
     (contents / "Info.plist").write_bytes(plistlib.dumps(info))
     (contents / "Resources/claude-swap-status.json").write_text(json.dumps(MARKER) + "\n")

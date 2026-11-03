@@ -7,6 +7,13 @@ The menu displays the coordinator's latest reported usage, not a live billing
 counter. It refreshes the catalog approximately once a minute; **Refresh Pool
 and Status** requests an earlier refresh.
 
+Some subscriptions currently report weekly quota without a five-hour meter.
+The menu shows **Not reported** for that meter, rather than inventing 0%.
+Availability follows the measured weekly and model-specific quotas. Old readings
+are explicitly labeled **stale** when a fresh provider response is unavailable.
+Version a10 understands this response; rerun the one-command setup to update an
+older menu. Automatic background assignment remains compatible with older clients.
+
 ## Switch this Mac
 
 Open an available account's submenu and choose **Switch This Mac to This

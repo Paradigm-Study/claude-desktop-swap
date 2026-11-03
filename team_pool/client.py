@@ -540,8 +540,13 @@ class Client:
             if not _safe_string(token):
                 raise ClientError("The device credential is missing. Repeat setup before viewing the pool.")
         try:
-            value = self._transport(state).post("/v1/accounts/list", {}, token=token)
+            # Schema 2 preserves an explicitly absent session meter as null.
+            # Older menus require numbers; opt in rather than silently changing
+            # their entire catalog contract when the provider adds quota forms.
+            value = self._transport(state).post("/v1/accounts/list", {"usage_schema": 2}, token=token)
         except RequestError as error:
+            if error.status == 400:
+                raise ClientError("The coordinator does not support this menu's usage format yet. Refresh after the coordinator update completes.") from None
             if error.status == 404:
                 raise ClientError("The coordinator is still updating. Refresh the pool shortly.") from None
             if error.status == 401:

@@ -260,6 +260,26 @@ private func percentage(_ value: Any?) -> String {
     return String(format: "%.0f%%", value.doubleValue)
 }
 
+private func quotaDisplay(_ usage: [String: Any], key: String, stale: Bool = false) -> String {
+    // An explicit schema-2 null means the provider omitted the session meter.
+    // Missing/invalid data is still unknown; neither case becomes zero usage.
+    let label = key == "five_hour" && usage[key] is NSNull ? "Not reported" : percentage(usage[key])
+    return stale ? "\(label) (stale)" : label
+}
+
+private func quotaSummary(_ usage: [String: Any], stale: Bool) -> String {
+    let summary = "5h \(quotaDisplay(usage, key: "five_hour"))  ·  week \(quotaDisplay(usage, key: "seven_day"))"
+    return stale ? "\(summary)  ·  stale" : summary
+}
+
+private func quotaIsStale(_ account: [String: Any], catalogFailed: Bool, now: Date = Date()) -> Bool {
+    guard account["usage"] is [String: Any] else { return false }
+    if catalogFailed || account["reason"] as? String == "quota-stale" { return true }
+    guard let fetched = timestamp(account["fetched"]) else { return true }
+    let age = now.timeIntervalSince(fetched)
+    return age < 0 || age > 300
+}
+
 private func claudeAuthorizationURL(_ raw: Any?) -> URL? {
     guard let raw = raw as? String, raw.count <= 4096,
           let parts = URLComponents(string: raw), parts.scheme == "https",
@@ -418,8 +438,9 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let eligible = account["eligible"] as? Bool == true
                 let isCurrent = id == selected
                 let reason = account["reason"] as? String
+                let staleUsage = quotaIsStale(account, catalogFailed: catalogError != nil)
                 let available = eligible ? "Available" : availabilityReasons[reason ?? ""] ?? "Currently unavailable"
-                let row = NSMenuItem(title: "\(email)  ·  5h \(percentage(usage["five_hour"]))  ·  week \(percentage(usage["seven_day"]))",
+                let row = NSMenuItem(title: "\(email)  ·  \(quotaSummary(usage, stale: staleUsage))",
                                      action: nil, keyEquivalent: "")
                 row.state = isCurrent ? .on : .off
                 row.toolTip = "\(isCurrent ? "Assigned to this Mac. " : "")\(available)"
@@ -427,12 +448,13 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 detail.autoenablesItems = false
                 line(email, in: detail)
                 if let plan = safeLabel(details["subscriptionType"]) { line("Plan: \(plan)", in: detail) }
-                line("5-hour usage: \(percentage(usage["five_hour"]))", in: detail)
-                line("Weekly usage: \(percentage(usage["seven_day"]))", in: detail)
+                line("5-hour usage: \(quotaDisplay(usage, key: "five_hour", stale: staleUsage))", in: detail)
+                if usage["five_hour"] is NSNull { line("Claude did not report a 5-hour meter", in: detail) }
+                line("Weekly usage: \(quotaDisplay(usage, key: "seven_day", stale: staleUsage))", in: detail)
                 for key in usage.keys.sorted() where key != "five_hour" && key != "seven_day" {
                     let label = key.replacingOccurrences(of: "seven_day_", with: "Weekly ")
                         .replacingOccurrences(of: "weekly_scoped:", with: "Weekly ")
-                    line("\(String(label.prefix(80))): \(percentage(usage[key]))", in: detail)
+                    line("\(String(label.prefix(80))): \(quotaDisplay(usage, key: key, stale: staleUsage))", in: detail)
                 }
                 line(available, in: detail)
                 if let fetched = timestamp(account["fetched"]) {

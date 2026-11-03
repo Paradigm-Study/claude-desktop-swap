@@ -41,10 +41,13 @@ def validate_catalog(value):
                 if (not isinstance(usage, dict) or not {"five_hour", "seven_day"} <= set(usage)
                         or len(usage) > 30 or any(not isinstance(key, str)
                             or not re.fullmatch(r"(?:five_hour|seven_day(?:_[A-Za-z0-9_-]{1,64})?|weekly_scoped:[^\x00-\x1f\x7f]{1,96})", key)
-                            or not _number(percent) or percent < 0 for key, percent in usage.items())):
+                            or not ((key == "five_hour" and percent is None)
+                                    or (_number(percent) and percent >= 0))
+                            for key, percent in usage.items())):
                     raise ValueError
             if row["eligible"] and (row["state"] != "ready" or usage is None or row["fetched"] is None
-                                    or any(percent >= value["threshold"] for percent in usage.values())):
+                                    or any(percent >= value["threshold"] for percent in usage.values()
+                                           if percent is not None)):
                 raise ValueError
             seen.add(row["id"])
             accounts.append({**row, "account": dict(account), "usage": dict(usage) if usage is not None else None})

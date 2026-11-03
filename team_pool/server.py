@@ -411,7 +411,11 @@ class Coordinator:
                             self.db.execute("UPDATE accounts SET verified=1,secret=? WHERE id=?", (self.cipher.encrypt(json.dumps(credentials).encode()), row["id"]))
                     usage = self.provider.usage(credentials["access_token"])
                     # Provider adapters/fakes must obey the same fail-closed contract.
-                    if not isinstance(usage, dict) or not {"five_hour", "seven_day"} <= set(usage) or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in usage.values()):
+                    if (not isinstance(usage, dict) or not {"five_hour", "seven_day"} <= set(usage)
+                            or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                                   or not math.isfinite(v) or v < 0
+                                   for key, v in usage.items()
+                                   if not (key == "five_hour" and v is None))):
                         raise ProviderError("bad-usage")
                     with self.db:
                         self.db.execute("UPDATE accounts SET usage=?,fetched=?,next_poll=?,failures=0,error=NULL WHERE id=?", (json.dumps(usage), self.clock(), self.clock() + POLL_SECONDS, row["id"]))
@@ -449,8 +453,9 @@ class Coordinator:
                 usable[row["id"]] = (row, credentials)
                 if row["fetched"] is not None and 0 <= now - row["fetched"] <= FRESH_SECONDS:
                     usage = json.loads(row["usage"])
-                    if all(value < THRESHOLD for value in usage.values()):
-                        eligible.append((loads.get(row["id"], 0), max(usage.values()), row["id"]))
+                    known = [value for value in usage.values() if value is not None]
+                    if all(value < THRESHOLD for value in known):
+                        eligible.append((loads.get(row["id"], 0), max(known), row["id"]))
             current = device["account_id"]
             candidates = {item[2] for item in eligible}
             if current in candidates:

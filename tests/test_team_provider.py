@@ -228,6 +228,37 @@ class ProviderTest(unittest.TestCase):
         self.assertEqual(Provider(opener=FakeOpener({**base, 'limits': None})).usage('access'),
                          {'five_hour': 40, 'seven_day': 78})
 
+    def test_weekly_only_usage_retains_absent_session_meter(self):
+        limits = [{'kind': 'weekly_all', 'group': 'weekly', 'percent': 11},
+                  {'kind': 'weekly_scoped', 'group': 'weekly', 'percent': 8, 'is_active': False,
+                   'scope': {'model': {'display_name': 'Fable'}}}]
+        for base in ({}, {'five_hour': None}, {'five_hour': {'utilization': None}}):
+            result = Provider(opener=FakeOpener({**base, 'seven_day': {'utilization': 11},
+                                                'limits': limits})).usage('access')
+            self.assertEqual(result, {'five_hour': None, 'seven_day': 11, 'weekly_scoped:fable': 8})
+
+    def test_canonical_base_meters_fill_nulls_and_merge_conservatively(self):
+        limits = [{'kind': 'session', 'group': 'session', 'percent': 32},
+                  {'kind': 'weekly_all', 'group': 'weekly', 'percent': 44}]
+        for base in ({}, {'five_hour': None, 'seven_day': None},
+                     {'five_hour': {'utilization': None}, 'seven_day': {'utilization': None}}):
+            self.assertEqual(Provider(opener=FakeOpener({**base, 'limits': limits})).usage('access'),
+                             {'five_hour': 32, 'seven_day': 44})
+        self.assertEqual(Provider(opener=FakeOpener({'five_hour': {'utilization': 99},
+            'seven_day': {'utilization': 1}, 'limits': limits})).usage('access'),
+            {'five_hour': 99, 'seven_day': 44})
+
+    def test_unmeasured_or_malformed_canonical_usage_remains_unknown(self):
+        for limits in (None, [], [{'kind': 'unknown', 'percent': 0}],
+                       [{'kind': 'session', 'group': 'session', 'percent': 0}]):
+            with self.subTest(limits=limits), self.assertRaisesRegex(ProviderError, '^bad-usage$'):
+                Provider(opener=FakeOpener({'limits': limits})).usage('access')
+        for kind, group in [('session', 'session'), ('weekly_all', 'weekly')]:
+            for percent in (None, True, '0', -1, float('nan'), float('inf')):
+                with self.subTest(kind=kind, percent=percent), self.assertRaisesRegex(ProviderError, '^bad-usage$'):
+                    Provider(opener=FakeOpener({'five_hour': {'utilization': 0}, 'seven_day': {'utilization': 0},
+                        'limits': [{'kind': kind, 'group': group, 'percent': percent}]})).usage('access')
+
     def test_refresh_requires_successor_and_preserves_imported_fields(self):
         opener = FakeOpener({'access_token': 'new-access', 'refresh_token': 'new-refresh', 'expires_in': 1000,
                              'scope': 'user:inference user:profile'})

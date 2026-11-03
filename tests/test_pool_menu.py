@@ -53,7 +53,7 @@ class PoolMenuTests(unittest.TestCase):
         self.assertEqual(result["client_state"], "active")
         self.assertEqual(len(self.native.writes), writes)
         self.assertEqual(before, self.client.config.read_bytes())
-        self.assertEqual(self.transport.calls[-1], ("/v1/accounts/list", {}, DEVICE_TOKEN))
+        self.assertEqual(self.transport.calls[-1], ("/v1/accounts/list", {"usage_schema": 2}, DEVICE_TOKEN))
         self.assertNotIn(DEVICE_TOKEN, json.dumps(result))
         self.assertNotIn(PROVIDER_TOKEN, json.dumps(result))
 
@@ -66,6 +66,48 @@ class PoolMenuTests(unittest.TestCase):
         value = catalog()
         value["accounts"][0]["usage"].update(seven_day_sonnet=25, **{"weekly_scoped:claude sonnet 4.5": 30})
         self.assertEqual(validate_catalog(value)["accounts"][0]["usage"], value["accounts"][0]["usage"])
+
+    def test_catalog_preserves_absent_session_meter_without_fabricating_zero(self):
+        value = catalog()
+        value["accounts"][0]["usage"] = {"five_hour": None, "seven_day": 11, "weekly_scoped:claude sonnet": 8}
+        self.transport.next = value
+        before, writes = self.client.config.read_bytes(), len(self.native.writes)
+        code, reply, _ = self.run_bridge({"action": "list"})
+        self.assertEqual(code, 0)
+        row = reply["result"]["accounts"][0]
+        self.assertIsNone(row["usage"]["five_hour"])
+        self.assertEqual(row["usage"]["seven_day"], 11)
+        self.assertTrue(row["eligible"])
+        self.assertEqual(before, self.client.config.read_bytes())
+        self.assertEqual(writes, len(self.native.writes))
+
+    def test_null_session_does_not_bypass_known_weekly_or_model_limit(self):
+        for limit in ("seven_day", "weekly_scoped:claude sonnet"):
+            with self.subTest(limit=limit):
+                value = catalog()
+                row = value["accounts"][0]
+                row["usage"] = {"five_hour": None, "seven_day": 11, limit: 100}
+                with self.assertRaises(ClientError):
+                    validate_catalog(value)
+                row.update(eligible=False, reason="quota-exhausted")
+                self.assertEqual(validate_catalog(value)["accounts"][0]["usage"][limit], 100)
+
+    def test_catalog_null_is_allowed_only_for_explicit_session_meter(self):
+        bad_usage = [
+            {"five_hour": None, "seven_day": None},
+            {"five_hour": None, "seven_day": 11, "weekly_scoped:claude sonnet": None},
+            {"five_hour": None, "seven_day": 11, "seven_day_opus": None},
+            {"seven_day": 11},
+            {"five_hour": None, "seven_day": False},
+            {"five_hour": None, "seven_day": "11"},
+            {"five_hour": None, "seven_day": float("nan")},
+        ]
+        for usage in bad_usage:
+            with self.subTest(usage=usage):
+                value = catalog()
+                value["accounts"][0]["usage"] = usage
+                with self.assertRaises(ClientError):
+                    validate_catalog(value)
 
     def test_catalog_rejects_credential_fields_duplicates_and_invalid_usage(self):
         bad = []
@@ -96,6 +138,15 @@ class PoolMenuTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("still updating", result["error"])
         self.assertEqual(before, self.client.config.read_bytes())
+
+    def test_old_coordinator_format_rejection_preserves_local_state(self):
+        self.transport.error = RequestError(400)
+        before, writes = self.client.config.read_bytes(), len(self.native.writes)
+        code, result, _ = self.run_bridge({"action": "list"})
+        self.assertEqual(code, 1)
+        self.assertIn("usage format", result["error"])
+        self.assertEqual(before, self.client.config.read_bytes())
+        self.assertEqual(writes, len(self.native.writes))
 
     def test_manual_switch_uses_guarded_commit_and_preserves_backup(self):
         before = copy.deepcopy(self.native.original)

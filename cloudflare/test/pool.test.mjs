@@ -256,8 +256,70 @@ test('admin account diagnostics expose cached actual usage and a safe label with
   }
   await h.request('/admin/accounts/list', {}, device.device_token, { expected: 401 });
   const health = await h.mf.dispatchFetch('https://pool.example.test/health');
-  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a8' });
+  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a10' });
   assert.equal(h.provider.calls.length, calls);
+});
+
+test('usage diagnostics require admin authentication and an exact validated account identifier', async () => {
+  await h.add();
+  const device = await h.enroll();
+  for (const token of [undefined, device.device_token, 'unknown-bearer-which-is-more-than-thirty-two-bytes']) {
+    await h.request('/admin/accounts/usage-diagnostic', { account_id: 'a' }, token, { expected: 401 });
+  }
+  for (const body of [{}, { account_id: 'a', refresh: true }, { account_id: null }, { account_id: 3 },
+    { account_id: {} }, { account_id: '' }, { account_id: 'a\n' }, { account_id: 'a'.repeat(65) }]) {
+    await h.admin('accounts/usage-diagnostic', body, { expected: 400 });
+  }
+  assert.deepEqual(await h.admin('accounts/usage-diagnostic', { account_id: 'missing' }, { expected: 404 }),
+    { error: 'unknown-account' });
+  assert.equal(h.provider.calls.length, 0, 'authorization and input failures must not query the provider');
+});
+
+test('usage diagnostics inspect only selected usage without refreshing or changing any persistent state', async () => {
+  const value = await h.add('selected', h.now - 1);
+  await h.add('untouched', h.now - 1);
+  await h.enroll();
+  await h.sql("UPDATE accounts SET state='quarantined',usage=?,fetched=?,next_poll=?,error='refresh-uncertain-reimport-fresh-lineage' WHERE id=?",
+    JSON.stringify({ five_hour: 100, seven_day: 100 }), h.now - 86400, h.now + 3600, 'selected');
+  h.provider.rawUsage = {
+    five_hour: { utilization: 12, resets_at: '2026-11-03T02:00:00Z', access_token: value.access_token },
+    seven_day: { utilization: 21, resets_at: '2026-11-06T02:00:00Z' },
+    private_unrelated_field: { credentials: value.refresh_token },
+  };
+  const before = {};
+  for (const table of ['accounts', 'devices', 'audit']) before[table] = await h.sql(`SELECT * FROM ${table}`);
+  const result = await h.admin('accounts/usage-diagnostic', { account_id: 'selected' });
+  assert.deepEqual(Object.keys(result).sort(), ['account_id', 'diagnostic']);
+  assert.equal(result.account_id, 'selected');
+  assert.equal(typeof result.diagnostic, 'object');
+  assert.notEqual(result.diagnostic, null);
+  assert.equal(Array.isArray(result.diagnostic), false);
+  assert.equal(h.provider.count('usage'), 1);
+  assert.equal(h.provider.count('refresh'), 0);
+  assert.equal(h.provider.count('profile'), 0);
+  for (const table of ['accounts', 'devices', 'audit']) {
+    assert.deepEqual(await h.sql(`SELECT * FROM ${table}`), before[table], `${table} must remain unchanged`);
+  }
+  const raw = JSON.stringify(result);
+  for (const forbidden of [value.access_token, value.refresh_token, 'access_token', 'refresh_token',
+    'private_unrelated_field', 'credentials', before.accounts[0].secret]) {
+    assert.equal(raw.includes(forbidden), false, 'diagnostics must not expose credential material or unrelated raw fields');
+  }
+});
+
+test('usage diagnostic provider failures return a fixed error without quarantining or touching quota state', async () => {
+  await h.add();
+  const before = await h.sql('SELECT * FROM accounts');
+  const audit = await h.sql('SELECT * FROM audit');
+  for (const failure of [401, 429, 500]) {
+    h.provider.usageFailure = failure;
+    assert.deepEqual(await h.admin('accounts/usage-diagnostic', { account_id: 'a' }, { expected: 502 }),
+      { error: 'usage-diagnostic-unavailable' });
+    assert.deepEqual(await h.sql('SELECT * FROM accounts'), before);
+    assert.deepEqual(await h.sql('SELECT * FROM audit'), audit);
+  }
+  assert.equal(h.provider.count('usage'), 3);
+  assert.equal(h.provider.count('refresh'), 0);
 });
 
 test('member pool listing polls due quota, returns only safe fields, and never assigns or touches a device', async () => {
@@ -322,7 +384,113 @@ test('member menu schemas reject extra fields and malformed requested account ID
       { error: 'invalid-account-id' });
   }
   await h.request('/v1/assignment', { account_id: 'a', force: true }, device.device_token, { expected: 400 });
+  for (const usage_schema of [null, false, 1, 3, '2', {}]) {
+    await h.request('/v1/accounts/list', { usage_schema }, device.device_token, { expected: 400 });
+  }
   assert.equal(h.provider.calls.length, 0);
+});
+
+test('nullable session quota is explicit for schema2 menus while legacy menus and automatic clients remain compatible', async () => {
+  await h.add('nullable');
+  h.provider.rawUsage = {
+    five_hour: null, seven_day: { utilization: 11 },
+    limits: [
+      { kind: 'weekly_all', group: 'weekly', percent: 11 },
+      { kind: 'weekly_scoped', group: 'weekly', percent: 8, scope: { model: { display_name: 'Sonnet' } } },
+    ],
+  };
+  const device = await h.shareEnroll();
+  const before = (await h.admin('devices/list')).devices;
+  const legacy = await h.request('/v1/accounts/list', {}, device.device_token);
+  assert.equal(legacy.accounts[0].usage, null);
+  assert.equal(legacy.accounts[0].eligible, false);
+  assert.equal(legacy.accounts[0].reason, 'quota-unavailable');
+  assert.deepEqual(Object.keys(legacy.accounts[0]).sort(),
+    ['account', 'eligible', 'expires_at', 'fetched', 'id', 'reason', 'state', 'usage']);
+  const current = await h.request('/v1/accounts/list', { usage_schema: 2 }, device.device_token);
+  assert.deepEqual(current.accounts[0].usage, { five_hour: null, seven_day: 11, 'weekly_scoped:sonnet': 8 });
+  assert.equal(current.accounts[0].eligible, true);
+  assert.equal(current.accounts[0].reason, null);
+  assert.equal(h.provider.count('usage'), 1, 'catalog versions must reuse the same observation');
+  assert.deepEqual((await h.admin('devices/list')).devices, before, 'neither menu version assigns an account');
+  assert.equal(JSON.parse((await h.sql('SELECT usage FROM accounts WHERE id=?', 'nullable'))[0].usage).five_hour, null);
+  const automatic = await h.assignment(device);
+  assert.equal(automatic.account_id, 'nullable');
+  assert.equal(automatic.state, 'fresh');
+  assert.equal(Object.hasOwn(automatic, 'usage'), false, 'automatic clients retain their existing response contract');
+  assert.equal((await h.request('/v1/assignment', { account_id: 'nullable' }, device.device_token)).account_id, 'nullable');
+});
+
+test('nullable session quota still enforces known weekly and model quotas and preserves legacy failure reasons', async () => {
+  await h.add('nullable');
+  h.provider.rawUsage = {
+    five_hour: null, seven_day: { utilization: 11 },
+    limits: [
+      { kind: 'weekly_all', group: 'weekly', percent: 11 },
+      { kind: 'weekly_scoped', group: 'weekly', percent: 98, scope: { model: { display_name: 'Sonnet' } } },
+    ],
+  };
+  const device = await h.shareEnroll();
+  const current = await h.request('/v1/accounts/list', { usage_schema: 2 }, device.device_token);
+  assert.equal(current.accounts[0].eligible, false);
+  assert.equal(current.accounts[0].reason, 'quota-exhausted');
+  const legacy = await h.request('/v1/accounts/list', {}, device.device_token);
+  assert.equal(legacy.accounts[0].usage, null);
+  assert.equal(legacy.accounts[0].reason, 'quota-exhausted');
+  await h.request('/v1/assignment', { account_id: 'nullable' }, device.device_token, { expected: 409 });
+  assert.equal((await h.admin('devices/list')).devices[0].account_id, null);
+  h.provider.usageFailure = 429;
+  await h.advance(301);
+  const stale = await h.request('/v1/accounts/list', {}, device.device_token);
+  assert.equal(stale.accounts[0].reason, 'quota-stale');
+  assert.equal(stale.accounts[0].usage, null);
+});
+
+test('unknown session quota without canonical weekly evidence remains unavailable and preserves prior observations', async () => {
+  await h.add();
+  const device = await h.shareEnroll();
+  await h.assignment(device);
+  h.provider.rawUsage = { five_hour: null, seven_day: { utilization: 11 }, limits: [] };
+  await h.advance(301);
+  const result = await h.request('/v1/accounts/list', { usage_schema: 2 }, device.device_token);
+  assert.equal(result.accounts[0].reason, 'quota-stale');
+  assert.equal(result.accounts[0].eligible, false);
+  assert.deepEqual(result.accounts[0].usage, { five_hour: 10, seven_day: 10 });
+  assert.equal((await h.admin('accounts/list')).accounts[0].error, 'bad-usage');
+  await h.request('/v1/assignment', { account_id: 'a' }, device.device_token, { expected: 409 });
+});
+
+test('nullable quota schema migration retries parser failures once without waiving rate limits or quarantine', async () => {
+  for (const id of ['parser-failure', 'rate-limited', 'quarantined']) await h.add(id);
+  await h.sql('DELETE FROM pool_metadata WHERE key=?', 'nullable-session-usage-v2');
+  const oldUsage = JSON.stringify({ five_hour: 100, seven_day: 100 });
+  await h.sql("UPDATE accounts SET usage=?,fetched=?,next_poll=?,failures=8,error='bad-usage'", oldUsage, h.now - 172800, h.now + 3600);
+  await h.sql("UPDATE accounts SET error='http-429' WHERE id='rate-limited'");
+  await h.sql("UPDATE accounts SET state='quarantined' WHERE id='quarantined'");
+  const before = await h.sql('SELECT * FROM accounts ORDER BY id');
+  const audit = await h.sql('SELECT * FROM audit');
+  await h.restart();
+  const after = await h.sql('SELECT * FROM accounts ORDER BY id');
+  const parser = after.find(row => row.id === 'parser-failure');
+  assert.deepEqual(parser, { ...before.find(row => row.id === 'parser-failure'), next_poll: 0, failures: 0 });
+  for (const id of ['rate-limited', 'quarantined']) {
+    assert.deepEqual(after.find(row => row.id === id), before.find(row => row.id === id));
+  }
+  assert.deepEqual(await h.sql('SELECT * FROM audit'), audit);
+  assert.equal(h.provider.calls.length, 0, 'schema migration must not make provider requests');
+  h.provider.rawUsage = { five_hour: null, seven_day: { utilization: 11 },
+    limits: [{ kind: 'weekly_all', group: 'weekly', percent: 11 }] };
+  const device = await h.enroll();
+  const recovered = await h.request('/v1/accounts/list', { usage_schema: 2 }, device.device_token);
+  const recoveredAccount = recovered.accounts.find(row => row.id === 'parser-failure');
+  assert.deepEqual(recoveredAccount.usage, { five_hour: null, seven_day: 11 });
+  assert.equal(recoveredAccount.eligible, true);
+  assert.equal(h.provider.count('usage'), 1, 'rate-limited and quarantined rows must not be queried');
+  assert.equal((await h.admin('accounts/list')).accounts.find(row => row.id === 'parser-failure').error, null);
+  await h.sql("UPDATE accounts SET next_poll=?,failures=8,error='bad-usage' WHERE id='parser-failure'", h.now + 3600);
+  const recurring = await h.sql('SELECT * FROM accounts ORDER BY id');
+  await h.restart();
+  assert.deepEqual(await h.sql('SELECT * FROM accounts ORDER BY id'), recurring, 'restart must not bypass backoff after the migration was recorded');
 });
 
 test('concurrent menu listing and selection share the single refresh owner', async () => {
@@ -687,7 +855,7 @@ test('production entry enforces HTTPS, configuration and enrollment throttling t
   h.production = true; await h.restart();
   const health = await h.mf.dispatchFetch('https://pool.example.test/health');
   assert.equal(health.status, 200);
-  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a8' });
+  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a10' });
   assert.equal(health.headers.get('cache-control'), 'no-store');
   const insecure = await h.mf.dispatchFetch('http://pool.example.test/health');
   assert.equal(insecure.status, 400); assert.equal((await insecure.json()).error, 'https-required');

@@ -3,7 +3,7 @@
 set -euo pipefail
 umask 077
 
-RELEASE=v0.1.0a9
+RELEASE=v0.1.0a10
 REPOSITORY=Paradigm-Study/claude-desktop-swap
 UV_VERSION=0.13.5
 bootstrap_stage=''

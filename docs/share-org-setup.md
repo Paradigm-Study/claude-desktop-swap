@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/
 ```
 
 Run it as your ordinary Mac user, without `sudo` in front of the command. The
-installer uses the tested `v0.1.0a9` package and prepares its own Python runtime;
+installer uses the tested `v0.1.0a10` package and prepares its own Python runtime;
 Git, Python and uv do not need to be installed beforehand. Use that Mac’s
 logged-in desktop Terminal, including when helping through Screen Sharing. An
 SSH shell can lack access to its login Keychain even when the desktop services
@@ -48,7 +48,7 @@ pool activation; remaining continuity and failover checks are recorded in the
 ## If an older setup reported “Missing _meta.json”
 
 That error came from assuming Desktop's optional profile library existed. The
-`v0.1.0a9` installer supports an initialized ordinary Claude Desktop installation
+`v0.1.0a10` installer supports an initialized ordinary Claude Desktop installation
 without that library. Open Claude Desktop, finish its normal first sign-in if
 needed, and run the same one-command setup again. Do not create a replacement
 profile or delete your existing app data.
@@ -81,13 +81,13 @@ credential store only and refuses a `CLAUDE_CONFIG_DIR` override or conflicting
 native provider configuration.
 
 The package and runtime stay under
-`~/.local/share/claude-desktop-swap/releases/v0.1.0a9/`. Keep that directory in
+`~/.local/share/claude-desktop-swap/releases/v0.1.0a10/`. Keep that directory in
 place while the service uses it. Setup prints the installed client path; for this
 release, status and contribution commands are:
 
 ```sh
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a9/venv/bin/team-pool-client status
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a9/venv/bin/team-pool-client contribute-account
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a10/venv/bin/team-pool-client status
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a10/venv/bin/team-pool-client contribute-account
 ```
 
 If Share saves its sign-in elsewhere, use the same installer with its account

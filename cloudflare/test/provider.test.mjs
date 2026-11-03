@@ -289,6 +289,55 @@ test('missing or invalid usage is unknown, while over-100 utilization stays exha
     .provider.usage('access')).five_hour, 101);
 });
 
+test('live weekly-only response replaces stale usage without inventing a session percentage', async () => {
+  const value = {
+    five_hour: null, seven_day: { utilization: 11 },
+    seven_day_opus: null, seven_day_breakdown: { rows: [] },
+    limits: [
+      { kind: 'weekly_all', group: 'weekly', percent: 11, is_active: true, scope: null },
+      { kind: 'weekly_scoped', group: 'weekly', percent: 8, is_active: false,
+        scope: { model: { display_name: 'Fable' }, surface: null } },
+    ],
+  };
+  for (const five_hour of [null, undefined, { utilization: null }]) {
+    assert.deepEqual(await fake([{ ...value, five_hour }]).provider.usage('access'), {
+      five_hour: null, seven_day: 11, 'weekly_scoped:fable': 8,
+    });
+  }
+});
+
+test('canonical base meters fill nullable legacy windows and preserve the highest reported value', async () => {
+  const limits = [
+    { kind: 'session', group: 'session', percent: 32, is_active: false },
+    { kind: 'weekly_all', group: 'weekly', percent: 44, is_active: false },
+  ];
+  for (const base of [{}, { five_hour: null, seven_day: null },
+    { five_hour: { utilization: null }, seven_day: { utilization: null } }]) {
+    assert.deepEqual(await fake([{ ...base, limits }]).provider.usage('access'), { five_hour: 32, seven_day: 44 });
+  }
+  assert.deepEqual(await fake([{
+    five_hour: { utilization: 99 }, seven_day: { utilization: 10 }, limits,
+  }]).provider.usage('access'), { five_hour: 99, seven_day: 44 });
+  assert.deepEqual(await fake([{ limits: [limits[1]] }]).provider.usage('access'), { five_hour: null, seven_day: 44 });
+});
+
+test('absent session requires measured canonical weekly quota, not empty or unknown rows', async () => {
+  for (const limits of [undefined, null, [], [{ kind: 'unknown', percent: 0 }],
+    [{ kind: 'weekly_scoped', group: 'weekly', percent: 0, scope: { model: { display_name: 'Fable' } } }]]) {
+    await fails(fake([{ five_hour: null, seven_day: { utilization: 0 }, limits }]).provider.usage('access'), 'bad-usage');
+  }
+  await fails(fake([{ limits: [{ kind: 'session', group: 'session', percent: 0 }] }])
+    .provider.usage('access'), 'bad-usage');
+  for (const kind of ['session', 'weekly_all']) {
+    const row = { kind, group: kind === 'session' ? 'session' : 'weekly', percent: 1 };
+    for (const change of [{ percent: null }, { percent: true }, { percent: '0' },
+      { percent: -1 }, { percent: Infinity }, { percent: undefined }, { group: 'spend' }]) {
+      await fails(fake([{ five_hour: { utilization: 0 }, seven_day: { utilization: 0 },
+        limits: [{ ...row, ...change }] }]).provider.usage('access'), 'bad-usage');
+    }
+  }
+});
+
 test('refresh preserves imported fields without mutating its input or replaying the predecessor', async () => {
   const source = credentials();
   const { provider, requests } = fake([grant()]);

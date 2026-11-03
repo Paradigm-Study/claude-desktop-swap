@@ -26,6 +26,12 @@ function object(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function validUsage(value) {
+  return object(value) && Object.hasOwn(value, 'five_hour') && Object.hasOwn(value, 'seven_day')
+    && Object.entries(value).every(([key, percent]) => (key === 'five_hour' && percent === null)
+      || (typeof percent === 'number' && Number.isFinite(percent) && percent >= 0));
+}
+
 function keys(value, required, optional = []) {
   return object(value) && required.every(key => Object.hasOwn(value, key))
     && Object.keys(value).every(key => required.includes(key) || optional.includes(key));
@@ -222,6 +228,7 @@ export class PoolObject extends DurableObject {
         'CREATE TABLE IF NOT EXISTS audit (at REAL NOT NULL, event TEXT NOT NULL, subject TEXT NOT NULL)',
         'CREATE TABLE IF NOT EXISTS enrollment_limits (id TEXT PRIMARY KEY, count INTEGER NOT NULL, expires REAL NOT NULL)',
         'CREATE TABLE IF NOT EXISTS consumed_share_grants (grant_hash TEXT PRIMARY KEY, device_id TEXT NOT NULL, consumed REAL NOT NULL)',
+        'CREATE TABLE IF NOT EXISTS pool_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
       ];
       this.transaction(() => {
         for (const statement of schema) this.query(statement);
@@ -232,6 +239,12 @@ export class PoolObject extends DurableObject {
         }
         this.query("UPDATE accounts SET state='quarantined',error='interrupted-refresh' WHERE state='refreshing'");
         this.query("UPDATE contributions SET state='uncertain',secret=NULL WHERE state='exchanging'");
+        if (!this.one('SELECT value FROM pool_metadata WHERE key=?', 'nullable-session-usage-v2')) {
+          // A parser upgrade can repair a previously rejected provider shape.
+          // Retry those rows once; never waive rate-limit or grant recovery state.
+          this.query("UPDATE accounts SET next_poll=0,failures=0 WHERE state='ready' AND error='bad-usage'");
+          this.query('INSERT INTO pool_metadata(key,value) VALUES (?,?)', 'nullable-session-usage-v2', 'applied');
+        }
         this.expireContributions();
       });
       await this.ctx.storage.sync();
@@ -278,13 +291,13 @@ export class PoolObject extends DurableObject {
     const url = new URL(request.url);
     if (url.search) throw new PoolError('not-found', 404);
     if (request.method === 'GET' && url.pathname === '/health') {
-      return reply(200, { ok: true, mode: 'native-subscription', version: '0.1.0a8' });
+      return reply(200, { ok: true, mode: 'native-subscription', version: '0.1.0a10' });
     }
     if (request.method !== 'POST') throw new PoolError('not-found', 404);
     const routes = new Set([
       '/v1/enroll', '/v1/enroll/share', '/v1/link/share', '/v1/assignment', '/v1/accounts/list', '/v1/contributions/start', '/v1/contributions/complete',
       '/v1/contributions/status', '/v1/contributions/cancel', '/admin/invites',
-      '/admin/accounts/list', '/admin/accounts/import', '/admin/devices/list', '/admin/devices/revoke',
+      '/admin/accounts/list', '/admin/accounts/import', '/admin/accounts/usage-diagnostic', '/admin/devices/list', '/admin/devices/revoke',
     ]);
     const path = url.pathname;
     if (!routes.has(path)) throw new PoolError('not-found', 404);
@@ -317,8 +330,9 @@ export class PoolObject extends DurableObject {
         result = await this.assignment(device, body.account_id);
         break;
       case '/v1/accounts/list':
-        this.requireKeys(body, []);
-        result = await this.memberAccounts(device);
+        this.requireKeys(body, [], ['usage_schema']);
+        if (Object.hasOwn(body, 'usage_schema') && body.usage_schema !== 2) throw new PoolError('invalid-body');
+        result = await this.memberAccounts(device, body.usage_schema ?? 1);
         break;
       case '/v1/contributions/start':
         this.requireKeys(body, []);
@@ -341,6 +355,10 @@ export class PoolObject extends DurableObject {
       case '/admin/accounts/list':
         this.requireKeys(body, []);
         result = { accounts: await this.listAccounts() };
+        break;
+      case '/admin/accounts/usage-diagnostic':
+        this.requireKeys(body, ['account_id']);
+        result = await this.usageDiagnostic(body.account_id);
         break;
       case '/admin/devices/list':
         this.requireKeys(body, []);
@@ -551,15 +569,32 @@ export class PoolObject extends DurableObject {
     return accounts;
   }
 
+  async usageDiagnostic(accountId) {
+    if (typeof accountId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}(?![\s\S])/.test(accountId)) {
+      throw new PoolError('invalid-account-id');
+    }
+    const row = this.one('SELECT secret FROM accounts WHERE id=?', accountId);
+    if (!row) throw new PoolError('unknown-account', 404);
+    const credentials = await this.decrypt(row.secret);
+    // This read-only diagnostic bypasses poll: inspecting an old/quarantined
+    // account must not rotate its grant or change cached quota/recovery state.
+    try {
+      const diagnostic = await this.provider.usageDiagnostic(credentials.access_token);
+      return { account_id: accountId, diagnostic };
+    } catch {
+      throw new PoolError('usage-diagnostic-unavailable', 502);
+    }
+  }
+
   accountAvailability(row, credentials, now) {
     const usage = row.usage === null ? null : JSON.parse(row.usage);
     let reason = null;
     if (row.state !== 'ready') reason = row.state === 'refreshing' ? 'refreshing' : 'quarantined';
     else if (!row.verified) reason = 'unverified';
     else if (credentials.expires_at <= now + EXPIRY_MARGIN) reason = 'token-expiring';
-    else if (row.fetched === null || usage === null) reason = 'quota-unavailable';
+    else if (row.fetched === null || !validUsage(usage)) reason = 'quota-unavailable';
     else if (now - row.fetched < 0 || now - row.fetched > FRESH_SECONDS) reason = 'quota-stale';
-    else if (Object.values(usage).some(value => value >= this.threshold)) reason = 'quota-exhausted';
+    else if (Object.values(usage).some(value => value !== null && value >= this.threshold)) reason = 'quota-exhausted';
     return {
       usage, reason, eligible: reason === null,
       usable: row.state === 'ready' && Boolean(row.verified) && credentials.expires_at > now + EXPIRY_MARGIN,
@@ -577,7 +612,7 @@ export class PoolObject extends DurableObject {
     return accounts;
   }
 
-  async memberAccounts(device) {
+  async memberAccounts(device, usageSchema = 1) {
     await this.poll();
     const snapshots = await this.accountSnapshots();
     // Membership may change while provider quota or encrypted storage is read.
@@ -586,7 +621,14 @@ export class PoolObject extends DurableObject {
     const now = this.now();
     return {
       accounts: snapshots.map(({ row, credentials }) => {
-        const { usage, eligible, reason } = this.accountAvailability(row, credentials, now);
+        let { usage, eligible, reason } = this.accountAvailability(row, credentials, now);
+        if (usageSchema === 1 && usage !== null && Object.values(usage).some(value => value === null)) {
+          // Older menus require every meter to be numeric. Preserve their wire
+          // contract without inventing a zero for an explicitly absent meter.
+          usage = null;
+          eligible = false;
+          reason ??= 'quota-unavailable';
+        }
         return {
           id: row.id,
           account: { emailAddress: credentials.account.emailAddress, subscriptionType: credentials.account.subscriptionType },
@@ -782,8 +824,7 @@ export class PoolObject extends DurableObject {
           this.query('UPDATE accounts SET verified=1,secret=? WHERE id=?', encrypted, row.id);
         }
         const usage = await this.provider.usage(credentials.access_token);
-        if (!object(usage) || !Object.hasOwn(usage, 'five_hour') || !Object.hasOwn(usage, 'seven_day')
-            || Object.values(usage).some(value => typeof value !== 'number' || !Number.isFinite(value) || value < 0)) throw new ProviderError('bad-usage');
+        if (!validUsage(usage)) throw new ProviderError('bad-usage');
         this.query('UPDATE accounts SET usage=?,fetched=?,next_poll=?,failures=0,error=NULL WHERE id=?', JSON.stringify(usage), this.now(), this.now() + POLL_SECONDS, row.id);
       } catch (error) {
         let code = error instanceof ProviderError ? error.code : 'provider-error';
@@ -811,7 +852,8 @@ export class PoolObject extends DurableObject {
       const { row, credentials } = snapshot;
       const availability = this.accountAvailability(row, credentials, now);
       if (availability.usable) usable.set(row.id, snapshot);
-      if (availability.eligible) eligible.push([loads.get(row.id) || 0, Math.max(...Object.values(availability.usage)), row.id]);
+      if (availability.eligible) eligible.push([loads.get(row.id) || 0,
+        Math.max(...Object.values(availability.usage).filter(value => value !== null)), row.id]);
     }
     const current = device.account_id;
     let chosen, state;
