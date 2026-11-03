@@ -1,6 +1,6 @@
 # Live two-Mac acceptance worksheet
 
-Status: **IN PROGRESS — client 0.1.0a8 active on Mac A; a9 active on Mac B**.
+Status: **IN PROGRESS — client 0.1.0a10 active on Mac A; a9 last verified on Mac B**.
 Mac B completed setup in its own GUI Terminal after the directory repair and
 failed SSH attempts. Its native request and background sync passed, and the user
 reported that it works. Existing-conversation continuity on Mac B, actual menu
@@ -10,7 +10,7 @@ private prompts, account emails, or session identifiers.
 
 | Check | Mac A | Mac B | Evidence / observed limitation |
 | --- | --- | --- | --- |
-| macOS / Desktop / bundled Code version | 27.0.1 / 3.6556.2 / 2.1.308 | 27.2 / 3.6556.2 / Pending | Cloudflare coordinator; a8 active on Mac A, a9 active on Mac B. Mac B's bundled Code version remains unrecorded. |
+| macOS / Desktop / bundled Code version | 27.0.1 / 3.6556.2 / 2.1.309 | 27.2 / 3.6556.2 / Pending | Cloudflare coordinator; a10 active on Mac A, a9 last verified on Mac B. Mac B's bundled Code version remains unrecorded. |
 | Public one-command setup and repeat run | Passed on enrolled Mac | Initial setup passed; repeat pending | Mac A's public a8 activation and exact piped-command rerun preserved device, token, Share identity, backup, native fingerprint, and Desktop profile. Mac B's tagged public a9 installer completed in its own GUI Terminal after the repairs below. |
 | Standard Desktop layout without a profile library | Existing profile preserved | Passed | Mac B's native wrapper verified with its original standard Desktop data retained and no optional `_meta.json` created. The system and user policy directories were mode 0755, and the launcher policy was mode 0644. |
 | Installer directory access and repair | Existing installation accessible | Passed | a9 diagnosed the inaccessible root-owned ClaudeCode directory before Keychain access. An authorized repair changed its mode from 0700 to 0755, confirmed on Mac B. |
@@ -226,3 +226,44 @@ underlying Keychain error in the failed SSH attempts. No credential export or
 permission bypass was used. The user subsequently reported, "ok it works now".
 That is confirmation of working setup, not an explicit existing-conversation
 continuity test or evidence of actual menu clicks. Those checks remain pending.
+
+
+## November 2: weekly-only quota response and a10 activation
+
+Four ready accounts stopped updating because the provider began returning a null
+`five_hour` window alongside a measured `seven_day` and canonical `limits[]`
+weekly meters. The parser required both legacy windows to be numeric. Its
+`bad-usage` backoff retained old readings, which became stale and correctly
+disabled manual selection under the existing freshness rule. An account showing
+100% weekly usage actually returned 11% in a fresh provider response.
+
+An administrator-only structure diagnostic established the response shape without
+returning credentials or arbitrary provider fields. Native Code 2.1.309 also
+accepts nullable legacy windows. Release `v0.1.0a10` (commit `a383061`) normalizes
+canonical session and weekly meters, represents an explicitly unreported session
+meter as null, and still requires a measured weekly budget. Malformed or unknown
+usage is not converted to zero. The coordinator recovered only prior parser
+backoff once, preserving HTTP rate-limit backoff and quarantined refresh state.
+
+The menu opts into catalog schema 2 and shows **Not reported** for absent session
+meters, with explicit stale labels on old readings. Legacy menus receive a valid
+schema-1 catalog with unavailable nullable rows until updated; their automatic
+assignment protocol remains compatible. All four parser-error accounts obtained
+fresh readings after deployment; one genuinely exhausted account stayed blocked.
+Two separately quarantined refresh lineages were not changed.
+
+The a10 tagged installer completed on Mac A, reused its existing enrollment and
+verified background sync, and installed the new menu/helper. The catalog contains
+eight accounts. Manual selection of the formerly stale account through the
+installed helper committed in 0.55 seconds; a real normal-speed native Sonnet
+request returned exact OK in 1.77 seconds with `claude.ai / firstParty / max`.
+The preceding healthy assignment was restored in 0.66 seconds. Device identity,
+device token, Share identity, recovery backup, profile metadata and connector
+credentials were preserved; native credentials remained access-only and matched
+the client state. The earlier exhausted account was not forced back into use.
+
+Local validation completed 320 Python tests with one optional dependency skip,
+91 Cloudflare tests, Swift compilation and Wrangler's deployment dry-run. The
+deployed worker version is `17d93825-9191-42bd-a307-15c92e6f8522`. Direct GUI clicks
+and same-conversation switching remain distinct, unverified acceptance checks;
+the live selection test exercised the installed menu's helper/action path.
