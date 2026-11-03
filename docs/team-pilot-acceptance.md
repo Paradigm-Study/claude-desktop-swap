@@ -304,8 +304,10 @@ token. Other users' helpers were not restarted. An isolated child launched
 through that actual helper and the managed launcher reported
 `claude.ai / firstParty / max`. A normal-speed Sonnet request through the same
 helper returned exact OK in 7.8 seconds, exit 0, without persisting a new chat.
-The original conversation transcript remains present; resuming that specific
-conversation still requires user confirmation.
+The original conversation transcript remains present. The user confirmed that
+the affected session was opened over SSH from their laptop and that the original
+conversation responds after the repair. This completes the existing-conversation
+recovery check; it does not establish survival across future helper replacement.
 
 This establishes current helper-child authentication and inference. It does not
 establish persistent SSH lifecycle support: Desktop can replace the helper in
