@@ -40,6 +40,8 @@ keep the personal `cswap` rotator stopped while using the shared pool.
 
 This applies to **local Code sessions**. It does not switch regular Claude chats, Cowork, or cloud sessions. It does not create quota, pool billing balances, or guarantee uninterrupted retries and subagents when an account changes.
 
+The managed launcher is machine-wide and can also affect Desktop SSH sessions. Each macOS user needs their own pool enrollment; a working local setup does not establish that an SSH helper can access that user's login Keychain. See [shared Macs and SSH](docs/share-org-setup.md#shared-macs-and-ssh-sessions) before using an enrolled Mac as an SSH host.
+
 ## Install
 
 Requirements: macOS, Python 3.10+ for this installer, a Python version supported by upstream claude-swap, Claude Desktop with its Code feature already initialized, native Claude Code signed into a subscription, and permission to administer this Mac. Use this on a machine whose Claude settings you manage. An existing different managed process wrapper is a conflict that the installer will refuse to overwrite.

@@ -8,6 +8,7 @@ import plistlib
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -500,6 +501,250 @@ class InstallationTests(unittest.TestCase):
         self.assertFalse(self.layout.managed_root.exists())
 
 
+class MultiUserInstallationTests(unittest.TestCase):
+    setUp = InstallationTests.setUp
+    save = staticmethod(InstallationTests.save)
+    load = staticmethod(InstallationTests.load)
+    standard_layout = InstallationTests.standard_layout
+
+    def second_user(self):
+        other = swap.Layout(
+            self.root / "second-home", self.layout.uid + 10000, self.layout.gid,
+            self.layout.system_dir, self.layout.system_uid, self.layout.system_gid,
+            self.layout.managed_root, "second-user",
+        )
+        other.home.mkdir()
+        accounts = {layout.uid: SimpleNamespace(pw_dir=str(layout.home), pw_gid=layout.gid,
+                                                pw_name=layout.username)
+                    for layout in (self.layout, other)}
+        lookup = patch.object(swap.pwd, "getpwuid", side_effect=accounts.__getitem__)
+        lookup.start()
+        self.addCleanup(lookup.stop)
+        target = swap.DesktopTarget("managed", other.managed_root / other.username / "com.anthropic.claudefordesktop.plist")
+        # Tests cannot chown a second user's Desktop initialization marker. Only
+        # discovery is stubbed; real state, policy, launcher and rollback I/O run.
+        real_target = swap.desktop_target
+        discovery = patch.object(swap, "desktop_target", side_effect=lambda layout: target if layout == other else real_target(layout))
+        discovery.start()
+        self.addCleanup(discovery.stop)
+        return other, target
+
+    def snapshots(self):
+        return {path: (path.read_bytes(), path.stat().st_mode, path.stat().st_uid)
+                for path in self.root.rglob("*") if path.is_file()}
+
+    def test_schema_two_migration_retains_first_policy_and_machine_originals(self):
+        self.standard_layout()
+        self.save(self.layout.managed, {"unrelated": 7})
+        swap.install(self.layout)
+        first_policy = swap.desktop_target(self.layout).path
+        first_bytes = first_policy.read_bytes()
+        managed_bytes = self.layout.managed.read_bytes()
+        original = self.load(self.layout.state)
+        second, second_target = self.second_user()
+        swap.install(second, restore_fast_control=True)
+        state = self.load(self.layout.state)
+        self.assertEqual(state["schema"], 3)
+        self.assertEqual(state["managed_original"], original["managed_original"])
+        self.assertEqual(state["managed_existed"], original["managed_existed"])
+        self.assertEqual(state["users"][0]["profile_original"], original["profile_original"])
+        self.assertEqual(first_policy.read_bytes(), first_bytes)
+        self.assertEqual(self.layout.managed.read_bytes(), managed_bytes)
+        self.assertEqual(plistlib.loads(second_target.path.read_bytes()), {swap.FLAG: True})
+        launcher = self.layout.launcher.read_text()
+        for uid in (self.layout.uid, second.uid):
+            self.assertIn(f'if [ "$(/usr/bin/id -u)" = "{uid}" ]; then', launcher)
+        self.assertEqual(launcher.count("unset CLAUDE_CODE_DISABLE_FAST_MODE"), 1)
+        self.assertEqual(launcher.count('exec "$@"'), 1)
+        before = self.snapshots()
+        self.assertIn("Already installed", swap.install(self.layout))
+        self.assertIn("Already installed", swap.install(second, restore_fast_control=True))
+        self.assertEqual(self.snapshots(), before)
+        self.assertIn("verified", swap.status(self.layout))
+        self.assertIn("verified", swap.status(second))
+
+    def test_schema_one_migration_preserves_profile_and_restores_each_user(self):
+        self.save(self.profile, {swap.FLAG: False, "keep": "profile"})
+        swap.install(self.layout)
+        second, second_target = self.second_user()
+        first_bytes = self.profile.read_bytes()
+        swap.install(second)
+        self.assertEqual(self.profile.read_bytes(), first_bytes)
+        self.assertEqual(self.load(self.layout.state)["users"][0]["target_kind"], "profile")
+        swap.uninstall(second)
+        self.assertFalse(second_target.path.exists())
+        self.assertEqual(self.profile.read_bytes(), first_bytes)
+        self.assertIn("verified", swap.status(self.layout))
+        swap.uninstall(self.layout)
+        self.assertEqual(self.load(self.profile), {swap.FLAG: False, "keep": "profile"})
+        self.assertFalse(self.layout.launcher.exists())
+        self.assertFalse(self.layout.managed.exists())
+        self.assertFalse(self.layout.state.exists())
+
+    def test_first_user_removal_retains_second_and_final_removal_restores_original_launcher(self):
+        self.standard_layout()
+        original_launcher = swap.render_launcher(self.layout.uid)
+        self.layout.launcher.write_bytes(original_launcher)
+        self.layout.launcher.chmod(0o700)
+        self.save(self.layout.managed, {"processWrapper": swap.wrapper_setting(self.layout), "keep": 9})
+        swap.install(self.layout)
+        first_target = swap.desktop_target(self.layout)
+        second, second_target = self.second_user()
+        swap.install(second, restore_fast_control=True)
+        second_bytes = second_target.path.read_bytes()
+        managed_bytes = self.layout.managed.read_bytes()
+        swap.uninstall(self.layout)
+        self.assertFalse(first_target.path.exists())
+        self.assertEqual(second_target.path.read_bytes(), second_bytes)
+        self.assertEqual(self.layout.managed.read_bytes(), managed_bytes)
+        self.assertEqual(self.layout.launcher.read_bytes(), swap.render_launcher(second.uid, True))
+        self.assertIn("Not installed for this", swap.status(self.layout))
+        self.assertIn("verified", swap.status(second))
+        with self.assertRaisesRegex(swap.SetupError, "not installed"):
+            swap.uninstall(self.layout)
+        # Changes unrelated to the owned flag survive final restoration.
+        second_target.path.write_bytes(plistlib.dumps({swap.FLAG: True, "keep": "later"}))
+        swap.uninstall(second)
+        self.assertEqual(plistlib.loads(second_target.path.read_bytes()), {"keep": "later"})
+        self.assertEqual(self.layout.managed.read_bytes(), managed_bytes)
+        self.assertEqual(self.layout.launcher.read_bytes(), original_launcher)
+        self.assertEqual(self.layout.launcher.stat().st_mode & 0o777, 0o700)
+        self.assertFalse(self.layout.state.exists())
+
+    def test_missing_prior_policy_is_not_accepted_as_migration(self):
+        self.standard_layout()
+        swap.install(self.layout)
+        swap.desktop_target(self.layout).path.unlink()
+        second, _ = self.second_user()
+        before = self.snapshots()
+        with self.assertRaisesRegex(swap.SetupError, "policy is missing"):
+            swap.install(second)
+        self.assertEqual(self.snapshots(), before)
+
+    def test_prior_user_drift_and_unsafe_state_refuse_migration(self):
+        self.standard_layout()
+        swap.install(self.layout)
+        second, _ = self.second_user()
+        first = swap.desktop_target(self.layout).path
+        for path, replacement, mode in (
+            (first, plistlib.dumps({swap.FLAG: False}), None),
+            (self.layout.managed, b'{"processWrapper":"third-party"}', None),
+            (self.layout.launcher, b"#!/bin/sh\nexit 7\n", None),
+            (self.layout.state, None, 0o644),
+        ):
+            with self.subTest(path=path):
+                original = path.read_bytes(), path.stat().st_mode & 0o777
+                if replacement is not None:
+                    path.write_bytes(replacement)
+                if mode is not None:
+                    path.chmod(mode)
+                before = self.snapshots()
+                with self.assertRaises(swap.SetupError):
+                    swap.install(second)
+                self.assertEqual(self.snapshots(), before)
+                path.write_bytes(original[0])
+                path.chmod(original[1])
+
+    def test_shared_state_rejects_duplicate_or_reassigned_identity_without_writes(self):
+        self.standard_layout()
+        swap.install(self.layout)
+        second, _ = self.second_user()
+        swap.install(second)
+        original = self.layout.state.read_bytes()
+        for alteration in ("duplicate", "home", "username", "gid"):
+            with self.subTest(alteration=alteration):
+                state = json.loads(original)
+                if alteration == "duplicate":
+                    state["users"].append(dict(state["users"][0]))
+                else:
+                    state["users"][0][alteration] = 12345 if alteration == "gid" else "/different"
+                self.save(self.layout.state, state)
+                before = self.snapshots()
+                with self.assertRaises(swap.SetupError):
+                    swap.uninstall(second)
+                self.assertEqual(self.snapshots(), before)
+        self.layout.state.write_bytes(original)
+
+    def test_second_install_failure_rolls_back_to_exact_legacy_installation(self):
+        self.standard_layout()
+        swap.install(self.layout)
+        second, _ = self.second_user()
+        before = self.snapshots()
+        real_write = swap.write_file
+        def fail_state(path, data, mode, owner):
+            if path == self.layout.state:
+                raise OSError("simulated failure")
+            return real_write(path, data, mode, owner)
+        with patch.object(swap, "write_file", side_effect=fail_state):
+            with self.assertRaises(OSError):
+                swap.install(second)
+        self.assertEqual(self.snapshots(), before)
+        self.assertIn("verified", swap.status(self.layout))
+
+    def test_second_install_checks_other_user_policy_again_before_writing(self):
+        self.standard_layout()
+        swap.install(self.layout)
+        first = swap.desktop_target(self.layout).path
+        second, _ = self.second_user()
+        before_launcher = self.layout.launcher.read_bytes()
+        before_state = self.layout.state.read_bytes()
+        real_make = swap.make_policy_directory
+        def drift(layout, target):
+            real_make(layout, target)
+            first.write_bytes(plistlib.dumps({swap.FLAG: False}))
+        with patch.object(swap, "make_policy_directory", side_effect=drift):
+            with self.assertRaisesRegex(swap.SetupError, "changed during setup"):
+                swap.install(second)
+        self.assertEqual(self.layout.launcher.read_bytes(), before_launcher)
+        self.assertEqual(self.layout.state.read_bytes(), before_state)
+
+    def test_prior_policy_symlink_and_wrong_owner_are_rejected(self):
+        self.standard_layout()
+        swap.install(self.layout)
+        first = swap.desktop_target(self.layout).path
+        second, _ = self.second_user()
+        real_read = swap.read_file
+        def wrong_owner(path):
+            snapshot = real_read(path)
+            if path == first:
+                return swap.Snapshot(snapshot.data, snapshot.mode, snapshot.uid + 1, snapshot.gid)
+            return snapshot
+        before = self.snapshots()
+        with patch.object(swap, "read_file", side_effect=wrong_owner):
+            with self.assertRaisesRegex(swap.SetupError, "unsafe ownership"):
+                swap.install(second)
+        self.assertEqual(self.snapshots(), before)
+        moved = first.with_name("original-policy")
+        first.rename(moved)
+        first.symlink_to(moved)
+        with self.assertRaises(swap.SetupError):
+            swap.install(second)
+        self.assertEqual(self.layout.state.read_bytes(), before[self.layout.state][0])
+
+    def test_shared_launcher_passes_existing_client_verification_for_each_user(self):
+        from team_pool import client, desktop_profile
+        self.standard_layout()
+        swap.install(self.layout)
+        first_target = swap.desktop_target(self.layout)
+        second, second_target = self.second_user()
+        swap.install(second)
+        for layout, target in ((self.layout, first_target), (second, second_target)):
+            with self.subTest(uid=layout.uid):
+                with patch.object(desktop_profile, "resolve_target", return_value=target), patch.object(os, "getuid", return_value=layout.uid):
+                    client.verify_desktop_wrapper(home=layout.home, system_dir=layout.system_dir,
+                                                  managed_root=layout.managed_root, system_uid=layout.system_uid)
+
+    def test_access_repair_validates_both_users_without_changing_files(self):
+        self.standard_layout()
+        with swap.installation_lock(self.layout):
+            swap.install(self.layout)
+        second, _ = self.second_user()
+        swap.install(second)
+        before = self.snapshots()
+        self.assertIn("already readable", swap.repair_access(second))
+        self.assertEqual(self.snapshots(), before)
+
+
 class LauncherTests(unittest.TestCase):
     def run_launcher(self, target_uid, restore_fast=False):
         with tempfile.TemporaryDirectory() as directory:
@@ -536,6 +781,11 @@ class LauncherTests(unittest.TestCase):
             launcher.chmod(0o755)
             result = subprocess.run([str(launcher), "/bin/sh", "-c", "exit 17"])
             self.assertEqual(result.returncode, 17)
+
+    def test_shared_launcher_cannot_exceed_older_clients_read_limit(self):
+        users = [{"uid": 501 + index, "restore_fast_control": False} for index in range(128)]
+        with self.assertRaisesRegex(swap.SetupError, "Too many enrolled"):
+            swap.render_users_launcher(users)
 
 
 if __name__ == "__main__":
