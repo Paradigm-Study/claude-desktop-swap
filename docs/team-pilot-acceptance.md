@@ -1,10 +1,11 @@
 # Live two-Mac acceptance worksheet
 
-Status: **IN PROGRESS — client 0.1.0a10 active on Mac A; a11 active for a second macOS user on Mac B**.
+Status: **IN PROGRESS — client 0.1.0a12 active on Mac A; a11 active for a second macOS user on Mac B**.
 Mac B completed setup in its own GUI Terminal after the directory repair and
 failed SSH attempts. Its native request and background sync passed, and the user
-reported that it works. Existing-conversation continuity on Mac B, actual menu
-clicks, and the remaining lifecycle checks below are still unverified.
+reported that it works. The second user's original SSH conversation on Mac B
+also resumed successfully after the bounded helper repair. Actual menu clicks
+and the remaining lifecycle checks below are still unverified.
 Use only non-sensitive labels such as Account A / Mac B. Do not paste credentials,
 private prompts, account emails, or session identifiers.
 
@@ -28,7 +29,7 @@ private prompts, account emails, or session identifiers.
 | Manual account selection through installed menu helper | Passed | Pending | Selection completed in 0.40 s, followed by a native Sonnet OK in 2.72 s. Restoring the original account completed in 0.41 s, followed by native OK in 2.19 s. Auth reported claude.ai / firstParty / max. |
 | Menu contribution start and cancellation | Passed through helper | Pending | Official OAuth start and cancellation succeeded without changing native credentials. No new account was added through the menu in this check; actual GUI clicks remain unverified. |
 | Initial native turn | Passed | Passed | Auth reports claude.ai / firstParty / max. Mac A's normal-speed Sonnet returned OK in 2.1 s after the a5 repair. Mac B's real normal-speed Sonnet request returned exact OK with exit 0 in 2.35 s. |
-| Existing conversation retained | Passed | Pending | Mac A's user confirmed that a resumed conversation worked. The user reported Mac B working, but did not explicitly confirm a resumed existing conversation. |
+| Existing conversation retained | Passed | Passed for second user's SSH session | Mac A's user confirmed that a resumed conversation worked. The second Mac B user confirmed that their original SSH conversation responds after the a11 helper repair; future helper replacement remains unverified. |
 | No refresh/trusted-device token delivered | Passed | Passed | Assignment and active native-store verification confirm access-only credentials. Mac B's native fingerprint matched client state, and its original recovery backup was present. |
 | Contributed-account refresh occurs only on coordinator | Pending | Pending | |
 | Real provider-token refresh followed by successful turn | Pending | Pending | |
@@ -315,3 +316,57 @@ an SSH context during an upgrade or cold start. No competing KeepAlive loop was
 installed. The GUI-context restart remains a bounded mitigation, with that
 lifecycle gap open. Validation completed 332 Python tests with one optional
 dependency skip; 53 installer tests and an independent ownership review passed.
+
+## November 3: targeted account recovery and refresh diagnostics
+
+Three older migrated accounts were quarantined after uncertain credential
+renewals. Their quota readings became stale because quarantined entries are
+excluded from polling. The old catch discarded the underlying exception, so
+those historical failures cannot be attributed to provider rejection, transport,
+successor validation, encryption, or persistence from the stored evidence.
+Ordinary contribution also rejected every existing account as a duplicate after
+exchanging its authorization code; it could not recover quarantined entries.
+
+Release `v0.1.0a12` (commit `4ad7dc6`) adds explicit targeted browser recovery.
+The coordinator captures the selected account and generation before sign-in,
+requires matching account and organization identities plus fresh credentials,
+and commits replacement and the `recovered` receipt together. The account ID is
+retained; old quota and backoff are cleared. Both coordinators implement the
+contract, and ordinary additions keep their previous duplicate behavior.
+The menu offers **Reconnect Account…** for quarantined entries and retains the
+target through pending, cancelled, failed, expired, and uncertain receipts.
+
+The Cloudflare coordinator records an admin-only allowlisted stage, reason, and
+timestamp for future refresh failures, without raw errors or provider responses.
+Historical failures remain unknown. Transport failures, timeout, and malformed
+JSON still share the transport/response category; these diagnostics do not
+justify replaying a potentially consumed refresh credential.
+
+Validation completed 357 Python tests with one optional dependency skip, 111
+Cloudflare tests, Swift compilation, Wrangler dry-run, and an independent review
+of replacement, membership, rollback, and diagnostic privacy. Deployment
+`cf5051a5-f979-41b6-a4dd-f694d33c5635` reports a12 in native subscription mode.
+Before deployment, the last near-expiry healthy account completed its normal
+refresh; no refresh was in progress and every ready token had over 100 minutes
+remaining. The deployed migration preserved five ready and three quarantined
+accounts without fabricating historical failure reasons.
+
+The tagged a12 installer completed on Mac A with verified background sync and
+the updated menu. Device and Share identities, native recovery backup, connector
+credentials, and native ownership all matched the pre-update checks; no refresh
+token was delivered to the Mac. The installed menu helper successfully started
+recovery for the selected quarantined account and returned a matching pending
+receipt. The user completed all three fresh authorizations in the local hidden
+Terminal prompt. Each returned `recovered`, retained its original pool ID, and
+advanced its generation once (18 to 19, 23 to 24, and 18 to 19). All three are
+ready with cleared errors and fresh quota; initial weekly usage was 91%, 85%,
+and 0%. The installed menu helper subsequently showed all three eligible, with
+the third account's measured usage advancing to 2%. Six of the eight accounts
+are eligible; two remain unavailable at the configured 98% quota threshold.
+
+Post-recovery checks again confirmed the same device and Share identities,
+unchanged recovery backup and connector credentials, active synchronization,
+matching native ownership, and no native refresh token. At that check Mac A
+was assigned to the third recovered account. Recovery repairs shared pool
+credentials; it does not establish future renewal success or resolve the
+separate SSH helper lifecycle limitation.
