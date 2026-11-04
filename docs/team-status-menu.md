@@ -55,6 +55,23 @@ refresh. Existing personal `cswap` accounts are not uploaded automatically.
 
 ## Install and recover
 
+With a12 or newer, a quarantined account's submenu offers **Reconnect Account…**.
+Confirm the account, then sign into that exact Claude account on the authorization
+page. Use **Enter Authorization Code…** to submit its complete code in the hidden
+field. Recovery renews that account for the shared pool and preserves its pool
+entry; it does not switch the current Mac or replace its native recovery backup.
+The coordinator verifies both the account and organization before replacement,
+requires a fresh authorization, and refuses to overwrite a healthy account or
+an entry that changed while sign-in was open.
+
+A successful recovery clears obsolete quota readings. The next provider check
+establishes current availability. Signing into a different account fails recovery
+without adding it to the pool or replacing the selected account. A cancelled or
+expired login can be started again. If a response was lost, check status before
+starting another sign-in; authorization codes are never replayed automatically.
+The ordinary **Add Account to Shared Pool…** flow still treats existing accounts
+as duplicates. Use the selected account's reconnect action for recovery.
+
 Use the [one-command setup](share-org-setup.md) to install or update the menu,
 client and persistent runtime together. It installs
 `~/Applications/Claude Swap Status.app` with the LaunchAgent

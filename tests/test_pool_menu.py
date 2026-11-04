@@ -241,6 +241,33 @@ class PoolMenuTests(unittest.TestCase):
         self.assertEqual(dispatch({"action": "contribute-status"}, self.client)["state"], "added")
         self.assertEqual(sum(path.endswith("complete") for path, _, _ in transport.calls), 1)
 
+    def test_menu_recovery_uses_targeted_login_and_private_input(self):
+        self.client.transport = transport = ContributionTransport()
+        before, backup = copy.deepcopy(self.native.credentials), copy.deepcopy(self.native.original)
+        code, start, raw = self.run_bridge({"action": "recover-start", "account_id": "account-a"})
+        self.assertEqual(code, 0)
+        self.assertEqual(start["result"]["account_id"], "account-a")
+        self.assertEqual(transport.calls[-1][1], {"account_id": "account-a"})
+        authorization_code = "fixture-oauth-code#" + "b" * 43
+        code, complete, raw = self.run_bridge({"action": "contribute-complete",
+            "contribution_id": start["result"]["contribution_id"], "code": authorization_code})
+        self.assertEqual(code, 0)
+        self.assertEqual(complete["result"]["state"], "recovered")
+        self.assertEqual(complete["result"]["account_id"], "account-a")
+        self.assertEqual(self.native.credentials, before)
+        self.assertEqual(self.native.original, backup)
+        self.assertNotIn(authorization_code, raw)
+        self.assertNotIn(authorization_code, self.client.config.read_text())
+
+    def test_menu_recovery_requires_valid_target_before_network(self):
+        calls = len(self.transport.calls)
+        for target in (None, "", "../account", "account\n", 9):
+            with self.subTest(target=target):
+                code, result, raw = self.run_bridge({"action": "recover-start", "account_id": target})
+                self.assertEqual(code, 1)
+                self.assertFalse(result["ok"])
+        self.assertEqual(len(self.transport.calls), calls)
+
     def test_unexpected_errors_never_echo_request_or_backend_secret(self):
         self.client.list_accounts = lambda: (_ for _ in ()).throw(RuntimeError("private-provider-token"))
         code, result, raw = self.run_bridge({"action": "list"})

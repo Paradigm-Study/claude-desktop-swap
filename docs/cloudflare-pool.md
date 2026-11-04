@@ -196,6 +196,20 @@ device. Lists expose only operational metadata, never tokens. The explicit
 `import-account` command is reserved for credentials whose refresh ownership has
 already been transferred; teammates normally use browser contribution.
 
+The a12 menu supports targeted recovery of a quarantined account through a fresh
+browser authorization. Its pending contribution is bound to the selected account
+and generation. Completion must match the account and organization and replace
+the old refresh credential with a fresh one. The existing pool ID is retained;
+cached quota and backoff are cleared for a new provider check. Ordinary additions
+continue to return duplicate for existing accounts, including quarantined ones.
+
+Admin account metadata records an allowlisted stage, reason, and time for future
+refresh failures. It never includes raw exceptions, provider response bodies,
+authorization URLs, or credentials. Historical failures remain unknown. A
+provider response error, successor validation failure, encryption failure, or
+persistence failure can leave a renewal uncertain; these diagnostics help
+distinguish them without retrying a potentially consumed refresh credential.
+
 The Worker is deliberately a small shared pool. Provider polling and refreshes
 are serialized; large pools or slow provider responses can exceed the client's
 75-second timeout. Keep the initial rollout to two Macs and a small account pool

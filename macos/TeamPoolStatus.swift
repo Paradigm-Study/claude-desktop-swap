@@ -289,6 +289,41 @@ private func claudeAuthorizationURL(_ raw: Any?) -> URL? {
     return parts.url
 }
 
+private func recoveryAccountID(_ receipt: [String: Any]?) -> String? {
+    // An ordinary addition receives its new account ID only in its terminal
+    // receipt. Recovery carries the target throughout authorization and retry.
+    guard let receipt = receipt, let state = receipt["state"] as? String,
+          !["added", "duplicate", "none"].contains(state) else { return nil }
+    return receipt["account_id"] as? String
+}
+
+private func canBeginRecovery(_ accountID: String, receipt: [String: Any]?) -> Bool {
+    switch receipt?["state"] as? String {
+    case "submitted", "exchanging": return false
+    case "pending": return recoveryAccountID(receipt) == accountID
+    default: return true
+    }
+}
+
+private func contributionNotice(_ value: [String: Any]) -> String {
+    let recovering = recoveryAccountID(value) != nil
+    let operation = recovering ? "Account recovery" : "Account addition"
+    let retry = recovering ? "reconnect this account again" : "start a new account addition"
+    let messages = [
+        "added": "Account added to the shared pool",
+        "recovered": "Account reconnected to the shared pool; this Mac’s assigned account is unchanged",
+        "duplicate": "That account is already in the shared pool",
+        "pending": "\(operation) is awaiting authorization",
+        "exchanging": "Authorization is being checked",
+        "uncertain": "\(operation) outcome is uncertain. Check its status or start a fresh authorization; do not reuse the code.",
+        "cancelled": "\(operation) cancelled",
+        "expired": "Authorization expired; \(retry)",
+        "failed": "Authorization failed; \(retry)",
+        "none": "No account authorization is pending",
+    ]
+    return messages[value["state"] as? String ?? ""] ?? "\(operation) status updated"
+}
+
 final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var item: NSStatusItem!
     private var timer: Timer?
@@ -465,6 +500,12 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 action(isCurrent ? "Assigned to this Mac" : "Switch This Mac to This Account",
                        #selector(switchAccount(_:)), enabled: current.canSwitch && eligible && !isCurrent && !bridgeBusy && catalogError == nil,
                        value: id, in: detail)
+                if reason == "quarantined" {
+                    action("Reconnect Account…", #selector(reconnectAccount(_:)),
+                           enabled: !bridgeBusy && !enteringCode && catalogError == nil
+                               && canBeginRecovery(id, receipt: contribution),
+                           value: ["account_id": id, "email": email], in: detail)
+                }
                 row.submenu = detail
                 menu.addItem(row)
             }
@@ -476,17 +517,27 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if catalogError == nil { line("Loading shared accounts…") }
         menu.addItem(.separator())
         let contributionState = contribution?["state"] as? String ?? "none"
+        let recoveryID = recoveryAccountID(contribution)
+        let authorizationKind = recoveryID == nil ? "Account Addition" : "Account Recovery"
         if contributionState == "pending" {
-            line("Account addition: awaiting Claude authorization")
+            line("\(authorizationKind): awaiting Claude authorization")
+            if let id = recoveryID { line("Reconnect: \(accountLabel(id))") }
             action("Enter Authorization Code…", #selector(enterAuthorizationCode), enabled: !bridgeBusy && !enteringCode)
-            action("Check Account Addition", #selector(checkContribution), enabled: !bridgeBusy)
-            action("Cancel Account Addition", #selector(cancelContribution), enabled: !bridgeBusy)
+            action("Check \(authorizationKind)", #selector(checkContribution), enabled: !bridgeBusy)
+            action("Cancel \(authorizationKind)", #selector(cancelContribution), enabled: !bridgeBusy)
         } else if ["submitted", "exchanging", "uncertain"].contains(contributionState) {
-            line(contributionState == "uncertain" ? "Account addition: outcome uncertain" : "Account addition: checking authorization")
-            action("Check Account Addition", #selector(checkContribution), enabled: !bridgeBusy)
+            line(contributionState == "uncertain" ? "\(authorizationKind): outcome uncertain" : "\(authorizationKind): checking authorization")
+            if let id = recoveryID { line("Reconnect: \(accountLabel(id))") }
+            action("Check \(authorizationKind)", #selector(checkContribution), enabled: !bridgeBusy)
             if contributionState == "uncertain" {
                 line("Do not reuse the previous authorization code")
-                action("Start New Account Authorization…", #selector(addAccount), enabled: !bridgeBusy && !enteringCode)
+                if let id = recoveryID {
+                    action("Restart Account Recovery…", #selector(reconnectAccount(_:)), enabled: !bridgeBusy && !enteringCode,
+                           value: ["account_id": id, "email": accountLabel(id)])
+                    action("Add Account to Shared Pool…", #selector(addAccount), enabled: !bridgeBusy && !enteringCode)
+                } else {
+                    action("Start New Account Authorization…", #selector(addAccount), enabled: !bridgeBusy && !enteringCode)
+                }
             }
         } else {
             action("Add Account to Shared Pool…", #selector(addAccount), enabled: !bridgeBusy && !enteringCode)
@@ -525,10 +576,33 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func addAccount() {
-        guard !bridgeBusy else { return }
+        startAuthorization()
+    }
+
+    private func accountLabel(_ id: String) -> String {
+        let accounts = catalog?["accounts"] as? [[String: Any]] ?? []
+        let account = accounts.first { $0["id"] as? String == id }
+        return safeLabel((account?["account"] as? [String: Any])?["emailAddress"]) ?? "the selected Claude account"
+    }
+
+    @objc private func reconnectAccount(_ sender: NSMenuItem) {
+        guard let target = sender.representedObject as? [String: String],
+              let id = target["account_id"], canBeginRecovery(id, receipt: contribution) else { return }
+        startAuthorization(accountID: id, email: safeLabel(target["email"]) ?? accountLabel(id))
+    }
+
+    private func startAuthorization(accountID: String? = nil, email: String? = nil) {
+        guard !bridgeBusy, !enteringCode else { return }
+        let recovering = accountID != nil
         let alert = NSAlert()
-        alert.messageText = "Add a subscription account to the shared pool?"
-        alert.informativeText = "Sign into the Claude account you want to share. Team devices will be able to use its subscription quota and account permissions."
+        if recovering {
+            let label = email ?? "the selected Claude account"
+            alert.messageText = "Reconnect \(label)?"
+            alert.informativeText = "Sign in as \(label) to restore its authorization for the whole team’s shared pool. This does not switch the account currently assigned to this Mac."
+        } else {
+            alert.messageText = "Add a subscription account to the shared pool?"
+            alert.informativeText = "Sign into the Claude account you want to share. Team devices will be able to use its subscription quota and account permissions."
+        }
         if contribution?["state"] as? String == "uncertain" {
             alert.informativeText += " The previous attempt had an uncertain outcome. Start a fresh authorization and use only its new code."
         }
@@ -537,19 +611,22 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         notice = nil
-        request("contribute-start", progress: "Starting account authorization…") { [weak self] result in
+        let fields: [String: Any] = accountID.map { ["account_id": $0] } ?? [:]
+        request(recovering ? "recover-start" : "contribute-start", fields: fields,
+                progress: recovering ? "Starting account recovery…" : "Starting account authorization…") { [weak self] result in
             guard let self = self else { return }
+            self.localRevision += 1
             switch result {
             case .success(let value):
                 self.contribution = value
                 if value["state"] as? String == "pending" {
                     guard let url = claudeAuthorizationURL(value["authorization_url"]) else {
-                        self.notice = "Claude returned an unrecognized sign-in URL. Cancel this addition and try again."
+                        self.notice = "Claude returned an unrecognized sign-in URL. Cancel this authorization and try again."
                         return
                     }
                     self.notice = NSWorkspace.shared.open(url)
                         ? "Complete Claude sign-in, then choose Enter Authorization Code…"
-                        : "Could not open Claude sign-in. Cancel this addition and try again."
+                        : "Could not open Claude sign-in. Cancel this authorization and try again."
                 } else { self.updateContributionNotice(value) }
             case .failure(let error): self.notice = self.message(error); self.refreshLocal()
             }
@@ -561,14 +638,15 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
               contribution?["state"] as? String == "pending",
               let id = contribution?["contribution_id"] as? String else { return }
         enteringCode = true
+        let recoveryID = recoveryAccountID(contribution)
         let alert = NSAlert()
-        alert.messageText = "Finish adding your Claude account"
+        alert.messageText = recoveryID.map { "Finish reconnecting \(accountLabel($0))" } ?? "Finish adding your Claude account"
         alert.informativeText = "Paste the complete authorization code from Claude, including #state. The code is hidden and sent directly to the shared coordinator."
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 24))
         field.placeholderString = "Complete authorization code"
         field.maximumNumberOfLines = 1
         alert.accessoryView = field
-        alert.addButton(withTitle: "Add Account")
+        alert.addButton(withTitle: recoveryID == nil ? "Add Account" : "Reconnect Account")
         alert.addButton(withTitle: "Later")
         alert.window.initialFirstResponder = field
         NSApp.activate(ignoringOtherApps: true)
@@ -584,14 +662,16 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         request("contribute-complete", fields: ["contribution_id": id, "code": code],
-                progress: "Adding account to shared pool…") { [weak self] result in
+                progress: recoveryID == nil ? "Adding account to shared pool…" : "Reconnecting account to shared pool…") { [weak self] result in
             guard let self = self else { return }
+            self.localRevision += 1
             switch result {
             case .success(let value): self.contribution = value; self.updateContributionNotice(value)
             case .failure(let error):
                 // Submission can succeed even if its response is lost. Do not
                 // offer resubmission until a coordinator status check resolves it.
                 self.contribution = ["contribution_id": id, "state": "submitted"]
+                if let target = recoveryID { self.contribution?["account_id"] = target }
                 self.notice = self.message(error)
             }
             self.refreshLocal()
@@ -602,20 +682,17 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateContributionNotice(_ value: [String: Any]) {
-        let messages = ["added": "Account added to the shared pool", "duplicate": "That account is already in the shared pool",
-                        "pending": "Account addition is awaiting authorization", "exchanging": "Authorization is being checked",
-                        "uncertain": "Addition outcome is uncertain. Check its status or start a fresh authorization; do not reuse the code.",
-                        "cancelled": "Account addition cancelled", "expired": "Authorization expired; start a new account addition",
-                        "failed": "Authorization failed; start a new account addition", "none": "No account addition is pending"]
-        notice = messages[value["state"] as? String ?? ""] ?? "Account addition status updated"
+        notice = contributionNotice(value)
     }
 
     @objc private func checkContribution() { inspectContribution(cancel: false) }
     @objc private func cancelContribution() { inspectContribution(cancel: true) }
 
     private func inspectContribution(cancel: Bool) {
-        request(cancel ? "contribute-cancel" : "contribute-status", progress: "Checking account addition…") { [weak self] result in
+        let progress = recoveryAccountID(contribution) == nil ? "Checking account addition…" : "Checking account recovery…"
+        request(cancel ? "contribute-cancel" : "contribute-status", progress: progress) { [weak self] result in
             guard let self = self else { return }
+            self.localRevision += 1
             switch result {
             case .success(let value): self.contribution = value; self.updateContributionNotice(value)
             case .failure(let error): self.notice = self.message(error)

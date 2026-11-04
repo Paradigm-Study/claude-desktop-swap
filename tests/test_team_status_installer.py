@@ -190,6 +190,32 @@ if command == "format" {
     precondition(claudeAuthorizationURL("https://evil.test@claude.com/cai/oauth/authorize") == nil)
     precondition(claudeAuthorizationURL("https://claude.com/cai/oauth/authorize#fragment") == nil)
     print("format-ok")
+} else if command == "recovery" {
+    let target = "quarantined-account"
+    for state in ["pending", "submitted", "exchanging", "uncertain", "cancelled", "failed", "expired", "recovered"] {
+        let receipt: [String: Any] = ["state": state, "account_id": target]
+        precondition(recoveryAccountID(receipt) == target)
+    }
+    for state in ["added", "duplicate"] {
+        let receipt: [String: Any] = ["state": state, "account_id": target]
+        precondition(recoveryAccountID(receipt) == nil)
+    }
+    for state in ["pending"] {
+        let receipt: [String: Any] = ["state": state, "account_id": target]
+        precondition(canBeginRecovery(target, receipt: receipt))
+        precondition(!canBeginRecovery("another-account", receipt: receipt))
+        precondition(!canBeginRecovery(target, receipt: ["state": state]))
+    }
+    for state in ["submitted", "exchanging"] {
+        precondition(!canBeginRecovery(target, receipt: ["state": state, "account_id": target]))
+    }
+    precondition(canBeginRecovery(target, receipt: ["state": "uncertain", "account_id": target]))
+    precondition(canBeginRecovery("another-account", receipt: ["state": "uncertain", "account_id": target]))
+    precondition(canBeginRecovery(target, receipt: ["state": "added", "account_id": "other"]))
+    precondition(contributionNotice(["state": "cancelled", "account_id": target]) == "Account recovery cancelled")
+    precondition(contributionNotice(["state": "cancelled"]) == "Account addition cancelled")
+    precondition(contributionNotice(["state": "recovered", "account_id": target]).contains("reconnected to the shared pool"))
+    print("recovery-ok")
 } else if command == "local-status" {
     let path = URL(fileURLWithPath: CommandLine.arguments[2])
     let now = Date().timeIntervalSince1970
@@ -200,6 +226,11 @@ if command == "format" {
     save()
     let active = readStatus(statePath: path, runningOverride: true)
     precondition(active.accountID == "new-account" && active.canSwitch)
+    state["contribution"] = ["state": "pending", "contribution_id": "recovery-attempt", "account_id": "quarantined-account"]
+    save()
+    let resumed = readStatus(statePath: path, runningOverride: true)
+    precondition(resumed.accountID == "new-account" && resumed.canSwitch)
+    precondition(recoveryAccountID(resumed.contribution) == "quarantined-account")
     state["state"] = "paused"
     save()
     precondition(!readStatus(statePath: path, runningOverride: true).canSwitch)
@@ -216,8 +247,10 @@ if command == "format" {
     print("local-status-ok")
 } else {
     do {
-        let result = try bridge(["action": "contribute-complete", "contribution_id": "fixture-id",
-                                 "code": "fixture-code#fixture-state"],
+        let request: [String: Any] = command == "recover-start"
+            ? ["action": "recover-start", "account_id": "quarantined-account"]
+            : ["action": "contribute-complete", "contribution_id": "fixture-id", "code": "fixture-code#fixture-state"]
+        let result = try bridge(request,
                                 configurationURL: URL(fileURLWithPath: CommandLine.arguments[2]),
                                 timeout: command == "timeout" ? 0.2 : 5)
         print(String(data: try JSONSerialization.data(withJSONObject: result), encoding: .utf8)!)
@@ -258,6 +291,18 @@ if command == "format" {
             "assert request == {'action':'contribute-complete','contribution_id':'fixture-id','code':'fixture-code#fixture-state'}\n"
             "print(json.dumps({'ok':True,'result':{'state':'added'}}))\n")
         self.assertEqual(json.loads(result), {"state": "added"})
+
+    def test_targeted_recovery_request_keeps_target_in_stdin_and_receipt(self):
+        result = self.run_helper("request = json.load(sys.stdin)\n"
+            "assert sys.argv[1:] == ['-I', '-m', 'team_pool.menu_bridge']\n"
+            "assert request == {'action':'recover-start','account_id':'quarantined-account'}\n"
+            "print(json.dumps({'ok':True,'result':{'state':'pending','account_id':request['account_id']}}))\n",
+            command="recover-start")
+        self.assertEqual(json.loads(result), {"state": "pending", "account_id": "quarantined-account"})
+
+    def test_recovery_receipts_resume_without_changing_target_or_add_intent(self):
+        result = subprocess.run([str(self.binary), "recovery"], capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.strip(), "recovery-ok")
 
     def test_local_assignment_and_activity_control_manual_switching(self):
         result = subprocess.run([str(self.binary), "local-status", str(self.work / "state.json")],

@@ -37,6 +37,20 @@ function keys(value, required, optional = []) {
     && Object.keys(value).every(key => required.includes(key) || optional.includes(key));
 }
 
+function refreshDiagnostic(stage, error, at) {
+  // Record only fixed, bounded categories. Never persist an exception message,
+  // upstream response body, endpoint, or rotating grant material.
+  let reason = `${stage}-error`;
+  if (stage === 'provider' && error instanceof ProviderError) {
+    if (/^http-[1-5][0-9]{2}$/.test(error.code)
+        || ['transport-or-response-error', 'bad-response', 'incomplete-refresh'].includes(error.code)) reason = error.code;
+  } else if (stage === 'successor-validation' && error instanceof PoolError) {
+    if (['invalid-credential-schema', 'invalid-credential-expiry', 'invalid-credential-scopes',
+      'invalid-account-metadata', 'refresh-identity-mismatch'].includes(error.code)) reason = error.code;
+  }
+  return { stage, reason, at };
+}
+
 function base64(bytes) {
   const array = new Uint8Array(bytes);
   let binary = '';
@@ -237,6 +251,8 @@ export class PoolObject extends DurableObject {
         for (const column of ['share_account_id', 'share_team_id']) {
           if (!columns.has(column)) this.query(`ALTER TABLE devices ADD COLUMN ${column} TEXT`);
         }
+        const accountColumns = new Set(this.query('PRAGMA table_info(accounts)').map(row => row.name));
+        if (!accountColumns.has('refresh_diagnostic')) this.query('ALTER TABLE accounts ADD COLUMN refresh_diagnostic TEXT');
         this.query("UPDATE accounts SET state='quarantined',error='interrupted-refresh' WHERE state='refreshing'");
         this.query("UPDATE contributions SET state='uncertain',secret=NULL WHERE state='exchanging'");
         if (!this.one('SELECT value FROM pool_metadata WHERE key=?', 'nullable-session-usage-v2')) {
@@ -291,7 +307,7 @@ export class PoolObject extends DurableObject {
     const url = new URL(request.url);
     if (url.search) throw new PoolError('not-found', 404);
     if (request.method === 'GET' && url.pathname === '/health') {
-      return reply(200, { ok: true, mode: 'native-subscription', version: '0.1.0a10' });
+      return reply(200, { ok: true, mode: 'native-subscription', version: '0.1.0a12' });
     }
     if (request.method !== 'POST') throw new PoolError('not-found', 404);
     const routes = new Set([
@@ -335,8 +351,10 @@ export class PoolObject extends DurableObject {
         result = await this.memberAccounts(device, body.usage_schema ?? 1);
         break;
       case '/v1/contributions/start':
-        this.requireKeys(body, []);
-        result = await this.contributionStart(device);
+        this.requireKeys(body, [], ['account_id']);
+        if (Object.hasOwn(body, 'account_id') && (typeof body.account_id !== 'string'
+            || !/^[a-zA-Z0-9_-]{1,64}(?![\s\S])/.test(body.account_id))) throw new PoolError('invalid-account-id');
+        result = await this.contributionStart(device, body.account_id);
         break;
       case '/v1/contributions/complete':
         this.requireKeys(body, ['contribution_id', 'code']);
@@ -551,7 +569,7 @@ export class PoolObject extends DurableObject {
 
   async listAccounts() {
     const accounts = [];
-    for (const row of this.query('SELECT id,generation,state,verified,fetched,next_poll,error,usage,secret FROM accounts ORDER BY id')) {
+    for (const row of this.query('SELECT id,generation,state,verified,fetched,next_poll,error,usage,secret,refresh_diagnostic FROM accounts ORDER BY id')) {
       const credentials = await this.decrypt(row.secret);
       // Only cached quota and human-readable labels leave this admin endpoint.
       // Explicit fields keep grant material and provider IDs out of responses.
@@ -560,6 +578,7 @@ export class PoolObject extends DurableObject {
         verified: row.verified, fetched: row.fetched, next_poll: row.next_poll,
         expires_at: credentials.expires_at,
         error: row.error, usage: row.usage === null ? null : JSON.parse(row.usage),
+        refresh_diagnostic: row.refresh_diagnostic === null ? null : JSON.parse(row.refresh_diagnostic),
         account: {
           emailAddress: credentials.account.emailAddress,
           subscriptionType: credentials.account.subscriptionType,
@@ -649,10 +668,10 @@ export class PoolObject extends DurableObject {
     if (existing) {
       if (!replaceQuarantined || existing.state !== 'quarantined') throw new PoolError('account-already-exists', 409);
       const previous = await this.decrypt(existing.secret);
-      if (previous.account.accountUuid !== credentials.account.accountUuid) throw new PoolError('replacement-account-identity-mismatch', 409);
+      if (['accountUuid', 'organizationUuid'].some(key => previous.account[key] !== credentials.account[key])) throw new PoolError('replacement-account-identity-mismatch', 409);
       if (previous.refresh_token === credentials.refresh_token) throw new PoolError('replacement-requires-fresh-credential-lineage', 409);
       this.transaction(() => {
-        this.query("UPDATE accounts SET secret=?,generation=generation+1,state='ready',verified=0,usage=NULL,fetched=NULL,next_poll=0,failures=0,error=NULL WHERE id=?", encrypted, id);
+        this.query("UPDATE accounts SET secret=?,generation=generation+1,state='ready',verified=0,usage=NULL,fetched=NULL,next_poll=0,failures=0,error=NULL,refresh_diagnostic=NULL WHERE id=?", encrypted, id);
         this.audit('quarantined-account-replaced', id);
       });
       return;
@@ -685,16 +704,21 @@ export class PoolObject extends DurableObject {
     return result;
   }
 
-  finishContribution(row, state, accountId = null) {
+  finishContribution(row, state, accountId = row.account_id ?? null) {
     // Caller owns the synchronous transaction containing account + receipt.
+    const current = this.one('SELECT * FROM contributions WHERE id=?', row.id);
+    if (!['pending', 'exchanging'].includes(current.state)) return this.receipt(current);
     this.query('UPDATE contributions SET state=?,secret=NULL,account_id=? WHERE id=?', state, accountId, row.id);
     this.audit(`contribution-${state}`, row.id);
     return this.receipt(this.one('SELECT * FROM contributions WHERE id=?', row.id));
   }
 
-  async contributionStart(device) {
+  async contributionStart(device, accountId = null) {
     this.expireContributions();
     let row = this.one("SELECT * FROM contributions WHERE device_id=? AND state='pending'", device.id);
+    if (row && row.account_id !== accountId) throw new PoolError('contribution-target-conflict', 409);
+    const target = accountId === null ? null : this.one('SELECT generation,state FROM accounts WHERE id=?', accountId);
+    if (accountId !== null && (!target || target.state !== 'quarantined')) throw new PoolError('account-not-recoverable', 409);
     let authorizationUrl;
     if (!row) {
       const now = this.now();
@@ -702,16 +726,18 @@ export class PoolObject extends DurableObject {
       if ((counts.hourly || 0) >= 5 || counts.daily >= 20) throw new PoolError('contribution-start-limit', 429);
       const id = randomToken(24);
       const secret = { verifier: randomToken(48), state: randomToken(32) };
+      if (target) secret.target_generation = target.generation;
       const encrypted = await this.encrypt(secret);
       authorizationUrl = await this.provider.authorizationUrl(secret.verifier, secret.state);
       await this.checkShareMembership(device);
       this.transaction(() => {
-        this.query("INSERT INTO contributions(id,device_id,created,expires,state,secret) VALUES (?,?,?,?,'pending',?)", id, device.id, now, now + CONTRIBUTION_TTL, encrypted);
+        this.query("INSERT INTO contributions(id,device_id,created,expires,state,secret,account_id) VALUES (?,?,?,?,'pending',?,?)", id, device.id, now, now + CONTRIBUTION_TTL, encrypted, accountId);
         this.audit('contribution-started', id);
       });
       row = this.contribution(device, id);
     } else {
       const secret = await this.decrypt(row.secret);
+      if (target && secret.target_generation !== target.generation) throw new PoolError('contribution-target-changed', 409);
       authorizationUrl = await this.provider.authorizationUrl(secret.verifier, secret.state);
       await this.checkShareMembership(device);
     }
@@ -734,6 +760,13 @@ export class PoolObject extends DurableObject {
     const row = this.contribution(device, id);
     if (row.state !== 'pending') return this.receipt(row);
     const secret = await this.decrypt(row.secret);
+    const recovery = row.account_id !== null;
+    if (recovery) {
+      const target = this.one('SELECT generation,state FROM accounts WHERE id=?', row.account_id);
+      if (!target || target.state !== 'quarantined' || target.generation !== secret.target_generation) {
+        return this.transaction(() => this.finishContribution(row, 'failed'));
+      }
+    }
     const match = typeof code === 'string' && code.length <= 4225 ? code.match(/^([\x21-\x22\x24-\x7e]{1,4096})#([A-Za-z0-9_-]{32,128})$/) : null;
     if (!match || match[0] !== code || !(await secretEqual(match[2], secret.state))) {
       const result = this.transaction(() => {
@@ -755,6 +788,29 @@ export class PoolObject extends DurableObject {
       if (credentials.expires_at <= this.now() + EXPIRY_MARGIN || !['pro', 'max', 'team', 'enterprise'].includes(credentials.account.subscriptionType)) {
         throw new PoolError('ineligible-subscription');
       }
+      if (recovery) {
+        const target = this.one('SELECT * FROM accounts WHERE id=?', row.account_id);
+        const previous = target ? await this.decrypt(target.secret) : null;
+        const matching = target?.state === 'quarantined' && target.generation === secret.target_generation
+          && ['accountUuid', 'organizationUuid'].every(key => previous.account[key] === credentials.account[key])
+          && previous.refresh_token !== credentials.refresh_token;
+        // Membership may have changed during the one-use exchange or decrypt.
+        await this.checkShareMembership(device);
+        if (!matching) return this.transaction(() => this.finishContribution(row, 'failed'));
+        const encrypted = await this.encrypt(credentials);
+        await this.checkShareMembership(device);
+        return this.transaction(() => {
+          const current = this.contribution(device, row.id);
+          if (current.state !== 'exchanging') return this.receipt(current);
+          const latest = this.one('SELECT generation,state FROM accounts WHERE id=?', row.account_id);
+          if (!latest || latest.state !== 'quarantined' || latest.generation !== secret.target_generation) {
+            return this.finishContribution(row, 'failed');
+          }
+          this.query("UPDATE accounts SET secret=?,generation=generation+1,state='ready',verified=1,usage=NULL,fetched=NULL,next_poll=0,failures=0,error=NULL,refresh_diagnostic=NULL WHERE id=?", encrypted, row.account_id);
+          this.audit('quarantined-account-replaced', row.account_id);
+          return this.finishContribution(row, 'recovered');
+        });
+      }
       for (const account of this.query('SELECT id,secret FROM accounts')) {
         const previous = await this.decrypt(account.secret);
         if (previous.account.accountUuid === credentials.account.accountUuid) {
@@ -772,15 +828,18 @@ export class PoolObject extends DurableObject {
       });
     } catch (error) {
       // A failed response may follow successful consumption. Never replay it.
-      const receipt = this.transaction(() => this.finishContribution(row, 'uncertain'));
+      const receipt = this.transaction(() => {
+        const current = this.contribution(device, row.id);
+        return current.state === 'exchanging' ? this.finishContribution(row, 'uncertain') : this.receipt(current);
+      });
       if (error instanceof PoolError && ['share-membership-required', 'share-directory-unavailable', 'share-not-configured'].includes(error.code)) throw error;
       return receipt;
     }
   }
 
-  quarantine(id, error) {
+  quarantine(id, error, diagnostic = null) {
     this.transaction(() => {
-      this.query("UPDATE accounts SET state='quarantined',error=? WHERE id=?", error, id);
+      this.query("UPDATE accounts SET state='quarantined',error=?,refresh_diagnostic=? WHERE id=?", error, diagnostic === null ? null : JSON.stringify(diagnostic), id);
       this.audit('account-quarantined', id);
     });
   }
@@ -792,22 +851,30 @@ export class PoolObject extends DurableObject {
       let credentials = await this.decrypt(row.secret);
       if (credentials.expires_at <= now + REFRESH_MARGIN) {
         this.transaction(() => {
-          this.query("UPDATE accounts SET state='refreshing' WHERE id=?", row.id);
+          this.query("UPDATE accounts SET state='refreshing',refresh_diagnostic=NULL WHERE id=?", row.id);
           this.audit('refresh-started', row.id);
         });
         await this.ctx.storage.sync();
+        let stage = 'provider';
         try {
-          const successor = validateCredentials(await this.provider.refresh(credentials));
+          const material = await this.provider.refresh(credentials);
+          stage = 'successor-validation';
+          const successor = validateCredentials(material);
+          if (['accountUuid', 'organizationUuid'].some(key => successor.account[key] !== credentials.account[key])) {
+            throw new PoolError('refresh-identity-mismatch');
+          }
+          stage = 'encryption';
           const encrypted = await this.encrypt(successor);
+          stage = 'persistence';
           this.transaction(() => {
-            this.query("UPDATE accounts SET secret=?,generation=generation+1,state='ready',verified=0,next_poll=0 WHERE id=?", encrypted, row.id);
+            this.query("UPDATE accounts SET secret=?,generation=generation+1,state='ready',verified=0,next_poll=0,refresh_diagnostic=NULL WHERE id=?", encrypted, row.id);
             this.audit('refresh-completed', row.id);
           });
           await this.ctx.storage.sync();
           credentials = successor;
           row = this.one('SELECT * FROM accounts WHERE id=?', row.id);
-        } catch {
-          this.quarantine(row.id, 'refresh-uncertain-reimport-fresh-lineage');
+        } catch (error) {
+          this.quarantine(row.id, 'refresh-uncertain-reimport-fresh-lineage', refreshDiagnostic(stage, error, this.now()));
           continue;
         }
       }

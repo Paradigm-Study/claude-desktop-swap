@@ -274,15 +274,24 @@ class Coordinator:
 
     def _finish_contribution(self, row, state, account_id=None):
         # Caller owns the transaction so an account and its receipt are atomic.
+        if account_id is None:
+            account_id = row["account_id"]
         self.db.execute("UPDATE contributions SET state=?,secret=NULL,account_id=? WHERE id=?", (state, account_id, row["id"]))
         self._audit("contribution-" + state, row["id"])
         return self._contribution_receipt(self._contribution(row["device_id"], row["id"]))
 
-    def contribution_start(self, token):
+    def contribution_start(self, token, account_id=None):
         with self.lock:
             device = self.authenticate_device(token)
+            if account_id is not None and (not isinstance(account_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", account_id)):
+                raise PoolError("invalid-account-id")
             self._expire_contributions()
             row = self.db.execute("SELECT * FROM contributions WHERE device_id=? AND state='pending'", (device["id"],)).fetchone()
+            if row is not None and row["account_id"] != account_id:
+                raise PoolError("contribution-target-conflict", 409)
+            target = None if account_id is None else self.db.execute("SELECT generation,state FROM accounts WHERE id=?", (account_id,)).fetchone()
+            if account_id is not None and (target is None or target["state"] != "quarantined"):
+                raise PoolError("account-not-recoverable", 409)
             if row is None:
                 now = self.clock()
                 counts = self.db.execute("SELECT sum(created>?),count(*) FROM contributions WHERE device_id=? AND created>?",
@@ -291,17 +300,21 @@ class Coordinator:
                     raise PoolError("contribution-start-limit", 429)
                 contribution_id = secrets.token_urlsafe(24)
                 secret = {"verifier": secrets.token_urlsafe(48), "state": secrets.token_urlsafe(32)}
+                if target is not None:
+                    secret["target_generation"] = target["generation"]
                 encrypted = self.cipher.encrypt(json.dumps(secret).encode())
                 # Generate/validate before persisting. This call must be local;
                 # provider traffic begins only after an authorization code.
                 authorization_url = self.provider.authorization_url(secret["verifier"], secret["state"])
                 with self.db:
-                    self.db.execute("INSERT INTO contributions(id,device_id,created,expires,state,secret) VALUES (?,?,?,?,'pending',?)",
-                                    (contribution_id, device["id"], now, now + CONTRIBUTION_TTL, encrypted))
+                    self.db.execute("INSERT INTO contributions(id,device_id,created,expires,state,secret,account_id) VALUES (?,?,?,?,'pending',?,?)",
+                                    (contribution_id, device["id"], now, now + CONTRIBUTION_TTL, encrypted, account_id))
                     self._audit("contribution-started", contribution_id)
                 row = self._contribution(device["id"], contribution_id)
             else:
                 secret = json.loads(self.cipher.decrypt(row["secret"]))
+                if target is not None and secret.get("target_generation") != target["generation"]:
+                    raise PoolError("contribution-target-changed", 409)
                 authorization_url = self.provider.authorization_url(secret["verifier"], secret["state"])
             return {**self._contribution_receipt(row), "authorization_url": authorization_url}
 
@@ -331,6 +344,12 @@ class Coordinator:
             if row["state"] != "pending":
                 return self._contribution_receipt(row)
             secret = json.loads(self.cipher.decrypt(row["secret"]))
+            recovery = row["account_id"] is not None
+            if recovery:
+                target = self.db.execute("SELECT generation,state FROM accounts WHERE id=?", (row["account_id"],)).fetchone()
+                if target is None or target["state"] != "quarantined" or target["generation"] != secret.get("target_generation"):
+                    with self.db:
+                        return self._finish_contribution(row, "failed")
             valid = isinstance(code, str) and len(code) <= CONTRIBUTION_CODE_LIMIT and code.count("#") == 1
             raw_code, callback_state = code.split("#", 1) if valid else ("", "")
             valid = (valid and 1 <= len(raw_code) <= 4096 and all(33 <= ord(char) <= 126 for char in raw_code)
@@ -354,6 +373,18 @@ class Coordinator:
                 # exchange_code verifies profile metadata against the grant and
                 # requires a paid native plan. Never trust client-supplied IDs.
                 with self.db:
+                    if recovery:
+                        self.authenticate_device(token)
+                        target = self.db.execute("SELECT * FROM accounts WHERE id=?", (row["account_id"],)).fetchone()
+                        prior = json.loads(self.cipher.decrypt(target["secret"])) if target is not None else None
+                        if (target is None or target["state"] != "quarantined" or target["generation"] != secret["target_generation"]
+                                or any(prior["account"][key] != credentials["account"][key] for key in ("accountUuid", "organizationUuid"))
+                                or prior["refresh_token"] == credentials["refresh_token"]):
+                            return self._finish_contribution(row, "failed")
+                        encrypted = self.cipher.encrypt(json.dumps(credentials).encode())
+                        self.db.execute("UPDATE accounts SET secret=?,generation=generation+1,state='ready',verified=1,usage=NULL,fetched=NULL,next_poll=0,failures=0,error=NULL WHERE id=?", (encrypted, row["account_id"]))
+                        self._audit("quarantined-account-replaced", row["account_id"])
+                        return self._finish_contribution(row, "recovered")
                     for account in self.db.execute("SELECT id,secret FROM accounts"):
                         prior = json.loads(self.cipher.decrypt(account["secret"]))
                         if prior["account"]["accountUuid"] == credentials["account"]["accountUuid"]:
@@ -562,9 +593,11 @@ class PoolHandler(BaseHTTPRequestHandler):
                     raise PoolError("unauthorized", 401)
                 result = self.server.coordinator.assignment(auth[7:])
             elif self.path == "/v1/contributions/start":
-                if body:
+                if set(body) - {"account_id"}:
                     raise PoolError("invalid-body")
-                result = self.server.coordinator.contribution_start(token)
+                if "account_id" in body and (not isinstance(body["account_id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", body["account_id"])):
+                    raise PoolError("invalid-account-id")
+                result = self.server.coordinator.contribution_start(token, body.get("account_id"))
             elif self.path == "/v1/contributions/complete":
                 if set(body) != {"contribution_id", "code"}:
                     raise PoolError("invalid-body")

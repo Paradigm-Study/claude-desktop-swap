@@ -9,11 +9,12 @@ import warnings
 import webbrowser
 
 from .client import ClientError, DEVICE_SECRET, RequestError, _number, _safe_string
+from .catalog import identifier
 from .provider import CLIENT_ID
 
 AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
 CALLBACK_URL = "https://platform.claude.com/oauth/code/callback"
-STATES = {"pending", "exchanging", "added", "duplicate", "failed", "uncertain", "expired", "cancelled"}
+STATES = {"pending", "exchanging", "added", "recovered", "duplicate", "failed", "uncertain", "expired", "cancelled"}
 SCOPES = {"org:create_api_key", "user:profile", "user:inference", "user:sessions:claude_code",
           "user:mcp_servers", "user:file_upload", "user:plugins"}
 
@@ -43,18 +44,24 @@ def authorization_url(value):
         raise ClientError("Coordinator returned an unrecognized Claude authorization URL; no browser was opened.") from None
 
 
-def receipt(value, *, expected_id=None, allow_url=False):
+def receipt(value, *, expected_id=None, allow_url=False, recovery_account_id=None):
     if not isinstance(value, dict):
         raise ClientError("Coordinator returned an invalid contribution receipt.")
     allowed = {"contribution_id", "state", "expires_at", "account_id"}
     if allow_url:
         allowed.add("authorization_url")
     if (set(value) - allowed or not _safe_string(value.get("contribution_id"), maximum=128)
-            or value.get("state") not in STATES or not _number(value.get("expires_at"))
+            or not isinstance(value.get("state"), str) or value["state"] not in STATES or not _number(value.get("expires_at"))
             or (expected_id is not None and value["contribution_id"] != expected_id)
-            or (value["state"] in ("added", "duplicate") and not _safe_string(value.get("account_id"), maximum=64))
-            or ("account_id" in value and not _safe_string(value["account_id"], maximum=64))):
+            or (value["state"] in ("added", "duplicate", "recovered") and not identifier(value.get("account_id")))
+            or ("account_id" in value and not identifier(value["account_id"]))):
         raise ClientError("Coordinator returned an invalid contribution receipt.")
+    if recovery_account_id is not None:
+        if (not identifier(recovery_account_id) or value.get("account_id") != recovery_account_id
+                or value["state"] in ("added", "duplicate")):
+            raise ClientError("Coordinator returned a receipt for a different account recovery; check contribution status before continuing.")
+    elif value["state"] == "recovered" or ("account_id" in value and value["state"] not in ("added", "duplicate")):
+        raise ClientError("Coordinator returned a receipt for a different login; check contribution status before continuing.")
     if allow_url and value["state"] == "pending":
         authorization_url(value.get("authorization_url"))
     elif "authorization_url" in value:
@@ -84,25 +91,61 @@ class Contribution:
                                  ("contribution_id", "state", "expires_at", "account_id") if key in result}
         self.client._save(state)
 
-    def start(self):
+    @staticmethod
+    def _target(last):
+        return last.get("account_id") if last["state"] not in ("added", "duplicate") else None
+
+    def _last(self, state):
+        last = state.get("contribution")
+        if last is None:
+            return None
+        if not isinstance(last, dict):
+            raise ClientError("The saved contribution receipt is invalid; no login was submitted.")
+        # "submitted" is the local no-replay marker, never a server receipt state.
+        check = dict(last)
+        if check.get("state") == "submitted":
+            check["state"] = "exchanging"
+        receipt(check, recovery_account_id=self._target(check) if "state" in check else None)
+        return last
+
+    def start(self, account_id=None):
+        if account_id is not None and not identifier(account_id):
+            raise ClientError("Select a valid account from the shared pool to recover.")
         with self.client.locked():
             state, token = self._context()
-            last = state.get("contribution")
+            last = self._last(state)
             if last and last.get("state") in ("submitted", "exchanging"):
                 raise ClientError("A contribution may have been submitted. Run contribute-account --status before starting another login.")
-            result = receipt(self.client._transport(state).post("/v1/contributions/start", {}, token), allow_url=True)
+            transport = self.client._transport(state)
+            if last and last["state"] == "pending":
+                latest = receipt(transport.post("/v1/contributions/status", {"contribution_id": last["contribution_id"]}, token),
+                                 expected_id=last["contribution_id"], recovery_account_id=self._target(last))
+                self._save(state, latest)
+                if latest["state"] in ("pending", "exchanging"):
+                    if latest["state"] == "exchanging":
+                        raise ClientError("A contribution may have been submitted. Run contribute-account --status before starting another login.")
+                    if self._target(latest) != account_id:
+                        raise ClientError("A different account login is still pending. Run contribute-account --status, then --cancel before changing accounts or switching between Add and Recover.")
+            body = {} if account_id is None else {"account_id": account_id}
+            try:
+                response = transport.post("/v1/contributions/start", body, token)
+            except RequestError as error:
+                if error.status == 409:
+                    raise ClientError("Another login is pending, or this account no longer needs recovery. Run contribute-account --status and refresh the pool before trying again.") from None
+                raise
+            result = receipt(response, allow_url=True, recovery_account_id=account_id)
             self._save(state, result)
             return result
 
     def inspect(self, *, cancel=False):
         with self.client.locked():
             state, token = self._context()
-            last = state.get("contribution")
+            last = self._last(state)
             if not last:
                 return {"state": "none"}
             path = "/v1/contributions/" + ("cancel" if cancel else "status")
             result = receipt(self.client._transport(state).post(path, {"contribution_id": last["contribution_id"]}, token),
-                             expected_id=last["contribution_id"])
+                             expected_id=last["contribution_id"], recovery_account_id=self._target(last))
             self._save(state, result)
             return result
 
@@ -114,14 +157,15 @@ class Contribution:
             raise ClientError("Paste the complete authorization code, including #state, at the hidden prompt.")
         with self.client.locked():
             state, token = self._context()
-            last = state.get("contribution")
+            last = self._last(state)
             if not last or last["contribution_id"] != contribution_id or last["state"] != "pending":
                 raise ClientError("This login is not pending. Check contribute-account --status; no code was submitted.")
             state["contribution"]["state"] = "submitted"
             self.client._save(state)
             try:
                 result = receipt(self.client._transport(state).post("/v1/contributions/complete",
-                    {"contribution_id": contribution_id, "code": code}, token), expected_id=contribution_id)
+                    {"contribution_id": contribution_id, "code": code}, token), expected_id=contribution_id,
+                    recovery_account_id=self._target(last))
             except RequestError:
                 raise ClientError("Contribution delivery was not confirmed. Run contribute-account --status; do not resubmit the code.") from None
             self._save(state, result)
@@ -139,15 +183,18 @@ def hidden_code():
         raise ClientError("A hidden terminal prompt is unavailable; the login remains pending.") from None
 
 
-def run_contribution(client, *, no_browser=False, status=False, cancel=False,
+def run_contribution(client, *, account_id=None, no_browser=False, status=False, cancel=False,
                      open_browser=None, read_code=None, output=print):
     flow = Contribution(client)
     if status or cancel:
         return flow.inspect(cancel=cancel)
     if read_code is None and not sys.stdin.isatty():
         raise ClientError("Run contribute-account in an interactive terminal on your Mac.")
-    output("This adds a subscription account to your team's shared pool. Team devices can use its quota and account permissions.")
-    result = flow.start()
+    if account_id is None:
+        output("This adds a subscription account to your team's shared pool. Team devices can use its quota and account permissions.")
+    else:
+        output("This renews the selected shared account's login. Sign into that same Claude account; a different account will not replace it.")
+    result = flow.start(account_id=account_id)
     if result["state"] != "pending":
         return result
     output("Sign into the account you intend to share on the Claude authorization page, then copy its complete code back here.")
@@ -162,7 +209,10 @@ def run_contribution(client, *, no_browser=False, status=False, cancel=False,
         output("Open this Claude authorization URL: " + url)
     try:
         code = (read_code or hidden_code)()
-        return flow.complete(result["contribution_id"], code)
+        result = flow.complete(result["contribution_id"], code)
+        if result["state"] == "recovered":
+            output("Account login recovered. The shared pool can use it again when quota is available.")
+        return result
     except KeyboardInterrupt:
         output("Contribution interrupted. Run contribute-account --status before continuing; --cancel only cancels a pending login.")
         raise

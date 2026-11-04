@@ -8,8 +8,8 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlencode
 
-from team_pool.client import Client, ClientError, RequestError
-from team_pool.contribute import Contribution, authorization_url, hidden_code, run_contribution
+from team_pool.client import Client, ClientError, RequestError, main as client_main
+from team_pool.contribute import Contribution, authorization_url, hidden_code, receipt, run_contribution
 from team_pool.provider import CLIENT_ID
 from test_team_client import FakeNative, DEVICE_TOKEN
 
@@ -30,22 +30,29 @@ class ContributionTransport:
         self.fail_after_accept = False
         self.result_id = "contribution-a"
         self.url = login_url()
+        self.target = None
 
     def post(self, path, body, token=None):
         self.calls.append((path, copy.deepcopy(body), token))
         if path == "/v1/enroll":
             return {"device_id": "device-a", "device_token": DEVICE_TOKEN}
+        if path.endswith("start"):
+            self.target = body.get("account_id")
+            if self.state not in ("pending", "exchanging"):
+                self.state = "pending"
         result = {"contribution_id": self.result_id, "state": self.state, "expires_at": 1600}
         if path.endswith("start"):
             result["authorization_url"] = self.url
         if path.endswith("complete"):
-            self.state = result["state"] = "added"
+            self.state = result["state"] = "recovered" if self.target else "added"
             if self.fail_after_accept:
                 raise RequestError()
         if path.endswith("cancel"):
             self.state = result["state"] = "cancelled"
         if self.state == "added":
             result["account_id"] = "shared-account"
+        if self.target:
+            result["account_id"] = self.target
         return result
 
 
@@ -80,6 +87,109 @@ class ContributionClientTests(unittest.TestCase):
             self.assertNotIn(secret, "\n".join(output))
         self.assertEqual(self.client.status()["state"], "enrolled")
         self.assertEqual(self.transport.calls[-1][2], DEVICE_TOKEN)
+        self.assertEqual(self.transport.calls[1][1], {})
+
+    def test_recovery_sends_target_and_keeps_native_credentials_and_secrets_private(self):
+        output, opened = [], []
+        result = run_contribution(self.client, account_id="quarantined-account",
+            open_browser=lambda url, **kw: opened.append(url) or True,
+            read_code=lambda: self.code, output=output.append)
+        self.assertEqual(result["state"], "recovered")
+        self.assertEqual(result["account_id"], "quarantined-account")
+        self.assertEqual(self.transport.calls[1][1], {"account_id": "quarantined-account"})
+        self.assertEqual(self.native.credentials, self.before)
+        self.assertEqual(self.native.writes, [])
+        self.assertEqual(opened, [login_url()])
+        self.assertIn("Account login recovered", output[-1])
+        raw = self.path.read_text()
+        for secret in (self.code, DEVICE_TOKEN, "authorization_url", "original-credential"):
+            self.assertNotIn(secret, raw)
+            self.assertNotIn(secret, "\n".join(output))
+
+    def test_invalid_recovery_target_makes_no_network_request(self):
+        calls = len(self.transport.calls)
+        for target in ("", "account/a", "a" * 65, "account-a\n", [], 1):
+            with self.subTest(target=target), self.assertRaises(ClientError):
+                self.flow.start(account_id=target)
+        self.assertEqual(len(self.transport.calls), calls)
+
+    def test_pending_recovery_survives_new_flow_status_and_cancel(self):
+        self.flow.start(account_id="quarantined-account")
+        flow = Contribution(self.client)
+        self.assertEqual(flow.inspect()["account_id"], "quarantined-account")
+        result = flow.inspect(cancel=True)
+        self.assertEqual(result["state"], "cancelled")
+        self.assertEqual(result["account_id"], "quarantined-account")
+        self.assertEqual(self.client._load()["contribution"], result)
+
+    def test_pending_mode_and_target_changes_require_cancellation(self):
+        for first, second in ((None, "account-a"), ("account-a", None), ("account-a", "account-b")):
+            with self.subTest(first=first, second=second):
+                self.flow.start(account_id=first)
+                before = self.client._load()["contribution"]
+                starts = sum(path.endswith("start") for path, _, _ in self.transport.calls)
+                with self.assertRaisesRegex(ClientError, "different account login"):
+                    self.flow.start(account_id=second)
+                self.assertEqual(self.client._load()["contribution"], before)
+                self.assertEqual(sum(path.endswith("start") for path, _, _ in self.transport.calls), starts)
+                self.assertTrue(self.transport.calls[-1][0].endswith("status"))
+                self.flow.inspect(cancel=True)
+
+    def test_pending_same_target_refreshes_status_before_returning_url(self):
+        self.flow.start(account_id="account-a")
+        result = self.flow.start(account_id="account-a")
+        self.assertEqual(result["account_id"], "account-a")
+        self.assertEqual([path for path, _, _ in self.transport.calls[-2:]],
+                         ["/v1/contributions/status", "/v1/contributions/start"])
+
+    def test_stale_local_pending_can_start_new_target_after_terminal_status(self):
+        self.flow.start(account_id="account-a")
+        self.transport.state = "expired"
+        result = self.flow.start(account_id="account-b")
+        self.assertEqual(result["state"], "pending")
+        self.assertEqual(result["account_id"], "account-b")
+
+    def test_pending_that_became_exchanging_requires_status(self):
+        self.flow.start(account_id="account-a")
+        self.transport.state = "exchanging"
+        starts = sum(path.endswith("start") for path, _, _ in self.transport.calls)
+        with self.assertRaisesRegex(ClientError, "--status"):
+            self.flow.start(account_id="account-a")
+        self.assertEqual(sum(path.endswith("start") for path, _, _ in self.transport.calls), starts)
+        self.assertEqual(self.client._load()["contribution"]["state"], "exchanging")
+
+    def test_lost_recovery_response_uses_status_without_replaying_code(self):
+        pending = self.flow.start(account_id="account-a")
+        self.transport.fail_after_accept = True
+        with self.assertRaisesRegex(ClientError, "do not resubmit"):
+            self.flow.complete(pending["contribution_id"], self.code)
+        journal = self.client._load()["contribution"]
+        self.assertEqual((journal["state"], journal["account_id"]), ("submitted", "account-a"))
+        with self.assertRaises(ClientError):
+            self.flow.complete(pending["contribution_id"], self.code)
+        result = Contribution(self.client).inspect()
+        self.assertEqual((result["state"], result["account_id"]), ("recovered", "account-a"))
+        self.assertEqual(sum(path.endswith("complete") for path, _, _ in self.transport.calls), 1)
+
+    def test_recovery_receipt_cannot_change_target_after_submission(self):
+        pending = self.flow.start(account_id="account-a")
+        self.transport.target = "account-b"
+        with self.assertRaisesRegex(ClientError, "different account recovery"):
+            self.flow.complete(pending["contribution_id"], self.code)
+        journal = self.client._load()["contribution"]
+        self.assertEqual((journal["state"], journal["account_id"]), ("submitted", "account-a"))
+
+    def test_recovery_receipt_cannot_change_target_during_status(self):
+        self.flow.start(account_id="account-a")
+        self.transport.target = "account-b"
+        with self.assertRaisesRegex(ClientError, "different account recovery"):
+            self.flow.inspect()
+        self.assertEqual(self.client._load()["contribution"]["account_id"], "account-a")
+
+    def test_server_pending_conflict_provides_safe_guidance(self):
+        self.client.transport.post = lambda *a, **kw: (_ for _ in ()).throw(RequestError(409))
+        with self.assertRaisesRegex(ClientError, "--status"):
+            self.flow.start(account_id="account-a")
 
     def test_lost_response_uses_status_without_replaying_exchange(self):
         result = self.flow.start()
@@ -187,6 +297,28 @@ class ContributionClientTests(unittest.TestCase):
 
 
 class ContributionInputTests(unittest.TestCase):
+    def test_receipt_rejects_malformed_ids_modes_and_states(self):
+        base = {"contribution_id": "operation-a", "state": "pending", "expires_at": 1600}
+        for update in ({"state": []}, {"state": "recovered", "account_id": "account-a"},
+                       {"account_id": "account-a"}, {"state": "added", "account_id": "bad/id"}):
+            with self.subTest(update=update), self.assertRaises(ClientError):
+                receipt(dict(base, **update))
+        for update in ({}, {"account_id": "account-b"}, {"account_id": "bad/id"},
+                       {"state": "added", "account_id": "account-a"}):
+            with self.subTest(update=update), self.assertRaises(ClientError):
+                receipt(dict(base, **update), recovery_account_id="account-a")
+        for state in ("pending", "exchanging", "recovered", "failed", "uncertain", "expired", "cancelled"):
+            value = dict(base, state=state, account_id="account-a")
+            self.assertEqual(receipt(value, recovery_account_id="account-a"), value)
+
+    def test_recovery_cli_passes_only_account_intent_to_hidden_prompt_flow(self):
+        with patch("sys.platform", "darwin"), patch("team_pool.client.Client") as factory, \
+                patch("team_pool.contribute.run_contribution", return_value={"state": "recovered", "account_id": "account-a"}) as run, \
+                patch("sys.stdout", io.StringIO()) as output:
+            self.assertEqual(client_main(["recover-account", "account-a", "--no-browser"]), 0)
+        run.assert_called_once_with(factory.return_value, account_id="account-a", no_browser=True, status=False, cancel=False)
+        self.assertEqual(json.loads(output.getvalue())["state"], "recovered")
+
     def test_only_expected_official_auth_urls_pass(self):
         self.assertEqual(authorization_url(login_url()), login_url())
         bad = [login_url().replace("claude.com", "claude.com.evil.invalid", 1),

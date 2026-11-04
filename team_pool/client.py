@@ -736,11 +736,16 @@ def main(argv=None):
     switch.add_argument("account_id")
     leave = commands.add_parser("leave")
     leave.add_argument("--restore", action="store_true")
-    contribute = commands.add_parser("contribute-account", help="Share a fresh subscription login with the enrolled pool")
-    contribution_options = contribute.add_mutually_exclusive_group()
-    contribution_options.add_argument("--no-browser", action="store_true", help="Print the authorization URL for manual opening")
-    contribution_options.add_argument("--status", action="store_true", help="Recover the last contribution receipt without exchanging a code")
-    contribution_options.add_argument("--cancel", action="store_true", help="Cancel a pending contribution login")
+    for name, help_text in (("contribute-account", "Share a fresh subscription login with the enrolled pool"),
+                            ("recover-account", "Sign in again to recover a quarantined shared account")):
+        contribute = commands.add_parser(name, help=help_text)
+        if name == "recover-account":
+            contribute.add_argument("account_id")
+        contribution_options = contribute.add_mutually_exclusive_group()
+        contribution_options.add_argument("--no-browser", action="store_true", help="Print the authorization URL for manual opening")
+        if name == "contribute-account":
+            contribution_options.add_argument("--status", action="store_true", help="Recover the last add or recovery receipt without exchanging a code")
+            contribution_options.add_argument("--cancel", action="store_true", help="Cancel a pending add or recovery login")
     args = parser.parse_args(argv)
     try:
         if sys.platform != "darwin":
@@ -764,10 +769,10 @@ def main(argv=None):
             result = client.sync(account_id=args.account_id)
         elif args.command == "resume":
             result = client.resume()
-        elif args.command == "contribute-account":
+        elif args.command in ("contribute-account", "recover-account"):
             from .contribute import run_contribution
-            result = run_contribution(client, no_browser=args.no_browser,
-                                      status=args.status, cancel=args.cancel)
+            result = run_contribution(client, account_id=getattr(args, "account_id", None), no_browser=args.no_browser,
+                                      status=getattr(args, "status", False), cancel=getattr(args, "cancel", False))
         elif args.command == "run":
             return run(client)
         elif args.command == "service-install":

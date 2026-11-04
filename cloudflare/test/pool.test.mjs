@@ -61,7 +61,7 @@ class FakeAnthropic {
       if (!name) return this.reply(401, { error: 'unknown-test-token' });
       return this.reply(200, {
         account: { uuid: this.identityOverride ?? name, email: `${name}@example.test` },
-        organization: { uuid: `org-${name}`, organization_type: 'claude_max', rate_limit_tier: 'default_claude_max_20x' },
+        organization: { uuid: this.organizationOverride ?? `org-${name}`, organization_type: 'claude_max', rate_limit_tier: 'default_claude_max_20x' },
       });
     }
     if (url.origin === 'https://api.anthropic.com' && url.pathname === USAGE_PATH && request.method === 'GET') {
@@ -107,7 +107,7 @@ class FakeAnthropic {
 
   grant(name, prefix) {
     const access = `${prefix}-access-secret-${name}`;
-    const refresh = `${prefix}-refresh-secret-${name}`;
+    const refresh = this.refreshOverride ?? `${prefix}-refresh-secret-${name}`;
     this.accesses.set(access, name);
     this.refreshes.set(refresh, name);
     return this.reply(200, { access_token: access, refresh_token: refresh,
@@ -177,7 +177,7 @@ class Harness {
   assignment(device, options) { return this.request('/v1/assignment', {}, device.device_token, options); }
   async advance(seconds) { this.now += seconds; await this.request('/__test/clock', { now: this.now }); }
   async sql(sql, ...args) { return (await this.request('/__test/sql', { sql, args })).rows; }
-  startContribution(device) { return this.request('/v1/contributions/start', {}, device.device_token); }
+  startContribution(device, accountId) { return this.request('/v1/contributions/start', accountId ? { account_id: accountId } : {}, device.device_token); }
   code(operation, code = 'valid-manual-code') { return `${code}#${new URL(operation.authorization_url).searchParams.get('state')}`; }
   complete(device, operation, code = this.code(operation), options) {
     return this.request('/v1/contributions/complete', { contribution_id: operation.contribution_id, code }, device.device_token, options);
@@ -245,7 +245,7 @@ test('admin account diagnostics expose cached actual usage and a safe label with
   assert.equal(account.state, 'ready');
   assert.equal(account.fetched, h.now);
   assert.deepEqual(Object.keys(account).sort(), [
-    'account', 'error', 'expires_at', 'fetched', 'generation', 'id', 'next_poll', 'state', 'usage', 'verified',
+    'account', 'error', 'expires_at', 'fetched', 'generation', 'id', 'next_poll', 'refresh_diagnostic', 'state', 'usage', 'verified',
   ]);
   assert.equal(h.provider.calls.length, calls, 'admin diagnostics must use cached observations');
   const raw = JSON.stringify(response);
@@ -256,7 +256,7 @@ test('admin account diagnostics expose cached actual usage and a safe label with
   }
   await h.request('/admin/accounts/list', {}, device.device_token, { expected: 401 });
   const health = await h.mf.dispatchFetch('https://pool.example.test/health');
-  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a10' });
+  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a12' });
   assert.equal(h.provider.calls.length, calls);
 });
 
@@ -646,11 +646,53 @@ test('an ambiguous refresh quarantines its lineage and is never replayed after r
   h.provider.refreshFailure = 500;
   await h.assignment(first, { expected: 503 });
   assert.equal(h.provider.count('refresh'), 1);
-  assert.equal((await h.admin('accounts/list')).accounts[0].state, 'quarantined');
+  const account = (await h.admin('accounts/list')).accounts[0];
+  assert.equal(account.state, 'quarantined');
+  assert.equal(account.error, 'refresh-uncertain-reimport-fresh-lineage');
+  assert.deepEqual(account.refresh_diagnostic, { stage: 'provider', reason: 'http-500', at: h.now });
+  const catalog = await h.request('/v1/accounts/list', {}, first.device_token);
+  assert.equal(Object.hasOwn(catalog.accounts[0], 'refresh_diagnostic'), false);
   await h.restart(); h.provider.refreshFailure = null;
   await h.assignment(first, { expected: 503 });
   assert.equal(h.provider.count('refresh'), 1);
   assert.doesNotMatch(JSON.stringify(await h.sql('SELECT * FROM accounts')), /sensitive-provider-error/);
+});
+
+for (const [stage, reason, expected] of [
+  ['provider', 'transport-or-response-error', 'transport-or-response-error'],
+  ['provider', 'incomplete-refresh', 'incomplete-refresh'],
+  ['provider', 'bad-response', 'bad-response'],
+  ['provider', 'sensitive-code-with-secret', 'provider-error'],
+  ['successor-validation', null, 'invalid-credential-schema'],
+  ['encryption', null, 'encryption-error'],
+  ['persistence', null, 'persistence-error'],
+]) {
+  test(`refresh diagnostics classify ${stage}/${expected} without storing exception contents or replaying`, async () => {
+    await h.add('a', h.now + 200); const device = await h.enroll();
+    await h.request('/__test/fail-refresh', { stage, reason });
+    await h.assignment(device, { expected: 503 });
+    const account = (await h.admin('accounts/list')).accounts[0];
+    assert.equal(account.state, 'quarantined');
+    assert.equal(account.error, 'refresh-uncertain-reimport-fresh-lineage');
+    assert.deepEqual(account.refresh_diagnostic, { stage, reason: expected, at: h.now });
+    assert.doesNotMatch(JSON.stringify(await h.sql('SELECT * FROM accounts')), /sensitive-/);
+    const calls = h.provider.count('refresh');
+    await h.restart();
+    await h.assignment(device, { expected: 503 });
+    assert.equal(h.provider.count('refresh'), calls);
+    assert.deepEqual((await h.admin('accounts/list')).accounts[0].refresh_diagnostic, account.refresh_diagnostic);
+  });
+}
+
+test('diagnostic schema migration preserves quarantined history as unknown instead of fabricating a cause', async () => {
+  await h.add('historical');
+  await h.sql("UPDATE accounts SET state='quarantined',error='refresh-uncertain-reimport-fresh-lineage'");
+  await h.sql('ALTER TABLE accounts DROP COLUMN refresh_diagnostic');
+  await h.restart();
+  const account = (await h.admin('accounts/list')).accounts[0];
+  assert.equal(account.state, 'quarantined');
+  assert.equal(account.refresh_diagnostic, null);
+  assert.equal(h.provider.count('refresh'), 0);
 });
 
 test('constructor recovery quarantines an interrupted durable refresh before another grant', async () => {
@@ -751,6 +793,171 @@ test('duplicate contribution does not replace existing rotating credential linea
   assert.deepEqual(await h.sql('SELECT secret,generation FROM accounts WHERE id=?', 'donated'), before);
   assert.equal((await h.admin('accounts/list')).accounts.length, 1);
   assert.deepEqual(await h.complete(first, operation), receipt);
+  assert.equal(h.provider.count('exchange'), 1);
+});
+
+async function quarantinedAccount(name = 'recover') {
+  const value = await h.add(name);
+  await h.sql("UPDATE accounts SET state='quarantined',verified=1,usage=?,fetched=?,next_poll=?,failures=4,error='refresh-uncertain-reimport-fresh-lineage',refresh_diagnostic=? WHERE id=?",
+    JSON.stringify({ five_hour: 100, seven_day: 100 }), h.now - 3600, h.now + 3600,
+    JSON.stringify({ stage: 'provider', reason: 'http-500', at: h.now - 3600 }), name);
+  h.provider.grants.set('valid-manual-code', name);
+  return value;
+}
+
+test('targeted recovery atomically replaces the same quarantined account with fresh quota and durable idempotent receipt', async () => {
+  await quarantinedAccount();
+  const first = await h.enroll(); const second = await h.enroll();
+  const operation = await h.startContribution(first, 'recover');
+  assert.equal(operation.account_id, 'recover');
+  assert.deepEqual(await h.startContribution(first, 'recover'), operation);
+  const pending = (await h.sql('SELECT * FROM contributions'))[0];
+  assert.match(pending.secret, /^v1:/);
+  assert.equal(pending.account_id, 'recover');
+  const receipts = await Promise.all(Array.from({ length: 8 }, () => h.complete(first, operation)));
+  assert.equal(receipts[0].state, 'recovered');
+  assert.equal(receipts[0].account_id, 'recover');
+  for (const receipt of receipts) assert.deepEqual(receipt, receipts[0]);
+  assert.equal(h.provider.count('exchange'), 1);
+  const row = (await h.sql('SELECT id,generation,state,verified,usage,fetched,next_poll,failures,error,refresh_diagnostic FROM accounts'))[0];
+  assert.deepEqual(row, { id: 'recover', generation: 2, state: 'ready', verified: 1,
+    usage: null, fetched: null, next_poll: 0, failures: 0, error: null, refresh_diagnostic: null });
+  h.provider.quotas.set('recover', { five_hour: 3, seven_day: 17 });
+  for (const device of [first, second]) {
+    const assignment = await h.assignment(device);
+    assert.equal(assignment.account_id, 'recover');
+    assert.equal(assignment.generation, 2);
+    assert.equal(assignment.access_token, 'contributed-access-secret-recover');
+    assert.equal(Object.hasOwn(assignment, 'refresh_token'), false);
+  }
+  assert.deepEqual((await h.admin('accounts/list')).accounts[0].usage, { five_hour: 3, seven_day: 17 });
+  await h.restart();
+  assert.deepEqual(await h.receipt('status', first, operation), receipts[0]);
+  assert.deepEqual(await h.complete(first, operation), receipts[0]);
+  assert.equal(h.provider.count('exchange'), 1);
+  assert.equal((await h.sql('SELECT secret FROM contributions'))[0].secret, null);
+});
+
+test('ordinary contribution preserves quarantined accounts for old clients', async () => {
+  await quarantinedAccount();
+  const first = await h.enroll();
+  const before = await h.sql('SELECT * FROM accounts');
+  const receipt = await h.complete(first, await h.startContribution(first));
+  assert.equal(receipt.state, 'duplicate');
+  assert.equal(receipt.account_id, 'recover');
+  assert.deepEqual(await h.sql('SELECT * FROM accounts'), before);
+});
+
+test('recovery start accepts only a quarantined target and never reuses an unrelated pending browser sign-in', async () => {
+  await h.add('healthy'); await quarantinedAccount('recover'); await quarantinedAccount('another');
+  const device = await h.enroll();
+  for (const body of [{ account_id: null }, { account_id: 3 }, { account_id: '' }, { account_id: 'bad/id' }, { account_id: 'recover', extra: true }]) {
+    await h.request('/v1/contributions/start', body, device.device_token, { expected: 400 });
+  }
+  for (const accountId of ['healthy', 'missing']) {
+    assert.deepEqual(await h.request('/v1/contributions/start', { account_id: accountId }, device.device_token, { expected: 409 }), { error: 'account-not-recoverable' });
+  }
+  const ordinary = await h.startContribution(device);
+  assert.deepEqual(await h.request('/v1/contributions/start', { account_id: 'recover' }, device.device_token, { expected: 409 }), { error: 'contribution-target-conflict' });
+  await h.receipt('cancel', device, ordinary);
+  const targeted = await h.startContribution(device, 'recover');
+  for (const body of [{}, { account_id: 'another' }]) {
+    assert.deepEqual(await h.request('/v1/contributions/start', body, device.device_token, { expected: 409 }), { error: 'contribution-target-conflict' });
+  }
+  assert.deepEqual(await h.receipt('status', device, targeted), {
+    contribution_id: targeted.contribution_id, state: 'pending', account_id: 'recover', expires_at: targeted.expires_at,
+  });
+  assert.equal(h.provider.count('exchange'), 0);
+});
+
+for (const mismatch of ['account', 'organization', 'refresh-lineage']) {
+  test(`targeted recovery rejects ${mismatch} mismatch without replacing or inserting any account`, async () => {
+    const old = await quarantinedAccount();
+    const device = await h.enroll(); const operation = await h.startContribution(device, 'recover');
+    const before = await h.sql('SELECT * FROM accounts');
+    if (mismatch === 'account') h.provider.grants.set('valid-manual-code', 'unrelated');
+    if (mismatch === 'organization') h.provider.organizationOverride = 'unrelated-organization';
+    if (mismatch === 'refresh-lineage') h.provider.refreshOverride = old.refresh_token;
+    const receipt = await h.complete(device, operation);
+    assert.equal(receipt.state, 'failed');
+    assert.equal(receipt.account_id, 'recover');
+    assert.deepEqual(await h.sql('SELECT * FROM accounts'), before);
+    assert.deepEqual(await h.complete(device, operation), receipt);
+    assert.equal(h.provider.count('exchange'), 1);
+    assert.equal((await h.sql('SELECT secret FROM contributions'))[0].secret, null);
+  });
+}
+
+for (const timing of ['before', 'during']) {
+  test(`targeted recovery rejects a generation change ${timing} OAuth exchange`, async () => {
+    await quarantinedAccount(); const device = await h.enroll();
+    const operation = await h.startContribution(device, 'recover');
+    const mutate = () => h.sql("UPDATE accounts SET generation=generation+1 WHERE id='recover'");
+    if (timing === 'before') await mutate();
+    else h.provider.beforeGrant = mutate;
+    const receipt = await h.complete(device, operation);
+    assert.equal(receipt.state, 'failed');
+    assert.equal(receipt.account_id, 'recover');
+    const account = (await h.admin('accounts/list')).accounts[0];
+    assert.equal(account.state, 'quarantined'); assert.equal(account.generation, 2);
+    assert.equal(h.provider.count('exchange'), timing === 'before' ? 0 : 1);
+    assert.deepEqual(await h.complete(device, operation), receipt);
+  });
+}
+
+test('recovery target persists on cancellation, expiry and interrupted exchange without consuming codes', async () => {
+  await quarantinedAccount(); const device = await h.enroll();
+  for (const state of ['cancelled', 'expired', 'uncertain']) {
+    const operation = await h.startContribution(device, 'recover');
+    if (state === 'cancelled') await h.receipt('cancel', device, operation);
+    if (state === 'expired') await h.advance(601);
+    if (state === 'uncertain') {
+      await h.sql("UPDATE contributions SET state='exchanging' WHERE id=?", operation.contribution_id);
+      await h.restart();
+    }
+    const receipt = await h.complete(device, operation);
+    assert.equal(receipt.state, state);
+    assert.equal(receipt.account_id, 'recover');
+  }
+  assert.equal(h.provider.count('exchange'), 0);
+  assert.equal((await h.admin('accounts/list')).accounts[0].generation, 1);
+});
+
+test('recovery cannot commit if a cancellation becomes durable during OAuth exchange', async () => {
+  await quarantinedAccount(); const device = await h.enroll();
+  const operation = await h.startContribution(device, 'recover');
+  const before = await h.sql('SELECT * FROM accounts');
+  h.provider.beforeGrant = () => h.sql("UPDATE contributions SET state='cancelled',secret=NULL WHERE id=?", operation.contribution_id);
+  const receipt = await h.complete(device, operation);
+  assert.equal(receipt.state, 'cancelled');
+  assert.equal(receipt.account_id, 'recover');
+  assert.deepEqual(await h.sql('SELECT * FROM accounts'), before);
+  assert.equal(h.provider.count('exchange'), 1);
+});
+
+test('membership removal during recovery leaves old account unchanged and code unreplayable', async () => {
+  await quarantinedAccount(); const device = await h.shareEnroll();
+  const operation = await h.startContribution(device, 'recover');
+  const before = await h.sql('SELECT * FROM accounts');
+  h.provider.beforeGrant = () => h.shareMember(false);
+  await h.complete(device, operation, h.code(operation), { expected: 401 });
+  assert.deepEqual(await h.sql('SELECT * FROM accounts'), before);
+  assert.deepEqual((await h.sql('SELECT state,secret,account_id FROM contributions'))[0], { state: 'uncertain', secret: null, account_id: 'recover' });
+  assert.equal((await h.admin('devices/list')).devices[0].revoked, 1);
+  assert.equal(h.provider.count('exchange'), 1);
+});
+
+test('failed recovery receipt persistence rolls back the credential replacement and does not replay its code', async () => {
+  await quarantinedAccount(); const device = await h.enroll();
+  const operation = await h.startContribution(device, 'recover');
+  const before = await h.sql('SELECT * FROM accounts');
+  await h.request('/__test/fail-receipt');
+  const receipt = await h.complete(device, operation);
+  assert.equal(receipt.state, 'uncertain');
+  assert.equal(receipt.account_id, 'recover');
+  assert.deepEqual(await h.sql('SELECT * FROM accounts'), before);
+  await h.restart();
+  assert.deepEqual(await h.complete(device, operation), receipt);
   assert.equal(h.provider.count('exchange'), 1);
 });
 
@@ -855,7 +1062,7 @@ test('production entry enforces HTTPS, configuration and enrollment throttling t
   h.production = true; await h.restart();
   const health = await h.mf.dispatchFetch('https://pool.example.test/health');
   assert.equal(health.status, 200);
-  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a10' });
+  assert.deepEqual(await health.json(), { ok: true, mode: 'native-subscription', version: '0.1.0a12' });
   assert.equal(health.headers.get('cache-control'), 'no-store');
   const insecure = await h.mf.dispatchFetch('http://pool.example.test/health');
   assert.equal(insecure.status, 400); assert.equal((await insecure.json()).error, 'https-required');

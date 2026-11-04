@@ -60,8 +60,13 @@ class ContributionServerTests(unittest.TestCase):
     def enroll(self, name):
         return self.pool.enroll(self.pool.invite(), name)
 
-    def start(self, device=None):
-        return self.pool.contribution_start((device or self.first)['device_token'])
+    def start(self, device=None, account_id=None):
+        return self.pool.contribution_start((device or self.first)['device_token'], account_id)
+
+    def quarantined(self, account_id='existing'):
+        self.pool.add_account(account_id, credentials(), exclusive_owner=True)
+        self.pool._quarantine(account_id, 'refresh-uncertain')
+        self.provider.grant['refresh_token'] = 'fresh-recovery-lineage'
 
     def code(self, operation, code='manual-auth-code'):
         state = urllib.parse.parse_qs(urllib.parse.urlsplit(operation['authorization_url']).query)['state'][0]
@@ -193,6 +198,136 @@ class ContributionServerTests(unittest.TestCase):
         self.assertEqual(self.finish(operation), receipt)
         self.assertEqual(len(self.provider.calls), 1)
 
+    def test_recovery_replaces_target_atomically_and_shares_new_generation(self):
+        self.quarantined()
+        operation = self.start(account_id='existing')
+        self.assertEqual(operation['account_id'], 'existing')
+        self.assertEqual(self.start(account_id='existing'), operation)
+        self.restart()
+        receipt = self.finish(operation)
+        self.assertEqual((receipt['state'], receipt['account_id']), ('recovered', 'existing'))
+        self.assertEqual(len(self.pool.accounts()), 1)
+        row = self.pool.accounts()[0]
+        self.assertEqual((row['generation'], row['state'], row['verified']), (2, 'ready', 1))
+        self.assertIsNone(row['error'])
+        for device in (self.first, self.second):
+            assignment = self.pool.assignment(device['device_token'])
+            self.assertEqual((assignment['account_id'], assignment['generation']), ('existing', 2))
+            self.assertNotIn('refresh_token', assignment)
+        self.restart()
+        self.assertEqual(self.finish(operation), receipt)
+        self.assertEqual(len(self.provider.calls), 1)
+
+    def test_recovery_start_rejects_invalid_healthy_missing_and_conflicting_targets(self):
+        for account_id in ('', 'bad/id', 'a' * 65, 'a\n', [], 42):
+            with self.subTest(account_id=account_id), self.assertRaises(PoolError) as caught:
+                self.start(account_id=account_id)
+            self.assertEqual(caught.exception.code, 'invalid-account-id')
+        self.pool.add_account('healthy', credentials(), exclusive_owner=True)
+        for account_id in ('healthy', 'missing'):
+            with self.assertRaises(PoolError) as caught:
+                self.start(account_id=account_id)
+            self.assertEqual(caught.exception.code, 'account-not-recoverable')
+        self.pool._quarantine('healthy', 'refresh-uncertain')
+        ordinary = self.start()
+        with self.assertRaises(PoolError) as caught:
+            self.start(account_id='healthy')
+        self.assertEqual(caught.exception.code, 'contribution-target-conflict')
+        self.pool.contribution_cancel(self.first['device_token'], ordinary['contribution_id'])
+        self.start(account_id='healthy')
+        for account_id in (None, 'different'):
+            with self.assertRaises(PoolError) as caught:
+                self.start(account_id=account_id)
+            self.assertEqual(caught.exception.code, 'contribution-target-conflict')
+        self.assertEqual(self.provider.calls, [])
+
+    def test_recovery_mismatched_account_org_or_same_lineage_cannot_replace(self):
+        self.quarantined()
+        before = tuple(self.pool.db.execute("SELECT secret,generation FROM accounts WHERE id='existing'").fetchone())
+        for field in ('accountUuid', 'organizationUuid', 'refresh_token'):
+            self.provider.grant = credentials()
+            if field != 'refresh_token':
+                self.provider.grant['refresh_token'] = 'fresh-recovery-lineage'
+                self.provider.grant['account'][field] = 'different'
+            operation = self.start(account_id='existing')
+            receipt = self.finish(operation)
+            self.assertEqual((receipt['state'], receipt['account_id']), ('failed', 'existing'))
+            self.assertEqual(tuple(self.pool.db.execute("SELECT secret,generation FROM accounts WHERE id='existing'").fetchone()), before)
+            self.assertEqual(self.finish(operation), receipt)
+        self.assertEqual(len(self.provider.calls), 3)
+
+    def test_recovery_generation_change_before_exchange_fails_without_consuming_code(self):
+        self.quarantined()
+        operation = self.start(account_id='existing')
+        with self.pool.db:
+            self.pool.db.execute("UPDATE accounts SET generation=generation+1")
+        with self.assertRaises(PoolError) as caught:
+            self.start(account_id='existing')
+        self.assertEqual(caught.exception.code, 'contribution-target-changed')
+        self.assertEqual(self.finish(operation)['state'], 'failed')
+        self.assertEqual(self.provider.calls, [])
+
+    def test_recovery_generation_change_during_exchange_is_not_overwritten(self):
+        self.quarantined()
+        operation = self.start(account_id='existing')
+        original = self.provider.exchange_code
+        def exchange(*args):
+            with self.pool.db:
+                self.pool.db.execute("UPDATE accounts SET generation=generation+1")
+            return original(*args)
+        self.provider.exchange_code = exchange
+        receipt = self.finish(operation)
+        self.assertEqual(receipt['state'], 'failed')
+        row = self.pool.accounts()[0]
+        self.assertEqual((row['state'], row['generation']), ('quarantined', 2))
+        self.assertEqual(len(self.provider.calls), 1)
+
+    def test_recovery_cancel_expire_and_interruption_preserve_target(self):
+        self.quarantined()
+        operation = self.start(account_id='existing')
+        result = self.pool.contribution_cancel(self.first['device_token'], operation['contribution_id'])
+        self.assertEqual((result['state'], result['account_id']), ('cancelled', 'existing'))
+        operation = self.start(account_id='existing')
+        self.now += 601
+        self.restart()
+        result = self.finish(operation)
+        self.assertEqual((result['state'], result['account_id']), ('expired', 'existing'))
+        operation = self.start(account_id='existing')
+        with self.pool.db:
+            self.pool.db.execute("UPDATE contributions SET state='exchanging' WHERE id=?", (operation['contribution_id'],))
+        self.restart()
+        result = self.finish(operation)
+        self.assertEqual((result['state'], result['account_id']), ('uncertain', 'existing'))
+        self.assertEqual(self.provider.calls, [])
+
+    def test_recovery_receipt_write_failure_rolls_back_replacement(self):
+        self.quarantined()
+        before = tuple(self.pool.db.execute("SELECT secret,generation FROM accounts WHERE id='existing'").fetchone())
+        operation = self.start(account_id='existing')
+        original = self.pool._finish_contribution
+        def finish(row, state, account_id=None):
+            if state == 'recovered':
+                self.assertEqual(self.pool.accounts()[0]['state'], 'ready')
+                raise RuntimeError('simulated receipt failure')
+            return original(row, state, account_id)
+        with mock.patch.object(self.pool, '_finish_contribution', side_effect=finish):
+            receipt = self.finish(operation)
+        self.assertEqual((receipt['state'], receipt['account_id']), ('uncertain', 'existing'))
+        self.assertEqual(tuple(self.pool.db.execute("SELECT secret,generation FROM accounts WHERE id='existing'").fetchone()), before)
+        self.assertEqual(self.finish(operation), receipt)
+        self.assertEqual(len(self.provider.calls), 1)
+
+    def test_recovery_revoked_during_exchange_cannot_replace(self):
+        self.quarantined()
+        operation = self.start(account_id='existing')
+        original = self.provider.exchange_code
+        def exchange(*args):
+            self.pool.revoke(self.first['device_id'])
+            return original(*args)
+        self.provider.exchange_code = exchange
+        self.assertEqual(self.finish(operation)['state'], 'uncertain')
+        self.assertEqual(self.pool.accounts()[0]['state'], 'quarantined')
+
     def test_concurrent_completions_exchange_once(self):
         operation = self.start()
         with concurrent.futures.ThreadPoolExecutor(8) as executor:
@@ -315,9 +450,17 @@ class ContributionServerTests(unittest.TestCase):
             self.assertEqual(receipt['state'], 'added')
             self.assertEqual(post(prefix + 'status', {'contribution_id': operation['contribution_id']}, token), (200, receipt))
             self.assertEqual(post(prefix + 'cancel', {'contribution_id': operation['contribution_id']}, token), (200, receipt))
+            self.pool._quarantine(receipt['account_id'], 'refresh-uncertain')
+            self.provider.grant['refresh_token'] = 'fresh-recovery-lineage'
+            for account_id in (None, 1, 'bad/id'):
+                self.assertEqual(post(prefix + 'start', {'account_id': account_id}, token), (400, {'error': 'invalid-account-id'}))
+            status, operation = post(prefix + 'start', {'account_id': receipt['account_id']}, token)
+            self.assertEqual(status, 200)
+            status, recovered = post(prefix + 'complete', {'contribution_id': operation['contribution_id'], 'code': self.code(operation)}, token)
+            self.assertEqual((status, recovered['state'], recovered['account_id']), (200, 'recovered', receipt['account_id']))
             self.pool.revoke(self.first['device_id'])
             self.assertEqual(post(prefix + 'start', None, token, raw=b'not-json'), (401, {'error': 'unauthorized'}))
-            self.assertEqual(len(self.provider.calls), 1)
+            self.assertEqual(len(self.provider.calls), 2)
         finally:
             server.shutdown()
             server.server_close()

@@ -2,6 +2,7 @@
 // clock control routes: the fixture inspects the actual Durable Object store.
 import { DurableObject } from 'cloudflare:workers';
 import { PoolObject } from '../../src/pool.mjs';
+import { ProviderError } from '../../src/provider.mjs';
 
 export class FixturePool extends PoolObject {
   constructor(ctx, env) {
@@ -31,17 +32,43 @@ export class FixturePool extends PoolObject {
         this.failReceiptOnce = true;
         return Response.json({ ok: true });
       }
+      if (path === '/__test/fail-refresh') {
+        this.failRefresh = body.stage;
+        if (body.stage === 'provider') {
+          this.provider.refresh = async () => { throw new ProviderError(body.reason); };
+        } else if (body.stage === 'successor-validation') {
+          const refresh = this.provider.refresh.bind(this.provider);
+          this.provider.refresh = async credentials => ({ ...await refresh(credentials), access_token: '' });
+        }
+        return Response.json({ ok: true });
+      }
       return new Response('Unknown fixture route', { status: 404 });
     }
     return super.fetch(request);
   }
 
   finishContribution(row, state, accountId) {
-    if (state === 'added' && this.failReceiptOnce) {
+    if (['added', 'recovered'].includes(state) && this.failReceiptOnce) {
       this.failReceiptOnce = false;
       throw new Error('Fixture receipt persistence failure');
     }
     return super.finishContribution(row, state, accountId);
+  }
+
+  async encrypt(value) {
+    if (this.failRefresh === 'encryption' && value.access_token?.startsWith('renewed-')) {
+      this.failRefresh = null;
+      throw new Error('sensitive-encryption-error');
+    }
+    return super.encrypt(value);
+  }
+
+  query(statement, ...args) {
+    if (this.failRefresh === 'persistence' && statement.startsWith('UPDATE accounts SET secret=?,generation=')) {
+      this.failRefresh = null;
+      throw new Error('sensitive-storage-error');
+    }
+    return super.query(statement, ...args);
   }
 }
 

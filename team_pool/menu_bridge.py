@@ -13,7 +13,7 @@ from .contribute import Contribution
 from .native import NativeStoreError
 
 MAX_INPUT = 8192
-COMMANDS = {"list": set(), "switch": {"account_id"}, "contribute-start": set(),
+COMMANDS = {"list": set(), "switch": {"account_id"}, "contribute-start": set(), "recover-start": {"account_id"},
             "contribute-complete": {"contribution_id", "code"},
             "contribute-status": set(), "contribute-cancel": set()}
 
@@ -42,6 +42,10 @@ def dispatch(request, client, *, running=service_running):
         flow = Contribution(client)
         if action == "contribute-start":
             return flow.start()
+        if action == "recover-start":
+            if not identifier(request["account_id"]):
+                raise ClientError("Select a valid account from the shared pool to recover.")
+            return flow.start(account_id=request["account_id"])
         if action == "contribute-complete":
             if not isinstance(request["contribution_id"], str):
                 raise ClientError("This contribution is invalid. Check Add Account status before continuing.")
