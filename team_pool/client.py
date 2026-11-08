@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from datetime import datetime, timezone
+import errno
 import fcntl
 import getpass
+import http.client
 import ipaddress
 import json
 import math
@@ -14,6 +17,8 @@ from pathlib import Path
 import plistlib
 import random
 import re
+import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -28,6 +33,25 @@ DEFAULT_CONFIG = Path.home() / ".config/claude-desktop-swap/team.json"
 SERVICE = "study.paradigm.claude-desktop-swap.team"
 DEVICE_SECRET = "device-token"
 MAX_RESPONSE = 64 * 1024
+_REQUEST_ENDPOINTS = frozenset((
+    "/v1/enroll", "/v1/enroll/share", "/v1/link/share", "/v1/assignment",
+    "/v1/accounts/list", "/v1/contributions/start", "/v1/contributions/complete",
+    "/v1/contributions/status", "/v1/contributions/cancel",
+))
+_REQUEST_CATEGORIES = frozenset((
+    "http-error", "timeout", "dns", "tls", "connection", "invalid-json",
+    "invalid-response", "response-too-large", "transport-error",
+))
+_COORDINATOR_CODES = frozenset((
+    "share-directory-unavailable", "no-eligible-account", "share-membership-required",
+    "share-not-configured", "internal-error",
+))
+
+
+def _duration_ms(value):
+    if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+        return round(min(value, 86_400_000))
+    return None
 
 
 class ClientError(Exception):
@@ -35,9 +59,58 @@ class ClientError(Exception):
 
 
 class RequestError(ClientError):
-    def __init__(self, status=None):
-        self.status = status
-        super().__init__("Coordinator request failed" + (f" (HTTP {status})." if status else "."))
+    def __init__(self, status=None, *, category=None, endpoint=None, coordinator_code=None,
+                 duration_ms=None):
+        # Only closed-vocabulary diagnostics may cross into logs or the menu.
+        self.status = status if type(status) is int and 100 <= status <= 599 else None
+        self.category = category if isinstance(category, str) and category in _REQUEST_CATEGORIES else (
+            "http-error" if self.status else "transport-error")
+        self.endpoint = endpoint if isinstance(endpoint, str) and endpoint in _REQUEST_ENDPOINTS else None
+        self.coordinator_code = (coordinator_code if isinstance(coordinator_code, str)
+                                 and coordinator_code in _COORDINATOR_CODES else None)
+        self.duration_ms = _duration_ms(duration_ms)
+        details = ([f"HTTP {self.status}"] if self.status else []) + [self.category]
+        if self.coordinator_code:
+            details.append(self.coordinator_code)
+        super().__init__("Coordinator request failed (" + "; ".join(details) + ").")
+
+
+def _transport_category(error):
+    # URLError.reason can be an exception or arbitrary remote text. Inspect types
+    # only; never parse or retain exception strings, which can contain secrets.
+    for _ in range(3):
+        if isinstance(error, urllib.error.URLError):
+            error = error.reason
+        else:
+            break
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, socket.gaierror):
+        return "dns"
+    if isinstance(error, ssl.SSLError):
+        return "tls"
+    if isinstance(error, (ConnectionError, http.client.HTTPException)):
+        return "connection"
+    if isinstance(error, OSError) and error.errno in (
+        errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENOTCONN,
+    ):
+        return "connection"
+    return "transport-error"
+
+
+def _coordinator_code(error):
+    # Error bodies are bounded just like success bodies. Only an exact known
+    # code is retained; messages, headers, URLs and extra JSON are discarded.
+    try:
+        raw = error.read(MAX_RESPONSE + 1)
+        if len(raw) <= MAX_RESPONSE:
+            result = json.loads(raw)
+            code = result.get("error") if isinstance(result, dict) else None
+            if isinstance(code, str) and code in _COORDINATOR_CODES:
+                return code
+    except (OSError, ValueError, http.client.HTTPException):
+        pass
+    return None
 
 
 class PausedError(ClientError):
@@ -89,9 +162,7 @@ class Transport:
         self.opener = urllib.request.build_opener(*handlers)
 
     def post(self, path, body, token=None):
-        if path not in ("/v1/enroll", "/v1/enroll/share", "/v1/link/share", "/v1/assignment", "/v1/accounts/list", "/v1/contributions/start",
-                        "/v1/contributions/complete", "/v1/contributions/status",
-                        "/v1/contributions/cancel"):
+        if not isinstance(path, str) or path not in _REQUEST_ENDPOINTS:
             raise ClientError("Unknown coordinator endpoint.")
         headers = {"Content-Type": "application/json", "Accept": "application/json",
                    "User-Agent": "claude-desktop-swap-pilot/1"}
@@ -100,21 +171,34 @@ class Transport:
         request = urllib.request.Request(
             self.server + path, data=json.dumps(body).encode(), headers=headers, method="POST"
         )
+        started = time.monotonic()
+
+        def failure(category, status=None, coordinator_code=None):
+            return RequestError(status, category=category, endpoint=path,
+                                coordinator_code=coordinator_code,
+                                duration_ms=(time.monotonic() - started) * 1000)
+
         try:
             with self.opener.open(request, timeout=self.timeout) as response:
                 raw = response.read(MAX_RESPONSE + 1)
                 if len(raw) > MAX_RESPONSE:
-                    raise RequestError()
-                result = json.loads(raw)
+                    raise failure("response-too-large")
+                try:
+                    result = json.loads(raw)
+                except ValueError:
+                    raise failure("invalid-json") from None
                 if not isinstance(result, dict):
-                    raise RequestError()
+                    raise failure("invalid-response")
                 return result
         except urllib.error.HTTPError as error:
             status = error.code
-            error.close()
-            raise RequestError(status) from None
-        except (OSError, ValueError, urllib.error.URLError):
-            raise RequestError() from None
+            try:
+                code = _coordinator_code(error)
+            finally:
+                error.close()
+            raise failure("http-error", status, code) from None
+        except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException) as error:
+            raise failure(_transport_category(error)) from None
 
 
 def _private_read(path):
@@ -532,13 +616,33 @@ class Client:
     def list_accounts(self):
         """Read member-visible metadata; never request an assignment or native write."""
         from .catalog import validate_catalog
-        with self.locked():
+
+        def identity(state):
+            return tuple(state.get(key) for key in (
+                "server", "device_id", "allow_loopback_http", "share_server",
+                "share_account_id", "share_team_id",
+            ))
+
+        def context():
+            # State is atomically replaced. Reading it need not wait behind a
+            # sync holding the mutation lock across a coordinator request.
+            # Bracket the separately stored token with identity checks so a
+            # concurrent leave/enroll cannot send its token to the old origin.
+            # Both enrollment paths require absent state before writing a new
+            # token; leave removes the old token before unlinking its state.
             state = self._load()
             if state["state"] in ("revoked", "left"):
                 raise ClientError("This Mac no longer has shared pool access.")
             token = self.native.get_secret(DEVICE_SECRET)
+            current = self._load(optional=True)
+            if (current is None or identity(current) != identity(state)
+                    or current["state"] in ("revoked", "left")):
+                raise ClientError("Pool enrollment changed while loading accounts. Refresh after setup completes.")
             if not _safe_string(token):
                 raise ClientError("The device credential is missing. Repeat setup before viewing the pool.")
+            return current, token
+
+        state, token = context()
         try:
             # Schema 2 preserves an explicitly absent session meter as null.
             # Older menus require numbers; opt in rather than silently changing
@@ -550,23 +654,25 @@ class Client:
             if error.status == 404:
                 raise ClientError("The coordinator is still updating. Refresh the pool shortly.") from None
             if error.status == 401:
+                # Revocation changes state, so it still needs the writer lock.
+                # Reload under it to preserve any intervening sync or setup.
                 with self.locked():
-                    current = self._load()
-                    if (current["device_id"], current["server"]) == (state["device_id"], state["server"]) and current["state"] != "left":
+                    current = self._load(optional=True)
+                    if (current is not None and identity(current) == identity(state)
+                            and current["state"] != "left"
+                            and self.native.get_secret(DEVICE_SECRET) == token):
                         current.update(state="revoked", reason="device_revoked")
                         self._save(current)
                 raise ClientError("This Mac no longer has shared pool access. Check your Claude Share membership.") from None
             raise
         catalog = validate_catalog(value)
-        with self.locked():
-            current = self._load()
-            if ((current["device_id"], current["server"]) != (state["device_id"], state["server"])
-                    or current["state"] in ("revoked", "left")):
-                raise ClientError("Pool enrollment changed while loading accounts. Refresh after setup completes.")
-            # The checkmark describes the credential actually installed on this
-            # Mac, even if a server decision has not yet been committed locally.
-            catalog.update(account_id=current.get("account_id"), client_state=current["state"],
-                           synced_at=current.get("synced_at"), catalog_at=self.clock())
+        current, current_token = context()
+        if identity(current) != identity(state) or current_token != token:
+            raise ClientError("Pool enrollment changed while loading accounts. Refresh after setup completes.")
+        # The checkmark describes the latest committed credential on this Mac,
+        # even if a server decision has not yet been committed locally.
+        catalog.update(account_id=current.get("account_id"), client_state=current["state"],
+                       synced_at=current.get("synced_at"), catalog_at=self.clock())
         return catalog
 
     def resume(self):
@@ -683,33 +789,65 @@ def run(client, *, sleep=time.sleep, jitter=random.uniform):
         return 2
 
 
+def _sync_diagnostic(event, *, started, failures, error=None, retry_in=None):
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "event": event,
+        "duration_ms": _duration_ms((time.monotonic() - started) * 1000),
+        "failed_attempts": failures,
+    }
+    if error is not None:
+        record.update(category="client-error", retry_in_seconds=retry_in)
+        if isinstance(error, RequestError):
+            record["category"] = error.category
+            for key, value in (("endpoint", error.endpoint), ("http_status", error.status),
+                               ("coordinator_code", error.coordinator_code),
+                               ("request_duration_ms", error.duration_ms)):
+                if value is not None:
+                    record[key] = value
+    print(json.dumps(record, sort_keys=True), flush=True)
+
+
 def _run(client, *, sleep, jitter):
     failures = 0
     last_state = None
     while True:
+        started = time.monotonic()
+        failure = None
+        recovered_attempts = 0
         try:
             status = client.sync()
+            recovered_attempts = failures
             failures = 0
             delay = max(5, status.get("next_sync_in", 30))
-        except PausedError:
+        except PausedError as error:
+            _sync_diagnostic("sync-stopped", started=started, failures=failures + 1, error=error)
             status = client.status()
             if status.get("reason") == "keychain_access_required":
                 print("Client paused: Keychain access requires foreground authorization. Run resume and sync --once in Terminal before restarting the service.", flush=True)
             else:
                 print("Client paused. Inspect status and correct the reported condition.", flush=True)
             return 2
-        except ClientError:
+        except ClientError as error:
+            failure = error
             failures += 1
             status = client.status()
             if status["state"] == "revoked":
+                _sync_diagnostic("sync-stopped", started=started, failures=failures, error=error)
                 print("Client stopped: enrollment revoked.", flush=True)
                 return 2
             delay = min(300, 5 * 2 ** min(failures - 1, 6))
+        delay = max(5, min(300, delay * jitter(0.8, 1.2)))
+        if failure is not None:
+            _sync_diagnostic("sync-failed", started=started, failures=failures,
+                             error=failure, retry_in=delay)
+        elif recovered_attempts:
+            _sync_diagnostic("sync-recovered", started=started, failures=recovered_attempts)
         current = (status["state"], status.get("reason"))
         if current != last_state:
             print("Client state: " + status["state"] + ".", flush=True)
             last_state = current
-        sleep(max(5, min(300, delay * jitter(0.8, 1.2))))
+        sleep(delay)
 
 
 def main(argv=None):

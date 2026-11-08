@@ -24,10 +24,15 @@ not switched. The selected account remains assigned until automatic quota
 failover is needed; the configured threshold still applies.
 
 Unavailable accounts cannot be selected. If the pool refresh fails, prior rows
-remain visible with a stale-data message and selection is disabled. Paused sync,
+remain visible with a refresh-failed message and selection is disabled. Their
+quota is labeled stale only when its timestamp is older than five minutes,
+invalid, or explicitly stale on the coordinator. Paused sync,
 a manual Claude login, or an interrupted credential write requires recovery;
 the menu does not overwrite those conditions. A busy background sync returns a
 short retry message instead of queuing another native writer indefinitely.
+With a13, reading the catalog does not wait for that writer's lock. The reader
+checks enrollment identity before and after the request and uses the latest
+committed account for its checkmark.
 
 Native inference continues directly to Anthropic. Switching does not restart
 Desktop, replace its profile, retry a failed request, or change credentials
@@ -87,3 +92,20 @@ request passwords. Read [Keychain recovery](keychain-access.md) when needed.
 Long or interrupted operations retain the client's write journal or contribution
 receipt; check status before retrying. **Quit Menu Bar** closes only the menu,
 leaving the independent automatic sync service running.
+
+## Loading diagnostics
+
+Client a13 records timestamped background failure and recovery events in
+`~/.config/claude-desktop-swap/agent.log`. Request diagnostics use fixed categories
+such as timeout, DNS, TLS, connection, or HTTP error, plus numeric status and
+duration where available. Only recognized coordinator error codes are retained.
+
+The menu keeps its latest 64 loading events in the private
+`~/.config/claude-desktop-swap/menu-diagnostics.json` file. Initial loading,
+recovery, and failures are recorded as timestamps and fixed categories. Neither
+diagnostic stream records authorization codes, tokens, headers, request bodies,
+provider responses, account addresses, or conversation content.
+
+These records distinguish a failed catalog request from stale quota or a stopped
+background service. A successful catalog load alone does not establish that an
+existing Claude conversation has received the latest credential.

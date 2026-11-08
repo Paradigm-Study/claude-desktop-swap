@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -61,6 +62,139 @@ class PoolMenuTests(unittest.TestCase):
         self.transport.next = catalog()
         self.transport.next["account_id"] = "account-b"
         self.assertEqual(dispatch({"action": "list"}, self.client)["account_id"], "account-a")
+
+    def test_catalog_loads_while_background_sync_holds_mutation_lock(self):
+        self.client.lock_timeout = 0.02
+        self.transport.next = catalog()
+        before, writes = self.client.config.read_bytes(), len(self.native.writes)
+        started = time.monotonic()
+        with _lock(self.client.config):
+            result = dispatch({"action": "list"}, self.client)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(result["account_id"], "account-a")
+        self.assertEqual(len(result["accounts"]), 2)
+        self.assertEqual(before, self.client.config.read_bytes())
+        self.assertEqual(writes, len(self.native.writes))
+
+    def test_catalog_rechecks_identity_before_sending_separately_read_device_token(self):
+        calls, writes = len(self.transport.calls), len(self.native.writes)
+        replacement = self.client._load()
+        replacement.update(server="https://replacement.example.invalid", device_id="device-new")
+
+        def changed_token(_name):
+            self.client._save(replacement)
+            return "fixture-new-device-token"
+
+        with patch.object(self.native, "get_secret", side_effect=changed_token):
+            with self.assertRaisesRegex(ClientError, "enrollment changed"):
+                dispatch({"action": "list"}, self.client)
+        self.assertEqual(len(self.transport.calls), calls)
+        self.assertEqual(writes, len(self.native.writes))
+        self.assertEqual(self.client._load(), replacement)
+
+    def test_catalog_cannot_send_new_token_to_old_origin_during_reenrollment(self):
+        token_read_started, new_token_written, finish_enrollment = (
+            threading.Event(), threading.Event(), threading.Event())
+        failures = []
+        get_secret, set_secret = self.native.get_secret, self.native.set_secret
+        replacement = Client(self.client.config, native=self.native, transport=FakeTransport(),
+                             preflight=lambda: None)
+
+        def read_during_enrollment(name):
+            token_read_started.set()
+            if not new_token_written.wait(2):
+                raise AssertionError("Replacement enrollment did not reach its token write")
+            return get_secret(name)
+
+        def pause_after_token_write(name, value):
+            set_secret(name, value)
+            new_token_written.set()
+            if not finish_enrollment.wait(2):
+                raise AssertionError("Reader did not finish while enrollment was paused")
+
+        def reenroll():
+            try:
+                if not token_read_started.wait(2):
+                    raise AssertionError("Reader did not snapshot the old enrollment")
+                replacement.leave(restore=True)
+                replacement.enroll("https://replacement.example.invalid", "New Mac", "new invite")
+            except BaseException as error:
+                failures.append(error)
+
+        calls = len(self.transport.calls)
+        with patch.object(self.native, "get_secret", side_effect=read_during_enrollment), \
+                patch.object(self.native, "set_secret", side_effect=pause_after_token_write), \
+                patch.object(replacement.transport, "post", return_value={
+                    "device_id": "device-new", "device_token": "fixture-new-device-token"}):
+            writer = threading.Thread(target=reenroll, daemon=True)
+            writer.start()
+            try:
+                with self.assertRaisesRegex(ClientError, "enrollment changed"):
+                    dispatch({"action": "list"}, self.client)
+                self.assertEqual(get_secret(DEVICE_SECRET), "fixture-new-device-token")
+                self.assertFalse(self.client.config.exists())
+                self.assertEqual(len(self.transport.calls), calls)
+            finally:
+                finish_enrollment.set()
+                writer.join(2)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(self.client._load()["server"], "https://replacement.example.invalid")
+
+    def test_catalog_rejects_response_after_enrollment_or_access_changes(self):
+        before = self.client._load()
+        writes = len(self.native.writes)
+        changes = [
+            {"device_id": "device-new"}, {"server": "https://replacement.example.invalid"},
+            {"share_account_id": "member-new"}, {"share_team_id": "team-new"},
+            {"state": "revoked"}, {"state": "left"}, None,
+        ]
+        for change in changes:
+            with self.subTest(change=change):
+                self.client._save(before)
+
+                def changed_response(*_args, **_kwargs):
+                    if change is None:
+                        self.client.config.unlink()
+                    else:
+                        self.client._save({**before, **change})
+                    return catalog()
+
+                with patch.object(self.transport, "post", side_effect=changed_response):
+                    with self.assertRaises(ClientError):
+                        dispatch({"action": "list"}, self.client)
+                self.assertEqual(self.client._load(optional=True),
+                                 None if change is None else {**before, **change})
+                self.assertEqual(writes, len(self.native.writes))
+
+    def test_catalog_rejects_response_after_device_token_changes(self):
+        before, writes = self.client.config.read_bytes(), len(self.native.writes)
+
+        def changed_response(*_args, **_kwargs):
+            self.native.secrets[DEVICE_SECRET] = "fixture-replacement-device-token"
+            return catalog()
+
+        with patch.object(self.transport, "post", side_effect=changed_response):
+            with self.assertRaisesRegex(ClientError, "enrollment changed"):
+                dispatch({"action": "list"}, self.client)
+        self.assertEqual(before, self.client.config.read_bytes())
+        self.assertEqual(writes, len(self.native.writes))
+
+    def test_catalog_uses_intervening_sync_commit_without_overwriting_it(self):
+        current = self.client._load()
+        current.update(account_id="account-b", synced_at=1001, generation=2)
+        writes = len(self.native.writes)
+
+        def synced_response(*_args, **_kwargs):
+            self.client._save(current)
+            return catalog()
+
+        with patch.object(self.transport, "post", side_effect=synced_response):
+            result = dispatch({"action": "list"}, self.client)
+        self.assertEqual(result["account_id"], "account-b")
+        self.assertEqual(result["synced_at"], 1001)
+        self.assertEqual(self.client._load(), current)
+        self.assertEqual(writes, len(self.native.writes))
 
     def test_catalog_accepts_provider_legacy_and_named_model_quotas(self):
         value = catalog()
@@ -130,6 +264,49 @@ class PoolMenuTests(unittest.TestCase):
         self.assertEqual(self.client._load()["state"], "revoked")
         self.assertNotIn("accounts", result)
         self.assertNotIn(DEVICE_TOKEN, raw)
+
+    def test_listing_old_revocation_cannot_invalidate_replacement_enrollment(self):
+        before = self.client._load()
+        writes = len(self.native.writes)
+        for change in ({"device_id": "device-new"}, {"share_account_id": "member-new"},
+                       {"share_team_id": "team-new"}, {"state": "left"}, {}, None):
+            with self.subTest(change=change):
+                self.client._save(before)
+                self.native.secrets[DEVICE_SECRET] = DEVICE_TOKEN
+
+                def rejected_response(*_args, **_kwargs):
+                    if change is None:
+                        self.client.config.unlink()
+                    elif change:
+                        self.client._save({**before, **change})
+                    else:
+                        self.native.secrets[DEVICE_SECRET] = "fixture-replacement-device-token"
+                    raise RequestError(401)
+
+                with patch.object(self.transport, "post", side_effect=rejected_response):
+                    code, result, raw = self.run_bridge({"action": "list"})
+                self.assertEqual(code, 1)
+                self.assertNotIn("accounts", result)
+                self.assertNotIn(DEVICE_TOKEN, raw)
+                self.assertEqual(self.client._load(optional=True),
+                                 None if change is None else {**before, **change})
+                self.assertEqual(writes, len(self.native.writes))
+
+    def test_listing_revocation_preserves_concurrent_committed_sync_metadata(self):
+        current = self.client._load()
+        current.update(account_id="account-b", synced_at=1001, generation=2)
+        writes = len(self.native.writes)
+
+        def rejected_response(*_args, **_kwargs):
+            self.client._save(current)
+            raise RequestError(401)
+
+        with patch.object(self.transport, "post", side_effect=rejected_response):
+            code, result, _ = self.run_bridge({"action": "list"})
+        self.assertEqual(code, 1)
+        self.assertNotIn("accounts", result)
+        self.assertEqual(self.client._load(), {**current, "state": "revoked", "reason": "device_revoked"})
+        self.assertEqual(writes, len(self.native.writes))
 
     def test_listing_deployment_delay_does_not_pause_or_overwrite_native(self):
         self.transport.error = RequestError(404)

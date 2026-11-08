@@ -177,11 +177,18 @@ if command == "format" {
     precondition(quotaSummary(["five_hour": 100, "seven_day": 100], stale: true).hasSuffix("stale"))
     precondition(!quotaSummary(absentMeter, stale: false).contains("0%"))
     let quotaNow = Date(timeIntervalSince1970: 1000)
-    precondition(quotaIsStale(["usage": absentMeter, "fetched": 699, "reason": "quarantined"], catalogFailed: false, now: quotaNow))
-    precondition(quotaIsStale(["usage": absentMeter, "fetched": 1001], catalogFailed: false, now: quotaNow))
-    precondition(quotaIsStale(["usage": absentMeter], catalogFailed: false, now: quotaNow))
-    precondition(!quotaIsStale(["usage": absentMeter, "fetched": 999], catalogFailed: false, now: quotaNow))
-    precondition(quotaIsStale(["usage": absentMeter, "fetched": 999], catalogFailed: true, now: quotaNow))
+    precondition(quotaIsStale(["usage": absentMeter, "fetched": 699, "reason": "quarantined"], now: quotaNow))
+    precondition(quotaIsStale(["usage": absentMeter, "fetched": 1001], now: quotaNow))
+    precondition(quotaIsStale(["usage": absentMeter], now: quotaNow))
+    precondition(!quotaIsStale(["usage": absentMeter, "fetched": 999], now: quotaNow))
+    // Losing the catalog connection does not invalidate a recently fetched quota.
+    let cachedAccount: [String: Any] = ["usage": absentMeter, "fetched": 999]
+    precondition(!quotaIsStale(cachedAccount, now: quotaNow))
+    precondition(!catalogControlsEnabled(bridgeBusy: false, catalogFailed: true))
+    precondition(quotaIsStale(cachedAccount, now: quotaNow.addingTimeInterval(300)))
+    precondition(quotaIsStale(["usage": absentMeter, "fetched": 999, "reason": "quota-stale"], now: quotaNow))
+    precondition(catalogControlsEnabled(bridgeBusy: false, catalogFailed: false))
+    precondition(!catalogControlsEnabled(bridgeBusy: true, catalogFailed: false))
     precondition(helperTimeout(for: "list") == 120)
     precondition(helperTimeout(for: "switch") == 240)
     precondition(helperTimeout(for: "contribute-complete") == 240)
@@ -190,6 +197,13 @@ if command == "format" {
     precondition(claudeAuthorizationURL("https://evil.test@claude.com/cai/oauth/authorize") == nil)
     precondition(claudeAuthorizationURL("https://claude.com/cai/oauth/authorize#fragment") == nil)
     print("format-ok")
+} else if command == "diagnostics" {
+    let directory = URL(fileURLWithPath: CommandLine.arguments[2])
+    for n in 1...70 {
+        recordMenuDiagnostic(n == 70 ? .recovered : .timeout,
+                             now: Date(timeIntervalSince1970: Double(n)), directory: directory)
+    }
+    print("diagnostics-ok")
 } else if command == "recovery" {
     let target = "quarantined-account"
     for state in ["pending", "submitted", "exchanging", "uncertain", "cancelled", "failed", "expired", "recovered"] {
@@ -254,7 +268,13 @@ if command == "format" {
                                 configurationURL: URL(fileURLWithPath: CommandLine.arguments[2]),
                                 timeout: command == "timeout" ? 0.2 : 5)
         print(String(data: try JSONSerialization.data(withJSONObject: result), encoding: .utf8)!)
-    } catch let failure as BridgeFailure { print("ERROR: " + failure.message) }
+    } catch let failure as BridgeFailure {
+        if command == "diagnostic-request" {
+            recordMenuDiagnostic(failure.diagnostic,
+                directory: URL(fileURLWithPath: CommandLine.arguments[2]).deletingLastPathComponent())
+            print("diagnostic-recorded")
+        } else { print("ERROR: " + failure.message) }
+    }
       catch { print("ERROR: unexpected helper failure") }
 }
 '''
@@ -284,6 +304,45 @@ if command == "format" {
     def test_quota_format_and_official_authorization_origin(self):
         result = subprocess.run([str(self.binary), "format"], capture_output=True, text=True, check=True)
         self.assertEqual(result.stdout.strip(), "format-ok")
+
+    def test_catalog_diagnostics_are_private_bounded_and_record_recovery(self):
+        result = subprocess.run([str(self.binary), "diagnostics", str(self.work)],
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.strip(), "diagnostics-ok")
+        path = self.work / "menu-diagnostics.json"
+        entries = json.loads(path.read_text())
+        self.assertEqual(len(entries), 64)
+        self.assertEqual(entries[0], {"at": 7, "category": "timeout"})
+        self.assertEqual(entries[-1], {"at": 70, "category": "recovered"})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertLess(path.stat().st_size, 16_384)
+
+    def test_catalog_diagnostics_refuse_link_and_shared_directory(self):
+        target = self.work / "unrelated"
+        target.write_text("preserve")
+        path = self.work / "menu-diagnostics.json"
+        path.symlink_to(target)
+        subprocess.run([str(self.binary), "diagnostics", str(self.work)], check=True, capture_output=True)
+        self.assertEqual(target.read_text(), "preserve")
+        self.assertTrue(path.is_symlink())
+        path.unlink()
+        self.work.chmod(0o755)
+        subprocess.run([str(self.binary), "diagnostics", str(self.work)], check=True, capture_output=True)
+        self.assertFalse(path.exists())
+
+    def test_catalog_failure_diagnostics_never_store_helper_error_or_unknown_kind(self):
+        for kind, expected in [("dns", "dns"), ("private-token-value", "helper-request-failed"),
+                               ("loaded", "helper-request-failed"), (None, "helper-request-failed")]:
+            with self.subTest(kind=kind):
+                result = self.run_helper("print(json.dumps({'ok':False,"
+                    "'error':'private authorization code must not be logged',"
+                    "'error_kind':" + repr(kind) + "}))\nsys.exit(1)\n", command="diagnostic-request")
+                self.assertEqual(result, "diagnostic-recorded")
+                path = self.work / "menu-diagnostics.json"
+                entries = json.loads(path.read_text())
+                self.assertEqual(entries[-1]["category"], expected)
+                self.assertEqual(set(entries[-1]), {"at", "category"})
+                self.assertNotIn("private", path.read_text())
 
     def test_helper_receives_code_only_on_stdin_and_reply_is_decoded(self):
         result = self.run_helper("request = json.load(sys.stdin)\n"

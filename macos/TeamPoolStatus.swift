@@ -126,6 +126,76 @@ private func readStatus(statePath: URL = stateURL, runningOverride: Bool? = nil)
 
 private struct BridgeFailure: Error {
     let message: String
+    var diagnostic: MenuDiagnosticKind = .helperRequestFailed
+}
+
+// Only these fixed categories are persisted. Helper messages, response bodies,
+// account metadata, and authorization requests never enter this file.
+private enum MenuDiagnosticKind: String, Codable {
+    case loaded
+    case recovered
+    case bootstrapError = "bootstrap-error"
+    case helperStartFailed = "helper-start-failed"
+    case helperRequestFailed = "helper-request-failed"
+    case helperTimeout = "helper-timeout"
+    case helperResponseInvalid = "invalid-helper-response"
+    case helperResponseOversized = "oversized-helper-response"
+    case httpError = "http-error"
+    case timeout
+    case dns
+    case tls
+    case connection
+    case invalidJSON = "invalid-json"
+    case invalidResponse = "invalid-response"
+    case responseTooLarge = "response-too-large"
+    case transportError = "transport-error"
+    case clientError = "client-error"
+    case keychainAccess = "keychain-access"
+    case helperError = "helper-error"
+}
+
+private func helperDiagnosticKind(_ value: Any?) -> MenuDiagnosticKind {
+    guard let value = value as? String,
+          ["http-error", "timeout", "dns", "tls", "connection", "invalid-json", "invalid-response",
+           "response-too-large", "transport-error", "client-error", "keychain-access", "helper-error"].contains(value)
+    else { return .helperRequestFailed }
+    return MenuDiagnosticKind(rawValue: value) ?? .helperRequestFailed
+}
+
+private struct MenuDiagnosticEvent: Codable {
+    let at: Double
+    let category: MenuDiagnosticKind
+}
+
+private func recordMenuDiagnostic(_ category: MenuDiagnosticKind, now: Date = Date(),
+                                  directory: URL = stateURL.deletingLastPathComponent()) {
+    // The existing private client directory owns this small rolling history.
+    // Refuse links, shared files, and unexpected ownership rather than repairing
+    // their permissions. A logging failure must not prevent pool access.
+    let directoryFD = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard directoryFD >= 0 else { return }
+    defer { close(directoryFD) }
+    var directoryStat = stat()
+    guard fstat(directoryFD, &directoryStat) == 0, directoryStat.st_uid == getuid(),
+          directoryStat.st_mode & 0o077 == 0 else { return }
+    let fd = openat(directoryFD, "menu-diagnostics.json", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+    guard fd >= 0 else { return }
+    defer { close(fd) }
+    var fileStat = stat()
+    guard fstat(fd, &fileStat) == 0, fileStat.st_uid == getuid(),
+          fileStat.st_mode & S_IFMT == S_IFREG, fileStat.st_mode & 0o077 == 0,
+          fileStat.st_nlink == 1, fileStat.st_size <= 16_384 else { return }
+    var bytes = [UInt8](repeating: 0, count: Int(fileStat.st_size))
+    let count = bytes.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+    guard count == bytes.count else { return }
+    var events = (try? JSONDecoder().decode([MenuDiagnosticEvent].self, from: Data(bytes))) ?? []
+    events = Array(events.filter { $0.at.isFinite && $0.at > 0 }.suffix(63))
+    let at = now.timeIntervalSince1970
+    guard at.isFinite, at > 0 else { return }
+    events.append(MenuDiagnosticEvent(at: at, category: category))
+    guard let data = try? JSONEncoder().encode(events), data.count <= 16_384,
+          lseek(fd, 0, SEEK_SET) == 0, ftruncate(fd, 0) == 0 else { return }
+    _ = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
 }
 
 // Pipes are drained on a dedicated queue so a helper cannot block waiting for the
@@ -146,14 +216,14 @@ private final class BoundedOutput: @unchecked Sendable {
     func result() throws -> Data {
         lock.lock()
         defer { lock.unlock() }
-        if overflow { throw BridgeFailure(message: "Pool response exceeded the supported size.") }
+        if overflow { throw BridgeFailure(message: "Pool response exceeded the supported size.", diagnostic: .helperResponseOversized) }
         return bytes
     }
 }
 
 private func helperConfiguration(configurationURL: URL? = nil) throws -> String {
     guard let url = configurationURL ?? Bundle.main.url(forResource: "helper", withExtension: "json") else {
-        throw BridgeFailure(message: "Update Claude Swap with the setup command to enable pool controls.")
+        throw BridgeFailure(message: "Update Claude Swap with the setup command to enable pool controls.", diagnostic: .bootstrapError)
     }
     let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
     guard attributes[.type] as? FileAttributeType == .typeRegular,
@@ -167,7 +237,7 @@ private func helperConfiguration(configurationURL: URL? = nil) throws -> String 
           let python = value["python"] as? String,
           python.hasPrefix("/"), !python.contains("\0"),
           FileManager.default.isExecutableFile(atPath: python) else {
-        throw BridgeFailure(message: "The installed pool helper needs repair. Run the setup command again.")
+        throw BridgeFailure(message: "The installed pool helper needs repair. Run the setup command again.", diagnostic: .bootstrapError)
     }
     return python
 }
@@ -180,7 +250,11 @@ private func helperTimeout(for action: String?) -> TimeInterval {
 
 private func bridge(_ request: [String: Any], configurationURL: URL? = nil,
                     timeout: TimeInterval? = nil) throws -> [String: Any] {
-    let python = try helperConfiguration(configurationURL: configurationURL)
+    let python: String
+    do { python = try helperConfiguration(configurationURL: configurationURL) }
+    catch {
+        throw BridgeFailure(message: "The installed pool helper needs repair. Run the setup command again.", diagnostic: .bootstrapError)
+    }
     var input = try JSONSerialization.data(withJSONObject: request)
     input.append(0x0a)
     guard input.count <= 16_384 else { throw BridgeFailure(message: "The request is too large.") }
@@ -200,7 +274,8 @@ private func bridge(_ request: [String: Any], configurationURL: URL? = nil,
     environment.removeValue(forKey: "ANTHROPIC_BASE_URL")
     task.environment = environment
     task.terminationHandler = { _ in exited.signal() }
-    try task.run()
+    do { try task.run() }
+    catch { throw BridgeFailure(message: "The pool helper could not run. Run the setup command again.", diagnostic: .helperStartFailed) }
     defer {
         try? stdin.fileHandleForWriting.close()
         try? stdout.fileHandleForReading.close()
@@ -224,21 +299,22 @@ private func bridge(_ request: [String: Any], configurationURL: URL? = nil,
     if exited.wait(timeout: .now() + (timeout ?? helperTimeout(for: request["action"] as? String))) == .timedOut {
         task.terminate()
         if exited.wait(timeout: .now() + 2) == .timedOut { kill(task.processIdentifier, SIGKILL) }
-        throw BridgeFailure(message: "The pool request timed out. Refresh status before retrying. An interrupted sign-in update may need recovery; do not resubmit an authorization code.")
+        throw BridgeFailure(message: "The pool request timed out. Refresh status before retrying. An interrupted sign-in update may need recovery; do not resubmit an authorization code.", diagnostic: .helperTimeout)
     }
     guard drained.wait(timeout: .now() + 2) == .success else {
-        throw BridgeFailure(message: "The pool helper did not finish its response.")
+        throw BridgeFailure(message: "The pool helper did not finish its response.", diagnostic: .helperResponseInvalid)
     }
     let output = try buffer.result()
     guard let reply = try? JSONSerialization.jsonObject(with: output) as? [String: Any],
           let ok = reply["ok"] as? Bool else {
-        throw BridgeFailure(message: "The pool helper returned an unreadable response. Run setup again if this continues.")
+        throw BridgeFailure(message: "The pool helper returned an unreadable response. Run setup again if this continues.", diagnostic: .helperResponseInvalid)
     }
     guard ok, task.terminationStatus == 0 else {
-        throw BridgeFailure(message: safeLabel(reply["error"]) ?? "The pool request did not complete.")
+        throw BridgeFailure(message: safeLabel(reply["error"]) ?? "The pool request did not complete.",
+                            diagnostic: helperDiagnosticKind(reply["error_kind"]))
     }
     guard let result = reply["result"] as? [String: Any] else {
-        throw BridgeFailure(message: "The pool helper returned an incomplete response.")
+        throw BridgeFailure(message: "The pool helper returned an incomplete response.", diagnostic: .helperResponseInvalid)
     }
     return result
 }
@@ -272,12 +348,18 @@ private func quotaSummary(_ usage: [String: Any], stale: Bool) -> String {
     return stale ? "\(summary)  ·  stale" : summary
 }
 
-private func quotaIsStale(_ account: [String: Any], catalogFailed: Bool, now: Date = Date()) -> Bool {
+private func quotaIsStale(_ account: [String: Any], now: Date = Date()) -> Bool {
     guard account["usage"] is [String: Any] else { return false }
-    if catalogFailed || account["reason"] as? String == "quota-stale" { return true }
+    // A failed catalog request changes connection status, not the age of the
+    // last known quota. Its original timestamp continues to age normally.
+    if account["reason"] as? String == "quota-stale" { return true }
     guard let fetched = timestamp(account["fetched"]) else { return true }
     let age = now.timeIntervalSince(fetched)
     return age < 0 || age > 300
+}
+
+private func catalogControlsEnabled(bridgeBusy: Bool, catalogFailed: Bool) -> Bool {
+    !bridgeBusy && !catalogFailed
 }
 
 private func claudeAuthorizationURL(_ raw: Any?) -> URL? {
@@ -415,8 +497,14 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         request("list", progress: "Refreshing shared pool…") { [weak self] result in
             guard let self = self else { return }
             switch result {
-            case .success(let value): self.catalog = value; self.catalogError = nil
-            case .failure(let error): self.catalogError = self.message(error)
+            case .success(let value):
+                if self.catalogError != nil { recordMenuDiagnostic(.recovered) }
+                else if self.catalog == nil { recordMenuDiagnostic(.loaded) }
+                self.catalog = value
+                self.catalogError = nil
+            case .failure(let error):
+                recordMenuDiagnostic((error as? BridgeFailure)?.diagnostic ?? .helperStartFailed)
+                self.catalogError = self.message(error)
             }
         }
     }
@@ -463,6 +551,7 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if let catalog = catalog, let accounts = catalog["accounts"] as? [[String: Any]] {
             let selected = current.accountID
+            let controlsEnabled = catalogControlsEnabled(bridgeBusy: bridgeBusy, catalogFailed: catalogError != nil)
             line("Shared accounts · % used")
             if accounts.isEmpty { line("No accounts in the pool yet") }
             for account in accounts {
@@ -473,7 +562,7 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let eligible = account["eligible"] as? Bool == true
                 let isCurrent = id == selected
                 let reason = account["reason"] as? String
-                let staleUsage = quotaIsStale(account, catalogFailed: catalogError != nil)
+                let staleUsage = quotaIsStale(account)
                 let available = eligible ? "Available" : availabilityReasons[reason ?? ""] ?? "Currently unavailable"
                 let row = NSMenuItem(title: "\(email)  ·  \(quotaSummary(usage, stale: staleUsage))",
                                      action: nil, keyEquivalent: "")
@@ -498,11 +587,11 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 detail.addItem(.separator())
                 action(isCurrent ? "Assigned to this Mac" : "Switch This Mac to This Account",
-                       #selector(switchAccount(_:)), enabled: current.canSwitch && eligible && !isCurrent && !bridgeBusy && catalogError == nil,
+                       #selector(switchAccount(_:)), enabled: current.canSwitch && eligible && !isCurrent && controlsEnabled,
                        value: id, in: detail)
                 if reason == "quarantined" {
                     action("Reconnect Account…", #selector(reconnectAccount(_:)),
-                           enabled: !bridgeBusy && !enteringCode && catalogError == nil
+                           enabled: controlsEnabled && !enteringCode
                                && canBeginRecovery(id, receipt: contribution),
                            value: ["account_id": id, "email": email], in: detail)
                 }

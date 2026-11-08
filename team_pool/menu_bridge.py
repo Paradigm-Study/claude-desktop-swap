@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 
-from .client import Client, ClientError, SERVICE
+from .client import Client, ClientError, RequestError, SERVICE
 from .catalog import identifier
 from .contribute import Contribution
 from .native import NativeStoreError
@@ -70,13 +70,15 @@ def main(*, input_stream=None, output_stream=None, factory=lambda: Client(lock_t
             raise ClientError("The menu request could not be read; no account was changed.") from None
         result = dispatch(request, factory())
         reply = {"ok": True, "result": result}
+    except RequestError as error:
+        reply = {"ok": False, "error": str(error), "error_kind": error.category}
     except ClientError as error:
-        reply = {"ok": False, "error": str(error)}
+        reply = {"ok": False, "error": str(error), "error_kind": "client-error"}
     except NativeStoreError:
-        reply = {"ok": False, "error": "Keychain access needs attention. Run setup in Terminal to approve access; the menu will not repeatedly prompt."}
+        reply = {"ok": False, "error_kind": "keychain-access", "error": "Keychain access needs attention. Run setup in Terminal to approve access; the menu will not repeatedly prompt."}
     except Exception:
         # Provider, backend and OS exceptions may embed request material.
-        reply = {"ok": False, "error": "The menu operation could not complete. Refresh status before retrying; existing recovery state was retained."}
+        reply = {"ok": False, "error_kind": "helper-error", "error": "The menu operation could not complete. Refresh status before retrying; existing recovery state was retained."}
     output_stream.write(json.dumps(reply) + "\n")
     return 0 if reply["ok"] else 1
 
