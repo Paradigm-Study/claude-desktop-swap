@@ -1,6 +1,6 @@
 # Live two-Mac acceptance worksheet
 
-Status: **IN PROGRESS — client 0.1.0a12 active on Mac A; a11 active for a second macOS user on Mac B**.
+Status: **IN PROGRESS — client 0.1.0a13 active on Mac A; a11 last installed for a second macOS user on Mac B**.
 Mac B completed setup in its own GUI Terminal after the directory repair and
 failed SSH attempts. Its native request and background sync passed, and the user
 reported that it works. The second user's original SSH conversation on Mac B
@@ -370,3 +370,43 @@ matching native ownership, and no native refresh token. At that check Mac A
 was assigned to the third recovered account. Recovery repairs shared pool
 credentials; it does not establish future renewal success or resolve the
 separate SSH helper lifecycle limitation.
+
+## November 8: pool loading during background sync
+
+Repeated reports of an unloaded pool outlasted the earlier one-time resyncs.
+At inspection the coordinator and installed helper returned all ten accounts;
+nine had fresh quota and one separately required account recovery after HTTP 401.
+The exact transient failure reported by the user was no longer present and had
+not been retained in the old logs. It cannot be attributed retrospectively.
+
+A reproducible local defect was established: the menu's two-second mutation-lock
+timeout could fail catalog loading while background synchronization held that
+lock across network requests. Release `v0.1.0a13` removes the read path's lock
+dependency. It reads atomically published state, checks enrollment and token
+identity around the request, and displays the latest committed assignment.
+Revocation writes still acquire the mutation lock. A paused leave/re-enroll
+regression verifies that a replacement token cannot be sent to the old origin.
+
+Quota freshness now follows its actual timestamp and coordinator reason instead
+of labeling every cached row stale after any catalog failure. The failure banner
+and disabled selection controls remain. Fixed-category diagnostics retain menu
+loading events and background request failures/recoveries; they exclude tokens,
+authorization codes, messages, URLs, response bodies, and account details.
+This improves evidence for any remaining network or coordinator failure rather
+than claiming all historical failures had the same cause.
+
+Validation: 380 tests completed successfully with one optional dependency skip,
+full Swift compilation, shell syntax checks, and independent read-only review.
+The tagged installer completed on Mac A. Its actual running menu recorded
+`loaded`; the installed helper returned all ten accounts in 0.182 seconds while
+the mutation lock was deliberately held. A normal-speed native Sonnet request
+returned exact OK in 3.81 seconds, and background sync remained active.
+
+Device/token and Share identities, recovery backup, matching native ownership,
+and access-only credentials passed post-install checks. The selected account
+and shared-credential hash differed from the baseline captured earlier in the
+work; their cause was not established, so unchanged connector values and account
+selection are not claimed. Four MCP records were present afterward, and no
+rollback of those live credentials was attempted. Visible menu confirmation is
+pending the user. The coordinator was not redeployed, Claude Desktop was not
+restarted, and Mac B's logged-out GUI service/SSH lifecycle gap remains open.
