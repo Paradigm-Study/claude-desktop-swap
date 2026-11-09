@@ -1,11 +1,13 @@
 # Live two-Mac acceptance worksheet
 
-Status: **IN PROGRESS — client 0.1.0a13 active on Mac A; a11 last installed for a second macOS user on Mac B**.
-Mac B completed setup in its own GUI Terminal after the directory repair and
-failed SSH attempts. Its native request and background sync passed, and the user
-reported that it works. The second user's original SSH conversation on Mac B
-also resumed successfully after the bounded helper repair. Actual menu clicks
-and the remaining lifecycle checks below are still unverified.
+Status: **IN PROGRESS — client 0.1.0a14 active for the SSH user on Mac B; a13 last verified on Mac A**.
+Mac B's a14 upgrade preserved enrollment, native ownership, shared connector
+credentials and existing conversation files. A newly created helper started in
+plain SSH context authenticated and completed a native request through the GUI
+execution service. The user's earlier conversation-continuity confirmation
+predates a14; confirmation after this upgrade and the remaining lifecycle checks
+below are still pending. Older rows retain their historical version-specific
+results; see the a14 record at the end for the replacement SSH mechanism.
 Use only non-sensitive labels such as Account A / Mac B. Do not paste credentials,
 private prompts, account emails, or session identifiers.
 
@@ -410,3 +412,53 @@ selection are not claimed. Four MCP records were present afterward, and no
 rollback of those live credentials was attempted. Visible menu confirmation is
 pending the user. The coordinator was not redeployed, Claude Desktop was not
 restarted, and Mac B's logged-out GUI service/SSH lifecycle gap remains open.
+
+## a14: persistent launcher and SSH execution lifecycle
+
+The November 8, 2026 incident had three demonstrated local causes. The enrolled
+macOS user had logged out, stopping its GUI sync service until the assignment
+expired. A generated managed-preference cache no longer contained the launcher's
+flag. A connector-only fallback file had also appeared. After the user signed
+in, a bounded native repair restored sync; restarting the existing SSH helper in
+GUI audit context restored its Keychain access. The user confirmed that the
+original remote conversation responded. That helper restart was a temporary
+repair, not a persistent lifecycle solution.
+
+Client a14 moves the installer-owned flag to Desktop's persistent local
+configuration library, with journaled migration and restoration. An owned,
+redundant MCP-only fallback can be archived intact after verifying its
+credentials against Keychain. Changed or new connector credentials, ownership
+drift and conflicting policy still stop recovery. Remote bundled Code processes
+now execute through a per-user GUI LaunchAgent; the helper itself remains owned
+by Desktop. The relay carries process I/O and control, never provider credentials.
+See [the SSH contract](ssh-native-mode.md) for the exact login requirement.
+
+The release candidate completed the ordinary setup orchestrator in Mac B's GUI
+context in **7.85 seconds**, including migration, foreground and background sync,
+GUI execution service installation and menu installation. The legacy policy
+file was removed; another user's already-missing legacy cache remained absent
+and did not block the migration. Native credential fingerprint, recovery backup,
+device identity and token, Share identity, all three shared connector records,
+Desktop data-directory identity and conversation-file paths were unchanged.
+The resulting native assignment was active and access-only, with no credential
+fallback file present. Repeating setup completed in **4.98 seconds** and reused
+the same healthy GUI execution service process.
+
+A separate disposable Desktop helper was started from **plain SSH**, without
+moving that helper into GUI context. A child launched through the installed
+wrapper reported `claude.ai / firstParty / max` in **0.35 seconds**. Another
+fresh SSH helper completed a normal-speed Sonnet request with exact `OK`, exit
+zero and one turn in **7.72 seconds**. Only those disposable helpers and their
+probe processes were removed afterward. `doctor --ssh` reported a ready GUI
+bridge and correctly skipped requiring Keychain access from the SSH caller.
+
+Local validation completed **505 Python tests**, with one optional dependency
+skip, plus installer shell syntax and whitespace checks. Independent reviews
+covered credential preservation, migration ownership, recovery interruption,
+relay identity checks and service lifecycle. Regression tests include missing
+other-user generated caches, journals above 1 MiB, rejection before oversized
+writes, MCP fallback races, signal/disconnect cleanup, active-job refusal and a
+lost service-drain reply. These tests do not establish future provider renewal,
+all Desktop updates, logout/login, sleep/wake, menu clicks or quota switching
+within a running conversation. A GUI login is still required; logging out ends
+its services and processes. Coordinator code was unchanged by a14.
