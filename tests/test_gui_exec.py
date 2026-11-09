@@ -184,12 +184,22 @@ class GUIExecTests(unittest.TestCase):
 
     def test_wrong_peer_uid_rejected_before_parse(self):
         self.server.peer_check = lambda _: os.getuid() + 1
-        conn = self.connect()
-        conn.sendall(b"secret-not-a-valid-request")
-        try:
-            self.assertEqual(conn.recv(100), b"")
-        except ConnectionResetError:
-            pass
+        with patch.object(bridge, "_take", wraps=bridge._take) as parse, \
+                patch.object(self.server, "pool_check", wraps=self.server.pool_check) as pool_check, \
+                patch.object(bridge.subprocess, "Popen", wraps=bridge.subprocess.Popen) as spawn:
+            conn = self.connect()
+            try:
+                conn.sendall(b"secret-not-a-valid-request")
+            except (BrokenPipeError, ConnectionResetError):
+                # Peer authentication can close the connection before this write.
+                pass
+            try:
+                self.assertEqual(conn.recv(100), b"")
+            except ConnectionResetError:
+                pass
+            parse.assert_not_called()
+            pool_check.assert_not_called()
+            spawn.assert_not_called()
         self.assertEqual(self.server.active_jobs, 0)
 
     def test_oversized_frame_rejected_without_payload(self):

@@ -416,8 +416,8 @@ restarted, and Mac B's logged-out GUI service/SSH lifecycle gap remains open.
 ## a14: persistent launcher and SSH execution lifecycle
 
 The November 8, 2026 incident had three demonstrated local causes. The enrolled
-macOS user had logged out, stopping its GUI sync service until the assignment
-expired. A generated managed-preference cache no longer contained the launcher's
+macOS user had no active GUI login, so its GUI sync service was absent and the
+assignment had expired. A generated managed-preference cache no longer contained the launcher's
 flag. A connector-only fallback file had also appeared. After the user signed
 in, a bounded native repair restored sync; restarting the existing SSH helper in
 GUI audit context restored its Keychain access. The user confirmed that the
@@ -474,3 +474,10 @@ passed on macOS and Linux, both with and without the optional upstream package,
 and passed the unchanged Cloudflare coordinator checks. A test-only follow-up
 bounds the relay environment fixture's wait and handles failure/EOF explicitly;
 it does not change the released runtime.
+
+A later macOS CI run exposed a test race when peer rejection closed the socket
+before the fixture's first write. The same commit passed in the parallel run.
+The fixture now accepts immediate EOF/reset or broken pipe while separately
+asserting that parsing, pool inspection and process creation were never reached.
+All 20 relay tests and 100 focused race iterations passed locally, including 50
+with an intentionally delayed write. This correction changes tests only.
