@@ -12,3 +12,14 @@ __pycache__/
 .claude/
 .claude-swap-backup/
 local/
+build/
+dist/
+*.egg-info/
+.pilot-state/
+*.sqlite*
+*.pem
+*.key
+*.invite
+node_modules/
+.wrangler/
+.dev.vars*

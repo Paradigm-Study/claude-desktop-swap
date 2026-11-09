@@ -1,0 +1,31 @@
+name = "claude-desktop-pool"
+main = "src/worker.mjs"
+compatibility_date = "2026-10-19"
+workers_dev = true
+preview_urls = false
+
+[observability]
+enabled = false
+
+[vars]
+POOL_SWITCH_THRESHOLD = "98"
+POOL_PUBLIC_URL = "https://claude-desktop-pool.proud-limit-da0a.workers.dev"
+POOL_SHARE_TEAM_ID = "B-pTJOWkq5wl"
+
+[[durable_objects.bindings]]
+name = "POOL"
+class_name = "PoolObject"
+
+[[durable_objects.bindings]]
+name = "SHARE_DIRECTORY"
+class_name = "DirectoryObject"
+script_name = "claude-share"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PoolObject"]
+
+[[ratelimits]]
+name = "ENROLL_LIMIT"
+namespace_id = "72330"
+simple = { limit = 10, period = 60 }
