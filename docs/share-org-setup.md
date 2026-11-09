@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/
 ```
 
 Run it as your ordinary Mac user, without `sudo` in front of the command. The
-installer uses the tested `v0.1.0a14` package and prepares its own Python runtime;
+installer uses the pinned `v0.1.0a15` package and prepares its own Python runtime;
 Git, Python and uv do not need to be installed beforehand. Use that Mac’s
 logged-in desktop Terminal, including when helping through Screen Sharing. An
 SSH shell can lack access to its login Keychain even when the desktop services
@@ -36,8 +36,11 @@ private recovery backup retained.
 macOS may ask for administrator approval. If Keychain asks for **`security` to
 access `Claude Code-credentials`**, choose **Always Allow** for that exact request.
 A one-time Allow does not authorize later background syncs. Setup verifies a real
-background sync before reporting success and pauses on access failures instead
-of repeatedly prompting. See [Keychain recovery](keychain-access.md).
+background sync before reporting success. During later syncs, a15 waits when
+metadata explicitly confirms a locked Keychain and resumes after safe checks
+once it unlocks. Approval failures, timeouts and unknown errors remain paused
+for foreground recovery. A lock or permission change during access can still
+produce a macOS prompt. See [Keychain recovery](keychain-access.md).
 
 After setup, resume an existing local Code conversation and send a normal-speed
 message. The menu bar lists all shared accounts, their 5-hour and weekly usage, and the account assigned to this Mac. Open an available account’s submenu to switch this Mac; automatic quota failover continues. Choose **Add Account to Shared Pool…** to authorize another subscription in the browser, then **Enter Authorization Code…** to finish in its hidden field. See the [menu guide](team-status-menu.md). Fast mode retains
@@ -75,10 +78,14 @@ Run the same command again. It reuses the installed release, preserves the
 existing device token and native recovery backup, and links an existing invite
 enrollment to your Share identity. It refuses a different Share identity,
 manual credential drift, revoked/left enrollment, or an unexplained pause. An
-explicit setup rerun can repair an owned `native_setup_or_policy` pause after
-verifying the original credential fingerprint and recovery backup. Other pauses
-still need their reported condition resolved. A failed installation can be retried with the same
-command; it does not require a second enrollment or invitation token.
+explicit ordinary setup rerun can repair an owned `native_setup_or_policy`,
+`keychain_locked`, or `keychain_access_required` pause after verifying the current
+credential still matches the pool's recorded fingerprint and the recovery backup
+is present. Run it in the enrolled user's desktop Terminal, unlocking Keychain
+and approving the expected access request if needed. Pending writes, credential
+drift and other pauses still need their reported condition resolved. A failed
+installation can be retried with the same command; it does not require a second
+enrollment or invitation token.
 
 The installer stops the personal `cswap` menu service to avoid competing writes.
 If you run `cswap auto` in a Terminal, stop that loop first. Global terminal and
@@ -87,13 +94,13 @@ credential store only and refuses a `CLAUDE_CONFIG_DIR` override or conflicting
 native provider configuration.
 
 The package and runtime stay under
-`~/.local/share/claude-desktop-swap/releases/v0.1.0a14/`. Keep that directory in
+`~/.local/share/claude-desktop-swap/releases/v0.1.0a15/`. Keep that directory in
 place while the service uses it. Setup prints the installed client path; for this
 release, status and contribution commands are:
 
 ```sh
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a14/venv/bin/team-pool-client status
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a14/venv/bin/team-pool-client contribute-account
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a15/venv/bin/team-pool-client status
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a15/venv/bin/team-pool-client contribute-account
 ```
 
 If Share saves its sign-in elsewhere, use the same installer with its account
@@ -105,8 +112,9 @@ curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/
 
 For a local readiness check, pass `--check` instead. It may prepare the downloaded
 runtime, but does not change Claude, enroll, or contact Share. The check requires
-noninteractive access to the current Keychain items; ordinary setup can request
-foreground authorization when needed. Readiness is not a successful enrollment.
+noninteractive access to the current Keychain items and never resumes a paused
+client. Ordinary setup can request foreground authorization and perform the
+guarded repair above. Readiness is not a successful enrollment.
 
 ## Shared Macs and SSH sessions
 
@@ -144,7 +152,7 @@ need a normal restart/retry to use the new launcher.
 For a read-only diagnosis on the remote Mac, run:
 
 ```sh
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a14/venv/bin/team-pool-client doctor --ssh
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a15/venv/bin/team-pool-client doctor --ssh
 ```
 
 The report distinguishes missing GUI login, stopped sync, expired assignment,

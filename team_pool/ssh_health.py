@@ -22,7 +22,7 @@ _LAUNCHCTL_TIMEOUT = 3
 _MAX_LAUNCHCTL_OUTPUT = 64 * 1024
 _STATES = frozenset({"active", "enrolled", "degraded", "paused", "revoked", "left"})
 _REASONS = frozenset({
-    "keychain_access_required", "native_setup_or_policy", "native_credentials_changed",
+    "keychain_access_required", "keychain_locked", "native_setup_or_policy", "native_credentials_changed",
     "native_store_capacity", "partial_native_write", "device_revoked",
     "coordinator_unavailable", "recovery_retained",
 })
@@ -211,6 +211,10 @@ def doctor(client, *, runner=subprocess.run, platform=None, bridge_health=None):
     if client_state in ("revoked", "left"):
         return finish("enrollment_inactive", "This enrollment cannot sync. Follow the enrollment recovery instructions before setting up access again.")
     if client_state == "paused":
+        if reason == "keychain_locked":
+            if checks["sync_service"]["status"] == "running":
+                return finish("keychain_locked", "Unlock this macOS user's login Keychain. The running service will recheck access without prompting and resume only after native ownership and recovery checks pass.", _REMOTE_GUIDANCE)
+            return finish("client_paused", "Unlock this macOS user's login Keychain, then rerun pool setup in Terminal on this Mac's screen to restart synchronization.", _REMOTE_GUIDANCE)
         if reason == "keychain_access_required":
             return finish("client_paused", _KEYCHAIN_GUIDANCE, _REMOTE_GUIDANCE)
         return finish(

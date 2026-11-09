@@ -35,9 +35,24 @@ def access_required_status(error):
 
 
 class KeychainWriteError(RuntimeError):
-    def __init__(self, status):
+    def __init__(self, status, *, reason="access_required"):
         self.status = int(status)
+        # A numeric denial cannot distinguish a lock from rejected access. Only
+        # the native metadata preflight may supply the explicit locked reason.
+        self.reason = "locked" if type(reason) is str and reason == "locked" else "access_required"
         super().__init__(f"Keychain write failed (OSStatus {self.status}).")
+
+
+def access_required_reason(error):
+    """Propagate only our typed classification, never backend exception data.
+
+    In particular, a keyring exception with a numeric denial or a reason-like
+    attribute is insufficient evidence of a lock and still needs foreground
+    authorization. Do not infer a retryable state from an exception chain.
+    """
+    if type(error) is KeychainWriteError and type(error.reason) is str and error.reason == "locked":
+        return "locked"
+    return "access_required"
 
 
 class KeychainInteractionError(RuntimeError):

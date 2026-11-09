@@ -34,6 +34,14 @@ With a13, reading the catalog does not wait for that writer's lock. The reader
 checks enrollment identity before and after the request and uses the latest
 committed account for its checkmark.
 
+With a15, **Waiting for Keychain** means the client confirmed a locked Keychain
+and its background service is still running. Unlock your login Keychain; the
+service checks again without requesting interaction and restores sync only after
+the normal ownership, backup and policy checks pass. Manual switching is blocked
+during that wait. A pending write needing review or a stopped service still shows
+**Automatic switching paused**. Unknown access errors and approval failures also
+remain paused; a successful pool refresh does not resume them.
+
 Native inference continues directly to Anthropic. Switching does not restart
 Desktop, replace its profile, retry a failed request, or change credentials
 already cached by an in-flight turn or subagent. Resume the conversation normally
@@ -87,8 +95,13 @@ The original personal `cswap` menu stays disabled because it would compete for
 the same native credential store. The shared menu calls the existing pool client
 and coordinator rather than becoming a separate account-rotation service.
 
-Keychain failures return instructions for foreground setup and do not repeatedly
-request passwords. Read [Keychain recovery](keychain-access.md) when needed.
+For `keychain_access_required`, or an old pause left after Keychain became
+readable, rerun ordinary [one-command setup](share-org-setup.md) in the enrolled
+user's desktop Terminal. A15 can repair an owned access-required or locked pause
+after verifying the pool's credential fingerprint and recovery backup. Check-only
+setup cannot resume it. Unknown errors and command timeouts do not trigger
+automatic access retries. A concurrent lock or permission change can still
+produce a macOS approval prompt; see [Keychain recovery](keychain-access.md).
 Long or interrupted operations retain the client's write journal or contribution
 receipt; check status before retrying. **Quit Menu Bar** closes only the menu,
 leaving the independent automatic sync service running.

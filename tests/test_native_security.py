@@ -21,7 +21,7 @@ class SecurityCLITests(unittest.TestCase):
     def setUp(self):
         self.runner = Mock(return_value=SimpleNamespace(returncode=0, stdout=b'{"fake":"credential"}\n'))
         self.inspector = Mock()
-        self.inspector.ready.return_value = True
+        self.inspector.access_reason.return_value = None
         self.cli = NativeSecurityCLI(None, runner=self.runner, inspector=self.inspector)
 
     def test_write_uses_only_fixed_process_arguments_and_one_escaped_stdin_command(self):
@@ -42,7 +42,7 @@ class SecurityCLITests(unittest.TestCase):
         self.assertEqual(options["stderr"], subprocess.DEVNULL)
         self.assertEqual(options["timeout"], 15)
         self.assertFalse(options.get("shell", False))
-        self.inspector.ready.assert_called_once_with(SERVICE, "test-user")
+        self.inspector.access_reason.assert_called_once_with(SERVICE, "test-user")
 
     def test_exact_command_bound_accounts_for_json_escaping_and_metadata(self):
         overhead = len(write_command("user", '{"value":""}'))
@@ -63,24 +63,46 @@ class SecurityCLITests(unittest.TestCase):
         self.runner.assert_not_called()
 
     def test_background_denies_unsafe_missing_or_uninspectable_acl_before_cli(self):
-        self.inspector.ready.return_value = False
+        self.inspector.access_reason.return_value = "access_required"
         for operation in (lambda: self.cli.get_password("user", background=True),
                           lambda: self.cli.set_password("user", "{}", background=True),
                           lambda: self.cli.delete_password("user", background=True)):
             with self.assertRaises(KeychainWriteError) as raised:
                 operation()
             self.assertEqual(raised.exception.status, -25308)
-        self.inspector.ready.side_effect = RuntimeError("FAKE_SECRET")
+            self.assertEqual(raised.exception.reason, "access_required")
+        self.inspector.access_reason.side_effect = RuntimeError("FAKE_SECRET")
         with self.assertRaises(KeychainWriteError) as raised:
             self.cli.get_password("user", background=True)
         self.assertNotIn("FAKE_SECRET", str(raised.exception))
+        self.assertEqual(raised.exception.reason, "access_required")
+        self.runner.assert_not_called()
+
+    def test_known_lock_is_classified_before_any_native_cli_operation(self):
+        self.inspector.access_reason.return_value = "locked"
+        for operation in (lambda: self.cli.get_password("user", background=True),
+                          lambda: self.cli.set_password("user", "{}", background=True),
+                          lambda: self.cli.delete_password("user", background=True)):
+            with self.assertRaises(KeychainWriteError) as raised:
+                operation()
+            self.assertEqual(raised.exception.reason, "locked")
+            self.assertEqual(raised.exception.status, -25308)
+        self.runner.assert_not_called()
+
+    def test_unknown_inspection_result_is_not_retryable_or_exposed(self):
+        for reason in ("FAKE_SECRET", False, {}, 1):
+            self.inspector.access_reason.return_value = reason
+            with self.subTest(reason_type=type(reason).__name__), self.assertRaises(KeychainWriteError) as raised:
+                self.cli.get_password("user", background=True)
+            self.assertEqual(raised.exception.reason, "access_required")
+            self.assertNotIn("FAKE_SECRET", str(raised.exception))
         self.runner.assert_not_called()
 
     def test_foreground_can_approve_and_read_preserves_exact_value(self):
         payload = '{"fake":"credential"}\n'
         self.runner.return_value.stdout = payload.encode() + b"\n"
         self.assertEqual(self.cli.get_password("user"), payload)
-        self.inspector.ready.assert_not_called()
+        self.inspector.access_reason.assert_not_called()
         self.assertEqual(self.runner.call_args.kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(self.runner.call_args.kwargs["timeout"], 120)
 
@@ -106,6 +128,7 @@ class SecurityCLITests(unittest.TestCase):
                 with self.assertRaises(KeychainWriteError) as raised:
                     operation()
                 self.assertEqual(raised.exception.status, -25308)
+                self.assertEqual(raised.exception.reason, "access_required")
                 self.assertNotIn("FAKE_SECRET", str(raised.exception))
 
     def test_native_service_never_uses_python_secret_reader_or_writer(self):
@@ -220,13 +243,34 @@ class ACLInspectionTests(unittest.TestCase):
             setattr(self, name, value)
             with self.subTest(name=name):
                 self.assertFalse(self.guard.ready(SERVICE, "user"))
+                expected = "locked" if name == "unlocked" else "access_required"
+                self.assertEqual(self.guard.access_reason(SERVICE, "user"), expected)
                 self.assertFalse(self.owned)
             setattr(self, name, previous)
 
     def test_metadata_failure_is_closed_and_releases_previously_retained_refs(self):
         self.guard.copy_access = lambda reference, destination: -25293
         self.assertFalse(self.guard.ready(SERVICE, "user"))
+        self.assertEqual(self.guard.access_reason(SERVICE, "user"), "access_required")
         self.assertFalse(self.owned)
+
+    def test_lock_status_failure_never_implies_locked_from_zero_output(self):
+        self.guard.keychain_status = lambda keychain, destination: -25308
+        self.assertEqual(self.guard.access_reason(SERVICE, "user"), "access_required")
+        self.assertFalse(self.owned)
+
+    def test_explicit_lock_stops_before_acl_or_secret_process_and_restores_ui_policy(self):
+        self.unlocked = False
+        self.guard.copy_access = Mock(side_effect=AssertionError("ACL read after lock"))
+        runner = Mock()
+        cli = NativeSecurityCLI(self.api, inspector=self.guard, runner=runner)
+        with self.assertRaises(KeychainWriteError) as raised:
+            cli.get_password("user", background=True)
+        self.assertEqual(raised.exception.reason, "locked")
+        runner.assert_not_called()
+        self.guard.copy_access.assert_not_called()
+        self.assertFalse(self.owned)
+        self.assertEqual(self.api.set_user_interaction_allowed.call_args_list[-1].args, (True,))
 
 
 if __name__ == "__main__":

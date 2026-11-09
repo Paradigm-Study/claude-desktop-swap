@@ -140,7 +140,7 @@ def inspect_state(client, *, allow_owned_repair=False):
             raise ClientError("A native write needs recovery. Run team-pool-client status and follow the recovery guide; setup will not overwrite it.")
         repairable = (allow_owned_repair and state.get("managed")
                       and state.get("state") == "paused"
-                      and state.get("reason") == "native_setup_or_policy")
+                      and state.get("reason") in {"native_setup_or_policy", "keychain_access_required", "keychain_locked"})
         if state.get("state") in ("paused", "revoked", "left") and not repairable:
             raise ClientError("The pool client is paused, revoked, or left. Run team-pool-client status and resolve that condition explicitly before setup.")
         if state.get("state") not in ("enrolled", "active", "degraded") and not repairable:

@@ -261,17 +261,58 @@ class NativeStoreTests(unittest.TestCase):
                 with self.assertRaises(NativeKeychainAccessError) as raised:
                     self.store.snapshot()
                 self.assertEqual(raised.exception.status, status)
+                self.assertEqual(raised.exception.reason, "access_required")
                 self.assertNotIn("FAKE_SECRET", str(raised.exception))
             with self.subTest(status=status, operation="write"), \
                     patch.object(self.backend, "set_password", side_effect=KeychainWriteError(status)):
                 with self.assertRaises(NativeKeychainAccessError) as raised:
                     self.store.set_secret("device-token", "FAKE_SECRET_INPUT")
                 self.assertEqual(raised.exception.status, status)
+                self.assertEqual(raised.exception.reason, "access_required")
                 self.assertNotIn("FAKE_SECRET", str(raised.exception))
             with self.subTest(status=status, operation="delete"), \
                     patch.object(self.backend, "delete_password", side_effect=wrapped):
                 with self.assertRaises(NativeKeychainAccessError):
                     self.store._set(NATIVE_SERVICE, "pilot-test", None)
+
+    def test_native_lock_classification_survives_read_and_write_without_backend_data(self):
+        from team_pool.macos_keychain import KeychainWriteError
+        error = KeychainWriteError(-25308, reason="locked")
+        for backend_method, operation in (
+            ("get_password", lambda: self.store._get(NATIVE_SERVICE, "pilot-test")),
+            ("set_password", lambda: self.store._set(NATIVE_SERVICE, "pilot-test", "FAKE_SECRET")),
+            ("delete_password", lambda: self.store._set(NATIVE_SERVICE, "pilot-test", None)),
+        ):
+            with self.subTest(operation=backend_method), patch.object(self.backend, backend_method, side_effect=error):
+                with self.assertRaises(NativeKeychainAccessError) as raised:
+                    operation()
+                self.assertEqual(raised.exception.reason, "locked")
+                self.assertNotIn("FAKE_SECRET", str(raised.exception))
+
+    def test_private_item_denial_and_foreign_error_attributes_cannot_claim_native_lock(self):
+        from team_pool.macos_keychain import KeychainWriteError
+        foreign = RuntimeError(-25308, "FAKE_SECRET")
+        foreign.reason = "locked"
+        cases = ((PILOT_SERVICE, KeychainWriteError(-25308, reason="locked")),
+                 (NATIVE_SERVICE, foreign),
+                 (NATIVE_SERVICE, KeychainWriteError(-25308, reason="FAKE_SECRET")))
+        for service, error in cases:
+            for backend_method, operation in (
+                ("get_password", lambda: self.store._get(service, "pilot-test")),
+                ("set_password", lambda: self.store._set(service, "pilot-test", "FAKE_SECRET")),
+            ):
+                with self.subTest(service=service, operation=backend_method), \
+                        patch.object(self.backend, backend_method, side_effect=error):
+                    with self.assertRaises(NativeKeychainAccessError) as raised:
+                        operation()
+                    self.assertEqual(raised.exception.reason, "access_required")
+                    self.assertNotIn("FAKE_SECRET", str(raised.exception))
+
+    def test_native_access_error_reason_is_closed_and_redacted(self):
+        for reason in ("FAKE_SECRET", {"token": "FAKE_SECRET"}, None):
+            error = NativeKeychainAccessError(-25308, reason=reason)
+            self.assertEqual(error.reason, "access_required")
+            self.assertNotIn("FAKE_SECRET", str(error))
 
     def test_config_failure_rolls_back_immediate_native_change(self):
         with patch.object(self.store, "_write_config", side_effect=OSError("disk full")):

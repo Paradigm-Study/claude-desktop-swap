@@ -39,10 +39,33 @@ discarded to make the command fit. Writes are verified by exact readback.
 
 Background private-item operations disable Keychain interaction. Native operations
 first inspect lock state, partition permissions, and the trusted security tool
-without decrypting the item. An authorization failure or timeout pauses the
-client instead of retrying. The security command has no no-UI flag: a lock or ACL
+without decrypting the item. An authorization failure, unknown error or timeout
+pauses the client instead of retrying. The security command has no no-UI flag: a lock or ACL
 change between preflight and access can still produce a prompt before the timeout
 stops the attempt. This is not a promise that macOS can never request approval.
+
+## Confirmed lock waits in 0.1.0a15
+
+Older clients retained the same access-required pause after a transient failure
+even when Keychain became readable again. That pause blocked both automatic
+sync and manual switching. A15 distinguishes a confirmed lock from an access
+failure: only a successful metadata query explicitly reporting the native item's
+Keychain as locked produces `keychain_locked`. It returns before starting the
+`security` process. A missing item, uninspectable metadata, ACL refusal, numeric
+denial alone or failed command does not establish a lock.
+
+For that confirmed lock, the background service stays running and checks again
+every 30 seconds without requesting Keychain interaction. After unlock it verifies
+the enrollment's native fingerprint, recovery backup, device credential and
+current policy before resuming ordinary sync. A recorded write must be proved
+untouched or fully completed; a partial write, manual sign-in change or conflicting
+policy stays paused. The wait does not retire credential fallback files or bypass
+the normal write guards. It does not unlock Keychain or store its password.
+
+Unknown errors and approval failures remain `keychain_access_required` and need
+explicit foreground recovery. An older persisted access-required pause is not
+automatically reclassified as a lock. A readable catalog or working Claude
+request alone does not clear that pause.
 
 ## Upgrade and recovery
 
@@ -59,8 +82,13 @@ Choose Always Allow only for that expected request. Never paste a Mac password
 into chat or put it in a command argument. The client does not request or store
 the Keychain password, unlock Keychain, or enable access for all applications.
 
-The shared menu bar displays `keychain_access_required` as a paused condition.
-After correcting access, use `resume`, `sync --once`, and restart the service.
+The shared menu bar displays a confirmed lock as **Waiting for Keychain** while
+the background service is running and no write recovery is pending. It displays
+`keychain_access_required` as a paused condition. Rerun ordinary one-command setup
+to update and repair either owned pause after access is restored; setup verifies
+the pool's fingerprint and original recovery backup before resuming. `--check`
+cannot resume or repair a paused client. Alternatively, after correcting access,
+use `resume`, `sync --once`, and restart the service.
 If prompts recur, stop the service and inspect the actual caller and item before
 making further changes. Do not restore the Python native writer from 0.1.0a4.
 
@@ -125,8 +153,10 @@ unsafe files or credential drift are retained for review. This does not solve
 overwriting a manual login. Treat fallback archives as credentials and never
 attach them to support reports.
 
-An explicit setup rerun can repair an owned `native_setup_or_policy` pause after
-these ownership checks. Other pauses require their specific condition to be
-resolved. Read-only status, catalog and `doctor --ssh` checks do not archive files
+An explicit ordinary setup rerun can repair an owned `native_setup_or_policy`,
+`keychain_locked`, or `keychain_access_required` pause after these ownership checks.
+It refuses pending writes, native credential drift, revoked/left enrollment and
+unexplained pauses. Other pauses require their specific condition to be resolved.
+Read-only status, catalog, `--check` and `doctor --ssh` checks do not archive files
 or resume a paused client. See [the SSH contract](ssh-native-mode.md) for the
 execution and recovery boundaries.

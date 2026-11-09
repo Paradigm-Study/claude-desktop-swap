@@ -147,6 +147,17 @@ class SSHHealthTests(unittest.TestCase):
             result = self.diagnose()
             self.assertEqual(result["checks"]["client"]["pause_reason"], "unknown")
 
+    def test_locked_keychain_distinguishes_waiting_service_from_stopped_service(self):
+        self.state.update(state="paused", reason="keychain_locked")
+        self.write_state()
+        result = self.diagnose()
+        self.assertEqual(result["category"], "keychain_locked")
+        self.assertIn("without prompting", " ".join(result["guidance"]))
+        self.service.stdout = b"job = {\n\tstate = not running\n}\n"
+        result = self.diagnose()
+        self.assertEqual(result["category"], "client_paused")
+        self.assertIn("rerun pool setup", " ".join(result["guidance"]))
+
     def test_caller_keychain_failure_is_distinct_from_gui_service_health(self):
         self.native.error = NativeKeychainAccessError(-25308)
         result = self.diagnose()

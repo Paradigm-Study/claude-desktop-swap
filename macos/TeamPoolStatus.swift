@@ -87,13 +87,17 @@ private func readStatus(statePath: URL = stateURL, runningOverride: Bool? = nil)
         "quota_stale": "Waiting for fresh account usage",
         "quota_exhausted": "All available pool accounts have reached the quota threshold",
         "device_revoked": "This Mac’s pool access was revoked",
-        "keychain_access_required": "Keychain approval is needed in Terminal",
+        "keychain_access_required": "Keychain access needs attention; run setup in Terminal",
+        "keychain_locked": "Unlock your login Keychain; sync will recheck access automatically",
         "native_store_capacity": "Native credential data exceeds the supported writer size",
         "recovery_retained": "Pool access ended; local recovery is available",
     ]
     if mode == "revoked" || mode == "left" {
         status.heading = "Shared pool access ended"
         status.detail = details[reason] ?? "Enroll this Mac again to join the pool"
+    } else if mode == "paused" && reason == "keychain_locked" && running && state["pending_write"] == nil {
+        status.heading = "Waiting for Keychain"
+        status.detail = details[reason] ?? "Unlock your login Keychain"
     } else if state["pending_write"] != nil || mode == "paused" {
         status.heading = "Automatic switching paused"
         status.detail = details[reason] ?? "A sign-in update needs attention"
