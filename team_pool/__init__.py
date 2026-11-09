@@ -3,4 +3,4 @@
 Importing this package performs no credential, filesystem, or network access.
 """
 
-__version__ = "0.1.0a1"
+__version__ = "0.1.0a14"

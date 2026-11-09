@@ -13,11 +13,13 @@ import math
 import os
 import plistlib
 import pwd
+import re
 import stat
 import sys
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
@@ -63,6 +65,66 @@ class NativePayloadError(NativePolicyError):
 
 def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+_FALLBACK_LIMIT = 4 * 1024 * 1024
+
+
+def _strict_json(data):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError
+            result[key] = value
+        return result
+
+    def invalid_constant(value):
+        raise ValueError
+
+    try:
+        value = json.loads(data, object_pairs_hook=unique, parse_constant=invalid_constant)
+        if not isinstance(value, dict):
+            raise ValueError
+        return value
+    except (ValueError, TypeError, RecursionError):
+        raise NativePolicyError("Credential fallback recovery contains unsupported JSON; no data was discarded.") from None
+
+
+def _private_blob(path: Path, limit=_FALLBACK_LIMIT, *, durable=False):
+    """Read a bounded owned private regular file without following links."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                    or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1
+                    or before.st_size > limit):
+                raise ValueError
+            data = stream.read(limit + 1)
+            if durable:
+                os.fsync(stream.fileno())
+            after = os.fstat(stream.fileno())
+        current = path.lstat()
+        if (len(data) > limit or _file_identity(before) != _file_identity(after)
+                or _file_identity(before) != _file_identity(current)):
+            raise ValueError
+        return data, before
+    except (OSError, ValueError):
+        raise NativePolicyError("Credential fallback recovery requires an unchanged, owned private regular file.") from None
+
+
+def _file_identity(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            info.st_ctime_ns, info.st_mode, info.st_uid, info.st_nlink)
+
+
+def _sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _regular_json(path: Path) -> dict:
@@ -274,13 +336,16 @@ class NativeStore:
                 "has_credentials": bool(credentials.get("claudeAiOauth")),
                 "has_backup": self._backup() is not None}
 
-    def preflight(self, assignment: dict | None = None):
+    def preflight(self, assignment: dict | None = None, *, allow_redundant_fallback=False):
         if any(self.environ.get(key) for key in AUTH_ENV):
             raise NativePolicyError("Auth/provider/config-directory overrides are unsupported by the native pilot.")
         if self.claude.is_symlink() or self.config.is_symlink():
             raise NativePolicyError("Symlinked native configuration is unsupported by the pilot.")
-        if os.path.lexists(self.claude / ".credentials.json"):
-            raise NativePolicyError("A credential-file fallback exists; resolve it before enrolling.")
+        recovery = self._fallback_journal()
+        if os.path.lexists(self.claude / ".credentials.json") or recovery is not None:
+            if not allow_redundant_fallback:
+                raise NativePolicyError("A credential-file fallback or unfinished recovery exists; resolve it before enrolling.")
+            self._inspect_redundant_fallback(recovery)
         if self._get("Claude Code", self.username) is not None:
             raise NativePolicyError("A native API-key Keychain item exists; use an ordinary subscription configuration.")
         paths = [Path(p) for p in self.policy_paths] + [self.claude / "settings.json"]
@@ -309,6 +374,160 @@ class NativeStore:
                 raise NativePolicyError("The assigned account conflicts with the required organization.")
         if _regular_json(self.config).get("primaryApiKey"):
             raise NativePolicyError("A primary API key is configured.")
+
+    def _fallback_directory(self):
+        return self.claude / ".desktop-swap-fallback"
+
+    def _check_fallback_directory(self, *, create=False):
+        path = self._fallback_directory()
+        try:
+            if create:
+                path.mkdir(mode=0o700, exist_ok=True)
+            info = path.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o700):
+                raise ValueError
+            return info
+        except FileNotFoundError:
+            if not create:
+                return None
+            raise NativePolicyError("Credential fallback archive directory is unavailable.") from None
+        except (OSError, ValueError):
+            raise NativePolicyError("Credential fallback archive requires an owned private directory.") from None
+
+    def _fallback_journal(self):
+        if self._check_fallback_directory() is None:
+            return None
+        path = self._fallback_directory() / "pending.json"
+        if not os.path.lexists(path):
+            return None
+        raw, _ = _private_blob(path, 4096)
+        value = _strict_json(raw)
+        if (set(value) != {"version", "archive", "sha256"} or type(value["version"]) is not int
+                or value["version"] != 1 or not isinstance(value["archive"], str)
+                or not re.fullmatch(r"[a-f0-9]{32}\.json", value["archive"])
+                or not isinstance(value["sha256"], str)
+                or not re.fullmatch(r"[a-f0-9]{64}", value["sha256"])):
+            raise NativePolicyError("Credential fallback recovery journal is invalid; recovery remains paused.")
+        return value
+
+    def _fallback_native(self):
+        raw = self._get(NATIVE_SERVICE, self.username)
+        credentials = _strict_json(raw) if raw is not None else {}
+        return credentials, _regular_json(self.config)
+
+    @staticmethod
+    def _redundant_connectors(raw, credentials):
+        fallback = _strict_json(raw)
+        if set(fallback) != {"mcpOAuth"} or not isinstance(fallback["mcpOAuth"], dict):
+            raise NativePolicyError("Credential fallback contains account or unsupported data; it was retained.")
+        native = credentials.get("mcpOAuth", {})
+        if not isinstance(native, dict):
+            raise NativePolicyError("Native connector data is unsupported; credential fallback was retained.")
+        for name, connector in fallback["mcpOAuth"].items():
+            stored = native.get(name)
+            if (not name or not isinstance(connector, dict) or not isinstance(stored, dict)
+                    or _json({k: v for k, v in connector.items() if k != "discoveryState"})
+                    != _json({k: v for k, v in stored.items() if k != "discoveryState"})):
+                raise NativePolicyError("Credential fallback has new or changed connector sign-ins; it was retained.")
+        return len(fallback["mcpOAuth"])
+
+    def _inspect_redundant_fallback(self, journal):
+        source = self.claude / ".credentials.json"
+        archive = self._fallback_directory() / journal["archive"] if journal else None
+        source_exists = os.path.lexists(source)
+        archive_exists = archive is not None and os.path.lexists(archive)
+        if journal and source_exists == archive_exists:
+            raise NativePolicyError("Credential fallback recovery is ambiguous; all data was retained.")
+        path = archive if archive_exists else source
+        raw, identity = _private_blob(path)
+        if journal and hashlib.sha256(raw).hexdigest() != journal["sha256"]:
+            raise NativePolicyError("Credential fallback changed during recovery; all data was retained.")
+        credentials, _ = self._fallback_native()
+        count = self._redundant_connectors(raw, credentials)
+        return path, raw, identity, count
+
+    def _write_fallback_journal(self, journal):
+        directory = self._fallback_directory()
+        fd, temporary = tempfile.mkstemp(prefix=".pending-", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(_json(journal) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, directory / "pending.json")
+            _sync_directory(directory)
+        finally:
+            if os.path.lexists(temporary):
+                os.unlink(temporary)
+
+    def retire_redundant_fallback(self, expected_fingerprint: str) -> dict:
+        """Archive only duplicate MCP fallback data for an existing managed login.
+
+        Native credentials, configuration, and the enrollment backup are never
+        written. A durable metadata-only journal precedes the rename. Ordinary
+        preflight rejects that journal until the moved bytes and current native
+        connector data have both been verified, including after interruption.
+        Advisory native locks bound this operation just like account activation;
+        conflicting writers leave recovery paused with all data retained.
+        """
+        try:
+            with self._locked() as check:
+                self.preflight(allow_redundant_fallback=True)
+                credentials, config = self._fallback_native()
+                if not expected_fingerprint or self._fingerprint(credentials, config) != expected_fingerprint:
+                    raise NativeDriftError("Native login changed; credential fallback was retained.")
+                backup = self._backup()
+                if backup is None:
+                    raise NativeStoreError("No enrollment backup exists; credential fallback was retained.")
+                journal = self._fallback_journal()
+                source = self.claude / ".credentials.json"
+                if journal is None and not os.path.lexists(source):
+                    return {"status": "absent", "connectors": 0}
+                path, raw, identity, count = self._inspect_redundant_fallback(journal)
+                directory_info = self._check_fallback_directory(create=True)
+                directory = self._fallback_directory()
+                if journal is None:
+                    journal = {"version": 1, "archive": uuid.uuid4().hex + ".json",
+                               "sha256": hashlib.sha256(raw).hexdigest()}
+                    self._write_fallback_journal(journal)
+                archive = directory / journal["archive"]
+
+                def verify_owner():
+                    check()
+                    now, now_config = self._fallback_native()
+                    if (self._fingerprint(now, now_config) != expected_fingerprint
+                            or _json(now) != _json(credentials) or self._backup() != backup):
+                        raise NativeDriftError("Native login or connectors changed during fallback recovery; all data was retained.")
+                    current_directory = self._check_fallback_directory()
+                    if (current_directory is None or current_directory.st_dev != directory_info.st_dev
+                            or current_directory.st_ino != directory_info.st_ino
+                            or self._fallback_journal() != journal):
+                        raise NativePolicyError("Credential fallback recovery changed; all data was retained.")
+
+                verify_owner()
+                unchanged, current_identity = _private_blob(path)
+                if unchanged != raw or _file_identity(current_identity) != _file_identity(identity):
+                    raise NativePolicyError("Credential fallback changed during recovery; all data was retained.")
+                if path == source:
+                    if os.path.lexists(archive):
+                        raise NativePolicyError("Credential fallback archive already exists; all data was retained.")
+                    os.rename(source, archive)
+                    _sync_directory(directory)
+                    _sync_directory(self.claude)
+                verify_owner()
+                archived, _ = _private_blob(archive, durable=True)
+                if archived != raw or hashlib.sha256(archived).hexdigest() != journal["sha256"]:
+                    raise NativePolicyError("Credential fallback archive verification failed; recovery remains paused.")
+                self._redundant_connectors(archived, credentials)
+                if os.path.lexists(source):
+                    raise NativePolicyError("A new credential fallback appeared; all data was retained.")
+                (directory / "pending.json").unlink()
+                _sync_directory(directory)
+                return {"status": "archived", "connectors": count}
+        except OSError:
+            raise NativeStoreError("Credential fallback recovery could not complete; existing data was retained.") from None
 
     @contextmanager
     def _locked(self):

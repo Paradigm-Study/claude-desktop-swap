@@ -12,7 +12,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 from team_pool.client import Client, ClientError, DEVICE_SECRET, SERVICE, service_path
-from team_pool.setup import Setup, TEAM_ID, directory_access_needs_repair, inspect_state, setup_lock, share_membership
+from team_pool.setup import (MAX_LAUNCHER_TRANSACTION_BYTES, Setup, TEAM_ID,
+                             directory_access_needs_repair, inspect_state,
+                             launcher_transaction_pending, setup_lock, share_membership)
 from team_pool.share_enrollment import DEFAULT_SHARE_SERVER
 from team_pool.desktop_profile import DesktopProfileError
 from test_team_client import FakeNative, FakeTransport
@@ -51,6 +53,8 @@ class SetupTests(unittest.TestCase):
                            enroll=self.enroll, installer=self.install,
                            verify_wrapper=self.check_wrapper, output=self.output.append,
                            desktop_preflight=self.desktop_preflight,
+                           gui_installer=Mock(),
+                           pending_launcher_transaction=Mock(return_value=False),
                            access_check=self.access_check,
                            sleep=lambda _: None, clock=lambda: next(self.ticks))
         self.platform = patch("team_pool.setup.sys.platform", "darwin")
@@ -229,6 +233,53 @@ class SetupTests(unittest.TestCase):
                 self.assertEqual(self.client.config.read_bytes(), before)
                 self.assertEqual(self.mutations(), [])
 
+    def test_setup_repairs_owned_policy_pause_without_replacing_enrollment(self):
+        self.active(state="paused", reason="native_setup_or_policy")
+        device = self.client._load()["device_id"]
+        original = copy.deepcopy(self.native.original)
+        secret = self.native.secrets[DEVICE_SECRET]
+        result = self.setup.run()
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(self.client._load()["device_id"], device)
+        self.assertEqual(self.native.original, original)
+        self.assertEqual(self.native.secrets[DEVICE_SECRET], secret)
+        self.assertEqual(self.enroll_calls, [True])
+
+    def test_owned_policy_repair_still_refuses_manual_login_before_disruption(self):
+        self.active(state="paused", reason="native_setup_or_policy")
+        self.native.credentials = {"manual": "fixture-sign-in"}
+        before = self.client.config.read_bytes()
+        with self.assertRaisesRegex(ClientError, "manual login"):
+            self.setup.run()
+        self.assertEqual(self.client.config.read_bytes(), before)
+        self.assertEqual(self.mutations(), [])
+
+    def test_readiness_check_never_resumes_owned_policy_pause(self):
+        self.active(state="paused", reason="native_setup_or_policy")
+        before = self.client.config.read_bytes()
+        with self.assertRaises(ClientError):
+            self.setup.run(check=True)
+        self.assertEqual(self.client.config.read_bytes(), before)
+        self.assertEqual(self.mutations(), [])
+
+    def test_ready_legacy_managed_target_still_runs_persistent_migration(self):
+        from types import SimpleNamespace
+        self.active()
+        self.desktop_preflight.return_value = SimpleNamespace(kind="managed")
+        self.setup.install_wrapper = Mock()
+        self.setup.run()
+        self.setup.install_wrapper.assert_called_once()
+
+    def test_owned_interrupted_launcher_transaction_recovers_before_layout_check(self):
+        self.active()
+        self.setup.pending_launcher_transaction.return_value = True
+        recovered = []
+        self.setup.install_wrapper = Mock(side_effect=lambda: recovered.append(True))
+        self.desktop_preflight.side_effect = lambda home: self.assertTrue(recovered)
+        self.setup.run()
+        self.setup.install_wrapper.assert_called_once()
+        self.desktop_preflight.assert_called_once_with(self.home)
+
     def test_manual_native_drift_is_not_overwritten(self):
         self.active()
         self.native.credentials = {"manual": "new account"}
@@ -373,6 +424,22 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(request.full_url, DEFAULT_SHARE_SERVER + "/api/me")
         self.assertIsNone(request.data)
         self.assertNotIn("ssa_", request.full_url)
+
+
+class LauncherTransactionTests(unittest.TestCase):
+    def test_metadata_check_accepts_read_limit_and_rejects_larger_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            system = Path(directory).resolve()
+            journal = system / ".claude-desktop-swap-transaction.json"
+            with journal.open("wb") as stream:
+                stream.truncate(MAX_LAUNCHER_TRANSACTION_BYTES)
+            journal.chmod(0o600)
+            self.assertTrue(launcher_transaction_pending(system_dir=system, system_uid=os.getuid()))
+            with journal.open("ab") as stream:
+                stream.write(b"x")
+            with self.assertRaises(ClientError):
+                launcher_transaction_pending(system_dir=system, system_uid=os.getuid())
+            self.assertEqual(journal.stat().st_size, MAX_LAUNCHER_TRANSACTION_BYTES + 1)
 
 
 class DirectoryAccessTests(unittest.TestCase):

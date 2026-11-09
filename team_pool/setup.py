@@ -27,8 +27,28 @@ from .share_enrollment import (DEFAULT_ACCOUNT_FILE, DEFAULT_SHARE_SERVER,
                                ShareTransport, enroll_from_share, saved_token)
 
 TEAM_ID = "B-pTJOWkq5wl"
+# Match scripts/desktop_swap.py's configuration/journal read and write limit.
+MAX_LAUNCHER_TRANSACTION_BYTES = 16 * 1024 * 1024
 KEYCHAIN_GUIDANCE = ('If macOS asks for “security” to access “Claude Code-credentials”, '
                      'choose Always Allow for that exact request. Never paste a password or token here.')
+
+
+def launcher_transaction_pending(*, system_dir=None, system_uid=0):
+    """Recognize only privileged recovery metadata; the installer validates it."""
+    directory = Path(system_dir or "/Library/Application Support/ClaudeCode")
+    path = directory / ".claude-desktop-swap-transaction.json"
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise ClientError("Cannot inspect launcher recovery metadata; preserve the installation and check directory access.") from None
+    parent = directory.lstat()
+    if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != system_uid or parent.st_mode & 0o022
+            or not stat.S_ISREG(info.st_mode) or info.st_uid != system_uid
+            or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > MAX_LAUNCHER_TRANSACTION_BYTES):
+        raise ClientError("Launcher recovery metadata has unsafe ownership or permissions; preserve it for administrator review.")
+    return True
 
 
 def directory_access_needs_repair(*, system_dir=None, managed_root=None, username=None, system_uid=0):
@@ -112,18 +132,24 @@ def share_membership(account_file, *, transport=None):
         raise ClientError("Claude Share membership could not be verified. Check connectivity and repeat setup.") from None
 
 
-def inspect_state(client):
+def inspect_state(client, *, allow_owned_repair=False):
     """Read-only: never turn a manual login or interrupted write into takeover."""
     state = client._load(optional=True)
     if state:
         if state.get("pending_write"):
             raise ClientError("A native write needs recovery. Run team-pool-client status and follow the recovery guide; setup will not overwrite it.")
-        if state.get("state") in ("paused", "revoked", "left"):
+        repairable = (allow_owned_repair and state.get("managed")
+                      and state.get("state") == "paused"
+                      and state.get("reason") == "native_setup_or_policy")
+        if state.get("state") in ("paused", "revoked", "left") and not repairable:
             raise ClientError("The pool client is paused, revoked, or left. Run team-pool-client status and resolve that condition explicitly before setup.")
-        if state.get("state") not in ("enrolled", "active", "degraded"):
+        if state.get("state") not in ("enrolled", "active", "degraded") and not repairable:
             raise ClientError("Unrecognized pool state; preserve it for recovery before setup.")
     try:
-        client.native.preflight()
+        if allow_owned_repair and state and state.get("managed"):
+            client.native.preflight(allow_redundant_fallback=True)
+        else:
+            client.native.preflight()
         snapshot = client.native.snapshot()
     except NativeKeychainAccessError:
         raise ClientError("Unlock your login Keychain and run setup in Terminal to approve the expected access request. Readiness checks never request approval.") from None
@@ -145,9 +171,10 @@ class Setup:
     def __init__(self, source_dir, *, client=None, account_file=DEFAULT_ACCOUNT_FILE,
                  home=None, runner=subprocess.run, sleep=time.sleep, clock=time.monotonic,
                  membership=share_membership, enroll=enroll_from_share,
-                 installer=install_service, verify_wrapper=verify_desktop_wrapper,
+                 installer=install_service, verify_wrapper=None, gui_installer=None,
                  desktop_preflight=resolve_target,
                  access_check=directory_access_needs_repair,
+                 pending_launcher_transaction=launcher_transaction_pending,
                  output=print):
         self.source = Path(source_dir).expanduser()
         self.home = Path(home or Path.home())
@@ -155,9 +182,11 @@ class Setup:
         self.account_file = Path(account_file).expanduser()
         self.runner, self.sleep, self.clock = runner, sleep, clock
         self.membership, self.enroll, self.installer = membership, enroll, installer
-        self.verify_wrapper, self.output = verify_wrapper, output
+        self.verify_wrapper = verify_wrapper or (lambda: verify_desktop_wrapper(gui_runtime=sys.executable))
+        self.gui_installer, self.output = gui_installer, output
         self.desktop_preflight = desktop_preflight
         self.access_check = access_check
+        self.pending_launcher_transaction = pending_launcher_transaction
         self.uid = os.getuid()
         self.domain = f"gui/{self.uid}"
         self.service = self.domain + "/" + SERVICE
@@ -281,7 +310,7 @@ class Setup:
         self.reopen_desktop = was_running
         result = self.command(["/usr/bin/sudo", sys.executable,
                                str(self.source / "scripts/desktop_swap.py"), "install", "--user",
-                               pwd.getpwuid(self.uid).pw_name], visible=True, timeout=180)
+                               pwd.getpwuid(self.uid).pw_name, "--gui-runtime", sys.executable], visible=True, timeout=180)
         if result.returncode:
             raise ClientError("Native Desktop launcher installation did not complete. Existing recovery state was retained; repeat setup after resolving the installer error.")
         self.verify_wrapper()
@@ -332,18 +361,28 @@ class Setup:
                 raise ClientError("Native setup directory permissions could not be repaired. Preserve the reported files and resolve that filesystem error before repeating setup; Keychain has not been accessed.")
         # Catch an uninitialized or unsupported Desktop layout before any
         # Keychain prompt, sudo request, app quit, or service interruption.
+        recovering_launcher = self.pending_launcher_transaction()
         try:
-            self.desktop_preflight(self.home)
+            # A journaled interrupted install may have created the selected
+            # entry before its metadata. Only the privileged installer can
+            # validate and finish that transaction; arbitrary orphan libraries
+            # still fail the ordinary preflight.
+            desktop_target = None if recovering_launcher else self.desktop_preflight(self.home)
         except DesktopProfileError as error:
             raise ClientError(str(error)) from None
         self.output(KEYCHAIN_GUIDANCE)
         with self.client.native.noninteractive() if check else _lock(self.client.config):
-            state = inspect_state(self.client)
+            state = inspect_state(self.client, allow_owned_repair=not check)
         saved_token(self.account_file, DEFAULT_SHARE_SERVER)
         wrapper_ready = True
         try:
             self.verify_wrapper()
         except ClientError:
+            wrapper_ready = False
+        # Old standard-layout installs own an OS-generated policy cache. An
+        # explicit setup rerun migrates their recorded flag to Desktop's local
+        # configuration library, even if the cache still happens to exist.
+        if recovering_launcher or getattr(desktop_target, "kind", None) == "managed":
             wrapper_ready = False
         self.service_spec(self.loaded(self.service))
         if check:
@@ -359,10 +398,17 @@ class Setup:
         try:
             if not wrapper_ready:
                 self.install_wrapper()
+                if recovering_launcher:
+                    self.desktop_preflight(self.home)
             self.stop_personal()
             # Repeat inspection after stopping competing writers; never accept drift.
             with _lock(self.client.config):
-                state = inspect_state(self.client)
+                state = inspect_state(self.client, allow_owned_repair=True)
+            if state and state.get("managed"):
+                # Explicit setup is the foreground recovery action. resume
+                # still requires the original fingerprint and backup and only
+                # retires redundant connector data; it never accepts drift.
+                self.client.resume()
             self.enroll(self.client, account_file=self.account_file,
                         device_name=socket.gethostname(), link=state is not None)
             self.client.sync(take_over_native_store=not bool(state and state.get("managed")))
@@ -399,6 +445,11 @@ class Setup:
                         self.output("The previous service configuration was preserved at " + str(backup))
                 raise
             self.background_ready(foreground_synced_at)
+            if self.gui_installer is None:
+                from .gui_exec_service import install_service as install_gui_service
+            else:
+                install_gui_service = self.gui_installer
+            install_gui_service(home=self.home, python=sys.executable)
             result = self.command([sys.executable, str(self.source / "scripts/install_team_status.py"), "install"], visible=True, timeout=180)
             if result.returncode:
                 raise ClientError("The pool is active, but the menu bar installation failed. Repeat setup to finish installing the menu bar.")

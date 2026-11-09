@@ -78,8 +78,15 @@ def managed_path(*, uid=None, username=None, managed_root=None):
     return root / username / DOMAIN
 
 
-def resolve_target(home, *, uid=None, username=None, managed_root=None, system_uid=0):
-    """Return the actual supported policy location; do not synthesize profiles."""
+def resolve_target(home, *, uid=None, username=None, managed_root=None, system_uid=0,
+                   ignore_managed_launcher=False):
+    """Discover configuration without writing it or changing Desktop identity.
+
+    An uninitialized optional library is an installable target, not an MDM
+    cache to create. The installer uses Desktop's own flag-only Default entry.
+    ``ignore_managed_launcher`` is for migrating a recorded legacy cache; it
+    never ignores a disabling or unrelated administrator policy.
+    """
     uid = os.getuid() if uid is None else uid
     home = Path(home)
     if os.environ.get("CLAUDE_USER_DATA_DIR"):
@@ -91,10 +98,10 @@ def resolve_target(home, *, uid=None, username=None, managed_root=None, system_u
     for _, policy in policies:
         if policy is not None and FLAG in policy and policy[FLAG] is not True:
             raise DesktopProfileError("A managed Desktop policy disables the launcher. Ask its administrator to resolve that policy before setup.")
-    # A prior standard-layout install remains owned by its recorded policy if
-    # Desktop later creates a configuration library of its own.
-    if policies[1][1] is not None and policies[1][1].get(FLAG) is True:
+    if not ignore_managed_launcher and policies[1][1] is not None and policies[1][1].get(FLAG) is True:
         return DesktopTarget("managed", user_policy)
+    if ignore_managed_launcher and any(policy and set(policy) - {FLAG} for _, policy in policies):
+        raise DesktopProfileError("This Mac already has managed Claude Desktop settings. Ask its administrator to enable the native launcher; setup will not change those policies.")
     profiles = home / "Library/Application Support/Claude-3p/configLibrary"
     meta = configuration(profiles / "_meta.json", owner=uid)
     if meta is not None:
@@ -115,11 +122,21 @@ def resolve_target(home, *, uid=None, username=None, managed_root=None, system_u
         raise DesktopProfileError("Open Claude Desktop from Applications, finish its first sign-in, then run this setup command again. Its ordinary app data has not been initialized; no profile needs to be created.")
     if any(policy and set(policy) - {FLAG} for _, policy in policies):
         raise DesktopProfileError("This Mac already has managed Claude Desktop settings. Ask its administrator to enable the native launcher; setup will not change those policies.")
-    return DesktopTarget("managed", user_policy)
+    # An orphaned nonempty library may belong to an incomplete Desktop edit.
+    # Only the installer's private journal can authorize recovery of its own
+    # interrupted writes; discovery must never guess which entry to select.
+    try:
+        if profiles.exists() and any(profiles.iterdir()):
+            raise DesktopProfileError("Claude Desktop's configuration library has files but no metadata. Preserve it and resolve the incomplete library before setup.")
+    except OSError:
+        raise DesktopProfileError("Claude Desktop's configuration library is unreadable; preserve it before setup.") from None
+    return DesktopTarget("native-library", profiles / "_meta.json")
 
 
 def launcher_enabled(target, *, uid=None, system_uid=0):
     uid = os.getuid() if uid is None else uid
+    if target.kind == "native-library":
+        return False
     managed = target.kind == "managed"
     value = configuration(target.path, owner=system_uid if managed else uid,
                           system=managed, plist=managed)

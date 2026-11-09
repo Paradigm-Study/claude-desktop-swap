@@ -1,4 +1,4 @@
-"""Desktop layout and policy discovery never synthesize profile identity."""
+"""Discovery is read-only; a native library does not change Desktop identity."""
 import json
 import os
 from pathlib import Path
@@ -37,7 +37,7 @@ class DesktopProfileTests(unittest.TestCase):
     def test_standard_target_does_not_write_or_need_config_library(self):
         before = self.marker.read_bytes()
         target = self.resolve()
-        self.assertEqual(target.kind, "managed")
+        self.assertEqual(target.kind, "native-library")
         self.assertFalse(launcher_enabled(target, uid=os.getuid(), system_uid=os.getuid()))
         self.assertFalse(self.managed.exists())
         self.assertEqual(self.marker.read_bytes(), before)

@@ -382,5 +382,322 @@ class NativeStoreTests(unittest.TestCase):
             self.store.set_secret("native-backup", "do-not-overwrite")
 
 
+    def fallback_fixture(self, *, discovery_difference=False):
+        fingerprint = self.activate()
+        credentials = self.current_credentials()
+        connector = {"accessToken": "fake-mcp-access", "refreshToken": "fake-mcp-refresh",
+                     "expiresAt": NOW + 100, "scopes": ["read"],
+                     "discoveryState": {"state": "ready", "revision": 2}}
+        credentials["mcpOAuth"] = {"connector": connector, "native-only": {"accessToken": "keep"}}
+        self.backend.set_password(NATIVE_SERVICE, "pilot-test", json.dumps(credentials))
+        fallback_connector = dict(connector)
+        if discovery_difference:
+            fallback_connector["discoveryState"] = {"state": "discovering", "revision": 1}
+        raw = (json.dumps({"mcpOAuth": {"connector": fallback_connector}}, indent=2) + "\n").encode()
+        path = self.store.claude / ".credentials.json"
+        path.write_bytes(raw)
+        path.chmod(0o600)
+        return fingerprint, path, raw
+
+    def test_redundant_fallback_archives_exact_bytes_without_rewriting_native_state(self):
+        fingerprint, path, raw = self.fallback_fixture(discovery_difference=True)
+        config = self.store.config.read_bytes()
+        self.store.set_secret("device-token", "fake-device-token")
+        keychain = dict(self.backend.items)
+        result = self.store.retire_redundant_fallback(fingerprint)
+        self.assertEqual(result, {"status": "archived", "connectors": 1})
+        self.assertFalse(path.exists())
+        archive_directory = self.store._fallback_directory()
+        archives = list(archive_directory.iterdir())
+        self.assertEqual(len(archives), 1)
+        self.assertEqual(archives[0].read_bytes(), raw)
+        self.assertEqual(archive_directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(archives[0].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.backend.items, keychain)
+        self.assertEqual(self.store.config.read_bytes(), config)
+        self.assertEqual(self.current_credentials()["mcpOAuth"]["connector"]["discoveryState"]["revision"], 2)
+        self.store.preflight()
+        self.assertEqual(self.store.retire_redundant_fallback(fingerprint), {"status": "absent", "connectors": 0})
+        self.assertEqual(list(archive_directory.iterdir()), archives)
+
+    def test_redundant_fallback_opt_in_preflight_only_inspects(self):
+        _, path, raw = self.fallback_fixture()
+        before = dict(self.backend.items)
+        with self.assertRaises(NativePolicyError):
+            self.store.preflight()
+        self.store.preflight(allow_redundant_fallback=True)
+        self.assertEqual(path.read_bytes(), raw)
+        self.assertFalse(self.store._fallback_directory().exists())
+        self.assertEqual(self.backend.items, before)
+
+    def test_redundant_fallback_refuses_new_connectors_or_changed_auth_and_preserves_file(self):
+        fingerprint, path, raw = self.fallback_fixture()
+        original = json.loads(raw)
+        cases = [
+            {"mcpOAuth": {"new": {"accessToken": "new-sign-in"}}},
+            {"mcpOAuth": {"connector": dict(original["mcpOAuth"]["connector"], accessToken="new-token")}},
+            {"mcpOAuth": {"connector": dict(original["mcpOAuth"]["connector"], expiresAt=False)}},
+            {"mcpOAuth": {"connector": {"discoveryState": "ready"}}},
+            {"mcpOAuth": {"connector": dict(original["mcpOAuth"]["connector"], extra="unknown")}},
+            {"mcpOAuth": {"connector": "unsupported"}},
+        ]
+        before = dict(self.backend.items)
+        for value in cases:
+            with self.subTest(value=list(value["mcpOAuth"])):
+                changed = json.dumps(value).encode()
+                path.write_bytes(changed)
+                with self.assertRaises(NativePolicyError):
+                    self.store.retire_redundant_fallback(fingerprint)
+                self.assertEqual(path.read_bytes(), changed)
+                self.assertFalse(self.store._fallback_directory().exists())
+                self.assertEqual(self.backend.items, before)
+
+    def test_redundant_fallback_rejects_unknown_top_level_and_ambiguous_json(self):
+        fingerprint, path, _ = self.fallback_fixture()
+        cases = [
+            b'{"mcpOAuth":{},"claudeAiOauth":{}}',
+            b'{"mcpOAuth":{},"pluginSecrets":{}}', b'{"mcpOAuth":{},"futureField":{}}',
+            b'{"mcpOAuth":{},"mcpOAuth":{}}',
+            b'{"mcpOAuth":{"connector":{"accessToken":"a","accessToken":"b"}}}',
+            b'{"mcpOAuth":{"connector":{"discoveryState":NaN}}}',
+            b'{"mcpOAuth":[]}', b'[]', b'not-json', b'\xff', b' ' * (4 * 1024 * 1024 + 1),
+        ]
+        before = dict(self.backend.items)
+        for raw in cases:
+            with self.subTest(length=len(raw)):
+                path.write_bytes(raw)
+                with self.assertRaises(NativePolicyError) as error:
+                    self.store.retire_redundant_fallback(fingerprint)
+                self.assertNotIn("fake-mcp", str(error.exception))
+                self.assertEqual(path.read_bytes(), raw)
+                self.assertEqual(self.backend.items, before)
+                self.assertFalse(self.store._fallback_directory().exists())
+
+    def test_redundant_fallback_requires_private_owned_regular_file(self):
+        fingerprint, path, raw = self.fallback_fixture()
+        path.chmod(0o644)
+        with self.assertRaises(NativePolicyError):
+            self.store.retire_redundant_fallback(fingerprint)
+        path.chmod(0o600)
+        target = path.with_name("preserved.json")
+        path.rename(target)
+        path.symlink_to(target)
+        with self.assertRaises(NativePolicyError):
+            self.store.retire_redundant_fallback(fingerprint)
+        self.assertEqual(target.read_bytes(), raw)
+        path.unlink()
+        os.link(target, path)
+        with self.assertRaises(NativePolicyError):
+            self.store.retire_redundant_fallback(fingerprint)
+        path.unlink()
+        target.rename(path)
+        real_uid = os.getuid()
+        with patch("team_pool.native.os.getuid", return_value=real_uid + 1):
+            with self.assertRaises(NativeStoreError):
+                self.store.retire_redundant_fallback(fingerprint)
+        self.assertEqual(path.read_bytes(), raw)
+        self.assertFalse(self.store._fallback_directory().exists())
+
+    def test_redundant_fallback_requires_current_ownership_and_original_backup(self):
+        fingerprint, path, raw = self.fallback_fixture()
+        for expected in (None, "wrong-fingerprint"):
+            with self.assertRaises(NativeDriftError):
+                self.store.retire_redundant_fallback(expected)
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertFalse(self.store._fallback_directory().exists())
+        self.backend.delete_password(PILOT_SERVICE, "pilot-test:native-backup")
+        with self.assertRaisesRegex(NativeStoreError, "No enrollment backup"):
+            self.store.retire_redundant_fallback(fingerprint)
+        self.assertEqual(path.read_bytes(), raw)
+        path.unlink()
+        with self.assertRaisesRegex(NativeStoreError, "No enrollment backup"):
+            self.store.retire_redundant_fallback(fingerprint)
+
+    def test_redundant_fallback_checks_other_policies_before_archiving(self):
+        fingerprint, path, raw = self.fallback_fixture()
+        self.store.environ["ANTHROPIC_AUTH_TOKEN"] = "fake-override"
+        with self.assertRaises(NativePolicyError):
+            self.store.retire_redundant_fallback(fingerprint)
+        self.store.environ.pop("ANTHROPIC_AUTH_TOKEN")
+        (self.store.claude / "settings.json").write_text('{"apiKeyHelper":"some-helper"}')
+        with self.assertRaises(NativePolicyError):
+            self.store.retire_redundant_fallback(fingerprint)
+        self.assertEqual(path.read_bytes(), raw)
+        self.assertFalse(self.store._fallback_directory().exists())
+
+    def test_redundant_fallback_interruption_before_rename_is_guarded_and_resumable(self):
+        fingerprint, path, raw = self.fallback_fixture()
+        with patch("team_pool.native.os.rename", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.store.retire_redundant_fallback(fingerprint)
+        self.assertEqual(path.read_bytes(), raw)
+        journal = self.store._fallback_directory() / "pending.json"
+        self.assertTrue(journal.is_file())
+        self.assertNotIn("fake-mcp", journal.read_text())
+        with self.assertRaises(NativePolicyError):
+            self.store.preflight()
+        self.store.preflight(allow_redundant_fallback=True)
+        self.assertEqual(self.store.retire_redundant_fallback(fingerprint)["status"], "archived")
+        self.assertFalse(path.exists())
+        self.assertFalse(journal.exists())
+        self.store.preflight()
+
+    def test_redundant_fallback_interruption_after_rename_cannot_bypass_preflight(self):
+        fingerprint, path, raw = self.fallback_fixture(discovery_difference=True)
+        rename = os.rename
+        def die_after_rename(source, destination):
+            rename(source, destination)
+            raise KeyboardInterrupt
+        with patch("team_pool.native.os.rename", side_effect=die_after_rename):
+            with self.assertRaises(KeyboardInterrupt):
+                self.store.retire_redundant_fallback(fingerprint)
+        self.assertFalse(path.exists())
+        with self.assertRaises(NativePolicyError):
+            self.store.preflight()
+        journal = self.store._fallback_journal()
+        archive = self.store._fallback_directory() / journal["archive"]
+        self.assertEqual(archive.read_bytes(), raw)
+        self.assertEqual(self.store.retire_redundant_fallback(fingerprint), {"status": "archived", "connectors": 1})
+        self.assertEqual(archive.read_bytes(), raw)
+        self.store.preflight()
+
+    def test_redundant_fallback_replaced_during_rename_is_retained_and_blocks_resume(self):
+        fingerprint, path, _ = self.fallback_fixture()
+        rename = os.rename
+        replacement = b'{"claudeAiOauth":{"accessToken":"fake-manual-login"}}'
+        def replace_then_rename(source, destination):
+            path.write_bytes(replacement)
+            rename(source, destination)
+        before = dict(self.backend.items)
+        with patch("team_pool.native.os.rename", side_effect=replace_then_rename):
+            with self.assertRaises(NativePolicyError):
+                self.store.retire_redundant_fallback(fingerprint)
+        journal = self.store._fallback_journal()
+        archive = self.store._fallback_directory() / journal["archive"]
+        self.assertEqual(archive.read_bytes(), replacement)
+        self.assertEqual(self.backend.items, before)
+        with self.assertRaises(NativePolicyError):
+            self.store.preflight()
+        with self.assertRaises(NativePolicyError):
+            self.store.retire_redundant_fallback(fingerprint)
+
+    def test_redundant_fallback_new_file_after_rename_is_not_discarded(self):
+        fingerprint, path, raw = self.fallback_fixture()
+        rename = os.rename
+        replacement = b'{"mcpOAuth":{"new":{"accessToken":"fake-new-login"}}}'
+        def rename_then_recreate(source, destination):
+            rename(source, destination)
+            path.write_bytes(replacement)
+            path.chmod(0o600)
+        with patch("team_pool.native.os.rename", side_effect=rename_then_recreate):
+            with self.assertRaises(NativePolicyError):
+                self.store.retire_redundant_fallback(fingerprint)
+        self.assertEqual(path.read_bytes(), replacement)
+        journal = self.store._fallback_journal()
+        self.assertEqual((self.store._fallback_directory() / journal["archive"]).read_bytes(), raw)
+        with self.assertRaises(NativePolicyError):
+            self.store.retire_redundant_fallback(fingerprint)
+
+    def test_redundant_fallback_changed_native_connectors_pause_after_rename(self):
+        fingerprint, path, raw = self.fallback_fixture()
+        rename = os.rename
+        def rename_then_change_native(source, destination):
+            rename(source, destination)
+            credentials = self.current_credentials()
+            credentials["mcpOAuth"]["connector"]["accessToken"] = "fake-newer-native-token"
+            self.backend.set_password(NATIVE_SERVICE, "pilot-test", json.dumps(credentials))
+        with patch("team_pool.native.os.rename", side_effect=rename_then_change_native):
+            with self.assertRaises(NativeDriftError):
+                self.store.retire_redundant_fallback(fingerprint)
+        self.assertFalse(path.exists())
+        self.assertEqual(self.current_credentials()["mcpOAuth"]["connector"]["accessToken"], "fake-newer-native-token")
+        journal = self.store._fallback_journal()
+        self.assertEqual((self.store._fallback_directory() / journal["archive"]).read_bytes(), raw)
+        with self.assertRaises(NativePolicyError):
+            self.store.preflight()
+
+    def test_redundant_fallback_archive_tampering_keeps_recovery_blocked(self):
+        fingerprint, _, _ = self.fallback_fixture()
+        rename = os.rename
+        def rename_then_tamper(source, destination):
+            rename(source, destination)
+            changed = json.loads(Path(destination).read_bytes())
+            changed["mcpOAuth"]["connector"]["discoveryState"] = {"state": "changed-after-inspection"}
+            Path(destination).write_text(json.dumps(changed))
+        with patch("team_pool.native.os.rename", side_effect=rename_then_tamper):
+            with self.assertRaises(NativePolicyError):
+                self.store.retire_redundant_fallback(fingerprint)
+        with self.assertRaises(NativePolicyError):
+            self.store.preflight()
+        with self.assertRaises(NativePolicyError):
+            self.store.retire_redundant_fallback(fingerprint)
+
+    def test_redundant_fallback_unsafe_journal_or_directory_blocks_ordinary_preflight(self):
+        fingerprint, _, _ = self.fallback_fixture()
+        directory = self.store._fallback_directory()
+        directory.mkdir(mode=0o755)
+        with self.assertRaises(NativePolicyError):
+            self.store.retire_redundant_fallback(fingerprint)
+        directory.chmod(0o700)
+        journal = directory / "pending.json"
+        journal.write_text('{"version":1,"version":1,"archive":"../unsafe","sha256":"bad"}')
+        journal.chmod(0o600)
+        with self.assertRaises(NativePolicyError):
+            self.store.preflight()
+        with self.assertRaises(NativePolicyError):
+            self.store.retire_redundant_fallback(fingerprint)
+
+    def test_redundant_fallback_pre_rename_replacement_is_preserved(self):
+        fingerprint, path, _ = self.fallback_fixture()
+        replacement = b'{"mcpOAuth":{"new":{"accessToken":"fake-new-signin"}}}'
+        writer = self.store._write_fallback_journal
+        def journal_then_replace(value):
+            writer(value)
+            path.write_bytes(replacement)
+        with patch.object(self.store, "_write_fallback_journal", side_effect=journal_then_replace):
+            with self.assertRaises(NativePolicyError):
+                self.store.retire_redundant_fallback(fingerprint)
+        self.assertEqual(path.read_bytes(), replacement)
+        self.assertTrue(self.store._fallback_journal())
+        with self.assertRaises(NativePolicyError):
+            self.store.preflight()
+
+    def test_redundant_fallback_rejects_duplicate_native_connector_auth(self):
+        fingerprint, path, raw = self.fallback_fixture()
+        native = self.backend.get_password(NATIVE_SERVICE, "pilot-test")
+        native = native.replace('"fake-mcp-access"', '"fake-stale-access", "accessToken": "fake-mcp-access"')
+        self.backend.set_password(NATIVE_SERVICE, "pilot-test", native)
+        with self.assertRaises(NativePolicyError):
+            self.store.retire_redundant_fallback(fingerprint)
+        self.assertEqual(path.read_bytes(), raw)
+        self.assertFalse(self.store._fallback_directory().exists())
+
+    def test_redundant_fallback_does_not_equate_boolean_and_number_auth(self):
+        fingerprint, path, raw = self.fallback_fixture()
+        credentials = self.current_credentials()
+        credentials["mcpOAuth"]["connector"]["expiresAt"] = 0
+        self.backend.set_password(NATIVE_SERVICE, "pilot-test", json.dumps(credentials))
+        fallback = json.loads(raw)
+        fallback["mcpOAuth"]["connector"]["expiresAt"] = False
+        path.write_text(json.dumps(fallback))
+        with self.assertRaises(NativePolicyError):
+            self.store.retire_redundant_fallback(fingerprint)
+        self.assertTrue(path.exists())
+
+    def test_redundant_fallback_uses_native_locks(self):
+        fingerprint, path, raw = self.fallback_fixture()
+        for lock in (self.store.claude / ".oauth_refresh.lock", self.home / ".claude.lock",
+                     self.home / ".claude.json.lock"):
+            lock.mkdir()
+            try:
+                with self.assertRaisesRegex(NativeStoreError, "is busy"):
+                    self.store.retire_redundant_fallback(fingerprint)
+            finally:
+                lock.rmdir()
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertFalse(self.store._fallback_directory().exists())
+
+
+
 if __name__ == "__main__":
     unittest.main()

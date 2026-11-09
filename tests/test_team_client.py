@@ -55,8 +55,14 @@ class FakeNative:
         finally:
             self.interaction_allowed = True
 
-    def preflight(self):
+    def preflight(self, *, allow_redundant_fallback=False):
         pass
+
+    def retire_redundant_fallback(self, expected):
+        self.preflight()
+        if expected != self.snapshot()["fingerprint"] or not self.has_backup:
+            raise NativeDriftError("fixture recovery ownership mismatch")
+        return {"status": "absent", "connectors": 0}
 
     def snapshot(self):
         return {"has_credentials": self.credentials is not None,
@@ -114,6 +120,81 @@ class FakeTransport:
         if path == "/v1/enroll":
             return {"device_id": "device-a", "device_token": DEVICE_TOKEN}
         return copy.deepcopy(self.next)
+
+
+class FallbackLifecycleTests(unittest.TestCase):
+    """Exercise real native recovery through the client ownership boundary."""
+
+    def setUp(self):
+        from team_pool.native import NativeStore, NATIVE_SERVICE
+        from test_team_native import FakeKeychain
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.backend = FakeKeychain()
+        self.native = NativeStore(self.home, self.backend, policy_paths=[],
+                                  environ={"USER": "fixture"}, clock=lambda: 1000)
+        self.connectors = {"connector": {"accessToken": "fixture-mcp-token", "discoveryState": {"cached": True}}}
+        self.backend.set_password(NATIVE_SERVICE, "fixture", json.dumps({"mcpOAuth": self.connectors}))
+        self.transport = FakeTransport()
+        self.client = client.Client(self.home / "pool/team.json", native=self.native,
+                                    transport=self.transport, clock=lambda: 1000, preflight=lambda: None)
+        self.client.enroll("https://pool.example.invalid", "Test Mac", INVITE)
+        self.client.sync()
+        self.fallback = self.home / ".claude/.credentials.json"
+
+    def duplicate(self):
+        self.fallback.write_text(json.dumps({"mcpOAuth": self.connectors}))
+        self.fallback.chmod(0o600)
+
+    def test_managed_sync_retires_duplicate_without_changing_any_keychain_value(self):
+        self.duplicate()
+        before = dict(self.backend.items)
+        result = self.client.sync()
+        self.assertEqual(result["state"], "active")
+        self.assertFalse(self.fallback.exists())
+        self.assertEqual(self.backend.items, before)
+
+    def test_explicit_resume_recovers_previous_policy_pause_without_reenrollment(self):
+        self.duplicate()
+        state = self.client._load()
+        state.update(state="paused", reason="native_setup_or_policy")
+        self.client._save(state)
+        identity = state["device_id"]
+        with self.assertRaises(client.PausedError):
+            self.client.sync()
+        self.assertTrue(self.fallback.exists())
+        self.client.resume()
+        self.assertEqual(self.client.sync()["state"], "active")
+        self.assertEqual(self.client._load()["device_id"], identity)
+        self.assertFalse(self.fallback.exists())
+
+    def test_conflicting_connector_stops_before_coordinator_request(self):
+        self.connectors["connector"]["accessToken"] = "different-fixture-token"
+        self.duplicate()
+        before = dict(self.backend.items)
+        requests = len(self.transport.calls)
+        with self.assertRaises(client.PausedError):
+            self.client.sync()
+        self.assertEqual(len(self.transport.calls), requests)
+        self.assertTrue(self.fallback.exists())
+        self.assertEqual(self.backend.items, before)
+
+    def test_manual_login_prevents_connector_recovery(self):
+        from team_pool.native import NATIVE_SERVICE
+        self.duplicate()
+        self.backend.set_password(NATIVE_SERVICE, "fixture", '{"claudeAiOauth":{"accessToken":"manual-fixture"}}')
+        with self.assertRaises(client.PausedError):
+            self.client.sync()
+        self.assertEqual(self.client.status()["reason"], "native_credentials_changed")
+        self.assertTrue(self.fallback.exists())
+
+    def test_status_does_not_recover_files(self):
+        self.duplicate()
+        before = dict(self.backend.items)
+        self.client.status()
+        self.assertTrue(self.fallback.exists())
+        self.assertEqual(self.backend.items, before)
 
 
 class ClientLifecycleTests(unittest.TestCase):

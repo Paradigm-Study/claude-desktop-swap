@@ -46,18 +46,12 @@ stops the attempt. This is not a promise that macOS can never request approval.
 
 ## Upgrade and recovery
 
-Stop the old shared service before installing the new version. Do not run the
-personal `cswap` selector alongside the team client.
-
-```sh
-.venv/bin/team-pool-client service-remove
-git pull --ff-only
-uv pip install --python .venv/bin/python .
-.venv/bin/team-pool-client resume
-.venv/bin/team-pool-client sync --once
-.venv/bin/team-pool-client service-install
-python3 scripts/install_team_status.py install
-```
+Use the [one-command setup](share-org-setup.md) in Terminal on the Mac's screen,
+as the enrolled macOS user. It updates the pinned client, launcher, sync service
+and GUI execution service together. It preserves the enrollment and recovery
+backup and verifies background sync. Do not run the personal `cswap` selector
+alongside the team client. Finish and close remote Code sessions using the bridge
+before upgrading its service; setup refuses to interrupt its running processes.
 
 Use a terminal without gateway/API-key overrides. During the explicit foreground
 step, macOS may request approval for `security` to access `Claude Code-credentials`.
@@ -69,3 +63,70 @@ The shared menu bar displays `keychain_access_required` as a paused condition.
 After correcting access, use `resume`, `sync --once`, and restart the service.
 If prompts recur, stop the service and inspect the actual caller and item before
 making further changes. Do not restore the Python native writer from 0.1.0a4.
+
+## Remote Mac login and SSH context
+
+A readable Keychain in the user's desktop session does not imply that a process
+started through SSH can read it. Desktop can replace or cold-start its SSH
+helper in a different macOS audit context. A GUI-context helper restart was a
+temporary repair for that instance, not a durable authentication mechanism.
+
+The a14 team launcher sends remote Code execution through the enrolled user's
+GUI LaunchAgent. Its same-UID private socket relays process input/output, signals
+and exit status; it does not export provider credentials or pass them through the
+protocol. The GUI service checks local native readiness without requesting
+Keychain interaction, then launches Code in its GUI context to use the ordinary
+native credential store. Inference still goes directly to Anthropic.
+
+The enrolled macOS user must stay logged into the remote Mac's desktop. Fast
+User Switching can leave that session running. Logout stops both GUI sync and
+execution; an SSH sign-in alone cannot replace them or unlock the login Keychain.
+The bridge fails with a setup message when its native prerequisites are absent.
+It does not change Keychain ACLs, store a password or provide access after logout.
+
+Run the installed client as that user, without `sudo`, for a read-only check:
+
+```sh
+team-pool-client doctor --ssh
+```
+
+Use the installed client path printed by setup if it is not on `PATH`. The
+diagnostic checks the GUI session, sync service, assignment and GUI bridge, with
+noninteractive native checks. It does not contact the coordinator or provider,
+change credentials, or display credential values. When the bridge is ready,
+direct SSH Keychain access is not required and is not reported as an error.
+Retry the original remote conversation to verify actual authentication; a
+readiness report is not that end-to-end test.
+
+## Launcher policy and redundant connector files
+
+An older installer's flag could disappear because it was stored in a generated
+macOS managed-preference cache. A14 setup migrates the recorded setting into
+Desktop's persistent local `configLibrary`. An ordinary Desktop installation
+without that library gets only the default metadata and launcher flag, retaining
+its login, conversation data and deployment mode. Existing selected settings and
+administrator policy are respected. This local policy failure does not establish
+that a pooled account needs fresh authorization.
+
+A failed native read can also leave `~/.claude/.credentials.json` containing MCP
+sign-ins. The a14 managed client can retire this fallback only when its sole
+top-level field is `mcpOAuth` and every connector already matches Keychain except
+for `discoveryState`. Keychain remains authoritative, including its discovery
+metadata. The original file is archived unchanged under the private
+`~/.claude/.desktop-swap-fallback/` directory; native account credentials,
+connector data and the enrollment backup are not rewritten by this recovery.
+
+Recovery checks account ownership and backup presence, journals the archive
+operation, and verifies both the archived bytes and native state. An interrupted
+or ambiguous archive keeps ordinary sync blocked until verified recovery.
+New connectors, changed sign-in fields, account credentials in the fallback,
+unsafe files or credential drift are retained for review. This does not solve
+`native_store_capacity` by removing MCP/plugin data, nor does it authorize
+overwriting a manual login. Treat fallback archives as credentials and never
+attach them to support reports.
+
+An explicit setup rerun can repair an owned `native_setup_or_policy` pause after
+these ownership checks. Other pauses require their specific condition to be
+resolved. Read-only status, catalog and `doctor --ssh` checks do not archive files
+or resume a paused client. See [the SSH contract](ssh-native-mode.md) for the
+execution and recovery boundaries.

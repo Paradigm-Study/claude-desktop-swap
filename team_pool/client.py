@@ -17,6 +17,7 @@ from pathlib import Path
 import plistlib
 import random
 import re
+import shlex
 import socket
 import ssl
 import stat
@@ -295,7 +296,8 @@ def _configuration(path):
         raise ClientError("Desktop native launcher configuration is missing or invalid; check the desktop-swap installation.") from None
 
 
-def verify_desktop_wrapper(*, home=None, system_dir=None, managed_root=None, system_uid=0):
+def verify_desktop_wrapper(*, home=None, system_dir=None, managed_root=None, system_uid=0,
+                           gui_runtime=None):
     from .desktop_profile import DesktopProfileError, launcher_enabled, resolve_target
     home = Path(home or Path.home())
     system_dir = Path(system_dir or "/Library/Application Support/ClaudeCode")
@@ -325,6 +327,12 @@ def verify_desktop_wrapper(*, home=None, system_dir=None, managed_root=None, sys
                 raise ValueError
         if 'exec "$@"' not in text:
             raise ValueError
+        if gui_runtime is not None:
+            selected = re.search(r'if \[ "\$\(/usr/bin/id -u\)" = "' + str(os.getuid())
+                                 + r'" \]; then\n(.*?)\nfi', text, re.S)
+            relay = 'exec ' + shlex.quote(str(gui_runtime)) + ' -m team_pool.gui_exec run -- "$@"'
+            if selected is None or relay not in selected.group(1):
+                raise ValueError
     except (OSError, ValueError):
         raise ClientError("The desktop-swap launcher is missing, changed, or installed for another user.") from None
 
@@ -397,11 +405,12 @@ class Client:
             raise PausedError(message) from None
         raise ClientError(message) from None
 
-    def _preflight(self, state=None):
+    def _preflight(self, state=None, *, inspect_native=True):
         from .native import NativeKeychainAccessError, NativePolicyError, NativeStoreError
         try:
             self.preflight()
-            self.native.preflight()
+            if inspect_native:
+                self.native.preflight()
         except ClientError:
             if state is not None:
                 state.update(state="paused", reason="native_setup_or_policy")
@@ -418,6 +427,24 @@ class Client:
             self._keychain_access_required(state)
         except NativeStoreError:
             raise ClientError("Native credential preflight failed; verify Keychain access.") from None
+
+    def _retire_redundant_fallback(self, state):
+        """Recover only a duplicate connector file owned by this enrollment."""
+        from .native import NativeDriftError, NativeKeychainAccessError, NativePolicyError, NativeStoreError
+        try:
+            self.native.retire_redundant_fallback(state["fingerprint"])
+        except NativeDriftError:
+            state.update(state="paused", reason="native_credentials_changed")
+            self._save(state)
+            raise PausedError("Native credentials changed during recovery. Both credential stores were preserved.") from None
+        except NativeKeychainAccessError:
+            self._keychain_access_required(state)
+        except NativePolicyError:
+            state.update(state="paused", reason="native_setup_or_policy")
+            self._save(state)
+            raise PausedError("Native policy or conflicting connector credentials need review. Existing credentials and recovery data were preserved.") from None
+        except NativeStoreError:
+            raise ClientError("Connector-file recovery could not be verified. Existing credentials and recovery data were preserved.") from None
 
     def enroll(self, server, device_name, invitation, *, allow_loopback_http=False):
         server = server_url(server, allow_loopback_http)
@@ -453,7 +480,7 @@ class Client:
                 raise PausedError("Enrollment was revoked or left. Inspect status and follow the recovery runbook.")
             if state["state"] == "paused":
                 raise PausedError("Client is paused. Inspect status and explicitly resume after correcting the reported condition.")
-            self._preflight(state)
+            self._preflight(state, inspect_native=not state.get("managed", False))
             try:
                 snapshot = self.native.snapshot()
             except NativeKeychainAccessError:
@@ -470,6 +497,9 @@ class Client:
                 state.update(state="paused", reason="native_credentials_changed")
                 self._save(state)
                 raise PausedError("Native credentials changed. Synchronization paused without overwriting them.")
+            if not initialize:
+                self._retire_redundant_fallback(state)
+                self._preflight(state)
             try:
                 token = self.native.get_secret(DEVICE_SECRET)
             except NativeKeychainAccessError:
@@ -682,7 +712,7 @@ class Client:
             state = self._load()
             if state["state"] in ("revoked", "left"):
                 raise ClientError("Revoked or departed enrollment cannot be resumed.")
-            self._preflight(state)
+            self._preflight(state, inspect_native=not state.get("managed", False))
             try:
                 snapshot = self.native.snapshot()
                 token = self.native.get_secret(DEVICE_SECRET)
@@ -693,6 +723,9 @@ class Client:
             self._recover_pending(state, snapshot)
             if state.get("managed") and snapshot["fingerprint"] != state["fingerprint"]:
                 raise ClientError("Native credentials still differ; resume will not overwrite a manual login or logout.")
+            if state.get("managed"):
+                self._retire_redundant_fallback(state)
+                self._preflight(state)
             state["state"] = "enrolled"
             state.pop("reason", None)
             self._save(state)
@@ -870,6 +903,8 @@ def main(argv=None):
     sync.add_argument("--take-over-native-store", action="store_true")
     for command in ("run", "status", "accounts", "resume", "service-install", "service-remove"):
         commands.add_parser(command)
+    doctor = commands.add_parser("doctor", help="Inspect local SSH prerequisites without changing credentials or sessions")
+    doctor.add_argument("--ssh", action="store_true", required=True)
     switch = commands.add_parser("switch-account", help="Select an available account for this Mac; quota failover continues")
     switch.add_argument("account_id")
     leave = commands.add_parser("leave")
@@ -901,6 +936,9 @@ def main(argv=None):
             result = client.sync(take_over_native_store=args.take_over_native_store)
         elif args.command == "status":
             result = client.status()
+        elif args.command == "doctor":
+            from .ssh_health import doctor
+            result = doctor(client)
         elif args.command == "accounts":
             result = client.list_accounts()
         elif args.command == "switch-account":
@@ -920,6 +958,10 @@ def main(argv=None):
             remove_service()
             result = {"state": "service_removed"}
         else:
+            from .gui_exec_service import remove_service as remove_gui_service
+            # Refuse active remote work before stopping sync or restoring the
+            # account. The bridge atomically drains only an idle owned service.
+            remove_gui_service()
             remove_service()
             result = client.leave(restore=args.restore)
         print(json.dumps(result, sort_keys=True))

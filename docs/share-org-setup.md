@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/
 ```
 
 Run it as your ordinary Mac user, without `sudo` in front of the command. The
-installer uses the tested `v0.1.0a13` package and prepares its own Python runtime;
+installer uses the tested `v0.1.0a14` package and prepares its own Python runtime;
 Git, Python and uv do not need to be installed beforehand. Use that Mac’s
 logged-in desktop Terminal, including when helping through Screen Sharing. An
 SSH shell can lack access to its login Keychain even when the desktop services
@@ -48,13 +48,17 @@ pool activation; remaining continuity and failover checks are recorded in the
 ## If an older setup reported “Missing _meta.json”
 
 That error came from assuming Desktop's optional profile library existed. The
-The installer supports an initialized ordinary Claude Desktop installation
+installer supports an initialized ordinary Claude Desktop installation
 without that library. Open Claude Desktop, finish its normal first sign-in if
 needed, and run the same one-command setup again. Do not create a replacement
 profile or delete your existing app data.
 
-For a standard installation, setup enables Desktop's supported user-scoped
-launcher preference. Existing profile installations keep their current profile.
+For a standard installation, a14 creates Desktop's ordinary local configuration
+library with only the launcher flag. That flag does not activate third-party mode.
+Existing profile installations keep their current selection and other settings.
+Earlier installations wrote a generated macOS managed-preference cache; setup
+migrates only the current user's recorded setting to the persistent library,
+even when that cache has disappeared.
 It preserves the app's sign-in, conversation index and deployment mode. A managed
 policy that disables the launcher must be resolved by its administrator. Setup checks Desktop initialization before stopping sync or closing Desktop.
 If an older installer left a recognized system directory unreadable, a9 first
@@ -70,8 +74,10 @@ password requested by `sudo`; it is separate from Claude sign-in and Keychain.
 Run the same command again. It reuses the installed release, preserves the
 existing device token and native recovery backup, and links an existing invite
 enrollment to your Share identity. It refuses a different Share identity,
-manual credential drift, or a paused/revoked/left enrollment until you explicitly
-resolve that condition. A failed installation can be retried with the same
+manual credential drift, revoked/left enrollment, or an unexplained pause. An
+explicit setup rerun can repair an owned `native_setup_or_policy` pause after
+verifying the original credential fingerprint and recovery backup. Other pauses
+still need their reported condition resolved. A failed installation can be retried with the same
 command; it does not require a second enrollment or invitation token.
 
 The installer stops the personal `cswap` menu service to avoid competing writes.
@@ -81,13 +87,13 @@ credential store only and refuses a `CLAUDE_CONFIG_DIR` override or conflicting
 native provider configuration.
 
 The package and runtime stay under
-`~/.local/share/claude-desktop-swap/releases/v0.1.0a13/`. Keep that directory in
+`~/.local/share/claude-desktop-swap/releases/v0.1.0a14/`. Keep that directory in
 place while the service uses it. Setup prints the installed client path; for this
 release, status and contribution commands are:
 
 ```sh
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a13/venv/bin/team-pool-client status
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a13/venv/bin/team-pool-client contribute-account
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a14/venv/bin/team-pool-client status
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a14/venv/bin/team-pool-client contribute-account
 ```
 
 If Share saves its sign-in elsewhere, use the same installer with its account
@@ -119,14 +125,33 @@ does not restore that handoff for users outside its enrollment list. An
 unenrolled SSH user can therefore receive "launcher started Claude Code without
 a credential" even while another user on the same Mac works.
 
-Enrollment alone does not guarantee SSH support. A helper started under an SSH
-login can be unable to read the same login Keychain that works in the user's
-desktop session. Confirm access in the actual helper context and test a resumed
-conversation. A one-time helper restart in the logged-in user's GUI context is
-a bounded repair; Desktop owns helper upgrades and cold starts, which can
-recreate the SSH context. Do not treat that repair as persistent SSH integration
-or install a competing restart loop for Desktop's helper. Preserve conversations,
-other users' services, and MCP/plugin credentials during recovery.
+Client a14 installs a per-user GUI execution bridge. The managed launcher routes
+only this user's bundled remote Code executable through it. The actual Code
+process runs in the logged-in user's macOS context and reads the native Keychain;
+the SSH helper continues to own the conversation and exchanges process input,
+output, signals and exit status through the relay. Neither the coordinator's
+refresh credentials nor native account tokens pass through the bridge protocol.
+Desktop can replace its SSH helper without requiring a manual GUI-context helper
+restart.
+
+The remote macOS user must remain signed into a desktop session. Switching to
+another macOS user may leave that session running; logging out ends its GUI
+services. There is no automatic fallback to a gateway or plaintext account
+credential. A missing bridge or unavailable native login produces an actionable
+error before starting Code. Existing Code processes created before the upgrade
+need a normal restart/retry to use the new launcher.
+
+For a read-only diagnosis on the remote Mac, run:
+
+```sh
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a14/venv/bin/team-pool-client doctor --ssh
+```
+
+The report distinguishes missing GUI login, stopped sync, expired assignment,
+policy pause and caller Keychain access. It does not claim that a remote
+conversation works merely because local checks pass. Confirm by resuming the
+original conversation. No service should repeatedly replace Desktop's own SSH
+helper. See [native SSH operation](ssh-native-mode.md).
 
 ## What membership controls
 

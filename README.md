@@ -40,7 +40,7 @@ keep the personal `cswap` rotator stopped while using the shared pool.
 
 This applies to **local Code sessions**. It does not switch regular Claude chats, Cowork, or cloud sessions. It does not create quota, pool billing balances, or guarantee uninterrupted retries and subagents when an account changes.
 
-The managed launcher is machine-wide and can also affect Desktop SSH sessions. Each macOS user needs their own pool enrollment; a working local setup does not establish that an SSH helper can access that user's login Keychain. See [shared Macs and SSH](docs/share-org-setup.md#shared-macs-and-ssh-sessions) before using an enrolled Mac as an SSH host.
+The managed launcher is machine-wide and can also affect Desktop SSH sessions. Each macOS user needs their own pool enrollment. The a14 team setup includes a GUI execution bridge so remote Code processes can read that user's native Keychain even when Desktop replaces its SSH helper. The remote macOS user must remain logged into a desktop session. See [shared Macs and SSH](docs/share-org-setup.md#shared-macs-and-ssh-sessions).
 
 ## Install
 
@@ -93,7 +93,7 @@ The wrapper normally leaves Desktop's Fast-mode restriction in place. To restore
 
 ## How it works
 
-Desktop can launch its bundled Code process through the system managed `processWrapper`. This installer sets that wrapper and enables `claudeCodeProcessWrapperEnabled` in the existing selected profile when its optional configuration library is present. An initialized standard Desktop installation uses its supported user-scoped macOS preference instead. Neither path creates a replacement Desktop profile or moves conversation data.
+Desktop can launch its bundled Code process through the system managed `processWrapper`. This installer sets that wrapper and enables `claudeCodeProcessWrapperEnabled` in the existing selected local configuration. An initialized standard installation gets Desktop's ordinary default configuration library containing only that flag. The flag does not select third-party mode or change the app's login/history identity. Earlier installer-owned managed-preference caches are migrated on repeat setup; conversation data stays in place.
 
 The wrapper removes host-pinned OAuth, API-key, and gateway environment values for the selected macOS user, then executes the original command and arguments. Claude Code can consequently read the native credential store that `cswap` updates. Other macOS users pass through the wrapper unchanged. The integration also removes the host's blanket nonessential-traffic restriction, which otherwise suppresses some account capabilities.
 
