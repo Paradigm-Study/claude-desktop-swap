@@ -49,11 +49,12 @@ class FakeNative:
 
     @contextmanager
     def noninteractive(self):
+        previous = self.interaction_allowed
         self.interaction_allowed = False
         try:
             yield
         finally:
-            self.interaction_allowed = True
+            self.interaction_allowed = previous
 
     def preflight(self, *, allow_redundant_fallback=False):
         pass
@@ -575,6 +576,311 @@ class ClientLifecycleTests(unittest.TestCase):
         self.assertTrue(self.native.interaction_allowed)
         self.assertEqual(self.client.status()["reason"], "keychain_access_required")
         self.assertIn("foreground authorization", output.getvalue())
+
+    def lock_wait(self):
+        self.enroll()
+        self.client.sync()
+        with patch.object(self.native, "snapshot", side_effect=NativeKeychainAccessError(-25308, reason="locked")):
+            with self.assertRaises(client.PausedError):
+                self.client.sync()
+        self.assertEqual(self.client.status()["reason"], "keychain_locked")
+
+    def test_proved_lock_wait_retains_state_without_assignments_or_writes(self):
+        self.lock_wait()
+        before = self.path.read_bytes()
+        requests, writes = len(self.transport.calls), len(self.native.writes)
+        observations = []
+
+        def locked_snapshot():
+            observations.append(self.native.interaction_allowed)
+            raise NativeKeychainAccessError(-25308, reason="locked")
+
+        with patch.object(self.native, "snapshot", side_effect=locked_snapshot):
+            for _ in range(3):
+                self.assertFalse(self.client.recover_locked_keychain())
+        self.assertEqual(observations, [False, False, False])
+        self.assertTrue(self.native.interaction_allowed)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(len(self.transport.calls), requests)
+        self.assertEqual(len(self.native.writes), writes)
+
+    def test_daemon_waits_for_unlock_then_performs_fresh_sync_noninteractively(self):
+        self.enroll()
+        self.client.sync()
+        is_locked = True
+        observations, delays = [], []
+        snapshot = self.native.snapshot
+        preflight = self.native.preflight
+        get_secret = self.native.get_secret
+        plan = self.native.plan
+        apply = self.native.apply
+
+        def read_snapshot():
+            observations.append(self.native.interaction_allowed)
+            if is_locked:
+                raise NativeKeychainAccessError(-25308, reason="locked")
+            return snapshot()
+
+        def guarded(operation):
+            def invoke(*args, **kwargs):
+                observations.append(self.native.interaction_allowed)
+                return operation(*args, **kwargs)
+            return invoke
+
+        requests = len(self.transport.calls)
+        self.transport.next = assignment(account_id="account-b", access_token="fixture-unlocked-token")
+
+        def sleep(delay):
+            nonlocal is_locked
+            self.assertFalse(self.native.interaction_allowed)
+            delays.append(delay)
+            if len(delays) <= 3:
+                self.assertEqual(len(self.transport.calls), requests)
+                self.assertEqual(len(self.native.writes), 1)
+            if len(delays) == 3:
+                is_locked = False
+            if len(delays) == 4:
+                raise InterruptedError("fixture daemon stop")
+
+        with patch.object(self.native, "snapshot", side_effect=read_snapshot), \
+                patch.object(self.native, "preflight", side_effect=guarded(preflight)), \
+                patch.object(self.native, "get_secret", side_effect=guarded(get_secret)), \
+                patch.object(self.native, "plan", side_effect=guarded(plan)), \
+                patch.object(self.native, "apply", side_effect=guarded(apply)), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            with self.assertRaises(InterruptedError):
+                client.run(self.client, sleep=sleep, jitter=lambda low, high: 1)
+        self.assertEqual(delays, [30, 30, 30, 30])
+        self.assertTrue(observations)
+        self.assertFalse(any(observations))
+        self.assertTrue(self.native.interaction_allowed)
+        self.assertEqual(self.client.status()["state"], "active")
+        self.assertEqual(self.client.status()["account_id"], "account-b")
+        self.assertEqual(len(self.transport.calls), requests + 1)
+        self.assertEqual(len(self.native.writes), 2)
+        events = [json.loads(line)["event"] for line in output.getvalue().splitlines() if line.startswith("{")]
+        self.assertEqual(events, ["keychain-waiting", "keychain-ready"])
+        for secret in (INVITE, DEVICE_TOKEN, PROVIDER_TOKEN, "fixture-unlocked-token"):
+            self.assertNotIn(secret, output.getvalue())
+
+    def test_daemon_restart_while_locked_stays_alive_without_repeated_logs(self):
+        self.lock_wait()
+        requests, writes = len(self.transport.calls), len(self.native.writes)
+        delays = []
+
+        def sleep(delay):
+            delays.append(delay)
+            if len(delays) == 3:
+                raise InterruptedError("fixture daemon stop")
+
+        with patch.object(self.native, "snapshot", side_effect=NativeKeychainAccessError(-25308, reason="locked")), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            with self.assertRaises(InterruptedError):
+                client.run(self.restart(), sleep=sleep)
+        self.assertEqual(delays, [30, 30, 30])
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertEqual(json.loads(output.getvalue())["event"], "keychain-waiting")
+        self.assertEqual(len(self.transport.calls), requests)
+        self.assertEqual(len(self.native.writes), writes)
+
+    def test_lock_recovery_does_not_touch_other_pauses_or_departed_enrollment(self):
+        self.lock_wait()
+        for state_name, reason in (("paused", "keychain_access_required"),
+                                   ("paused", "native_credentials_changed"),
+                                   ("paused", "partial_native_write"),
+                                   ("paused", "native_setup_or_policy"),
+                                   ("paused", "native_store_capacity"),
+                                   ("paused", "manual_pause"),
+                                   ("revoked", "device_revoked"),
+                                   ("left", "keychain_locked")):
+            with self.subTest(state=state_name, reason=reason):
+                state = self.client._load()
+                state.update(state=state_name, reason=reason)
+                self.client._save(state)
+                before = self.path.read_bytes()
+                with patch.object(self.native, "noninteractive") as guard, \
+                        patch.object(self.native, "snapshot") as snapshot:
+                    self.assertFalse(self.client.recover_locked_keychain())
+                guard.assert_not_called()
+                snapshot.assert_not_called()
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_lock_recovery_refuses_native_drift_without_requesting_assignment(self):
+        self.lock_wait()
+        self.native.credentials = {"manual": "fixture-different-login"}
+        before = copy.deepcopy(self.native.credentials)
+        requests = len(self.transport.calls)
+        with self.assertRaises(client.PausedError):
+            self.client.recover_locked_keychain()
+        self.assertEqual(self.client.status()["reason"], "native_credentials_changed")
+        self.assertEqual(self.native.credentials, before)
+        self.assertEqual(len(self.transport.calls), requests)
+        self.assertEqual(len(self.native.writes), 1)
+
+    def test_lock_recovery_requires_backup_and_device_secret(self):
+        self.lock_wait()
+        state = self.client._load()
+        for missing, reason in (("backup", "native_setup_or_policy"),
+                                ("device", "keychain_access_required")):
+            with self.subTest(missing=missing):
+                self.client._save(state)
+                self.native.has_backup = missing != "backup"
+                self.native.secrets[client.DEVICE_SECRET] = None if missing == "device" else DEVICE_TOKEN
+                with self.assertRaises(client.PausedError):
+                    self.client.recover_locked_keychain()
+                self.assertEqual(self.client.status()["reason"], reason)
+        self.assertEqual(len(self.native.writes), 1)
+
+    def test_lock_before_native_apply_recovers_untouched_journal_then_syncs(self):
+        self.enroll()
+        self.client.sync()
+        self.transport.next = assignment(account_id="account-b", access_token="fixture-renewed-token")
+        with patch.object(self.native, "apply", side_effect=NativeKeychainAccessError(-25308, reason="locked")):
+            with self.assertRaises(client.PausedError):
+                self.client.sync()
+        pending = self.client._load()["pending_write"]
+        self.assertEqual(self.native.snapshot()["fingerprint"], pending["before"])
+        self.assertTrue(self.client.recover_locked_keychain())
+        self.assertNotIn("pending_write", self.client._load())
+        self.assertEqual(len(self.native.writes), 1)
+        self.assertEqual(self.client.sync()["account_id"], "account-b")
+        self.assertEqual(len(self.native.writes), 2)
+
+    def test_lock_after_complete_native_apply_commits_recorded_fingerprint(self):
+        self.enroll()
+        self.client.sync()
+        self.transport.next = assignment(account_id="account-b", access_token="fixture-renewed-token")
+        apply = self.native.apply
+
+        def applied_then_locked(*args, **kwargs):
+            apply(*args, **kwargs)
+            raise NativeKeychainAccessError(-25308, reason="locked")
+
+        with patch.object(self.native, "apply", side_effect=applied_then_locked):
+            with self.assertRaises(client.PausedError):
+                self.client.sync()
+        pending = self.client._load()["pending_write"]
+        self.assertEqual(self.native.snapshot()["fingerprint"], pending["after"])
+        requests = len(self.transport.calls)
+        self.assertTrue(self.client.recover_locked_keychain())
+        self.assertNotIn("pending_write", self.client._load())
+        self.assertEqual(self.client._load()["fingerprint"], pending["after"])
+        self.assertEqual(self.client.status()["account_id"], "account-b")
+        self.assertEqual(len(self.transport.calls), requests)
+        self.assertEqual(len(self.native.writes), 2)
+
+    def test_lock_recovery_preserves_partial_or_unrelated_pending_writes(self):
+        self.enroll()
+        self.client.sync()
+        self.transport.next = assignment(account_id="account-b", access_token="fixture-renewed-token")
+        self.native.partial_write = True
+        with self.assertRaises(SystemExit):
+            self.client.sync()
+        state = self.client._load()
+        state.update(state="paused", reason="keychain_locked")
+        partial = copy.deepcopy(self.native.credentials)
+        for credentials, reason in ((partial, "partial_native_write"),
+                                    ({"manual": "fixture-login"}, "native_credentials_changed")):
+            with self.subTest(reason=reason):
+                self.native.credentials = copy.deepcopy(credentials)
+                self.client._save(state)
+                with self.assertRaises(client.PausedError):
+                    self.client.recover_locked_keychain()
+                self.assertEqual(self.client.status()["reason"], reason)
+                self.assertEqual(self.client._load()["pending_write"], state["pending_write"])
+                self.assertEqual(self.native.credentials, credentials)
+        self.assertEqual(len(self.native.writes), 1)
+
+    def test_lock_recovery_checks_policy_before_finishing_recorded_write(self):
+        self.enroll()
+        self.client.sync()
+        with patch.object(self.native, "apply", side_effect=NativeKeychainAccessError(-25308, reason="locked")):
+            with self.assertRaises(client.PausedError):
+                self.client.sync()
+        pending = self.client._load()["pending_write"]
+        with patch.object(self.native, "preflight", side_effect=NativePolicyError("fixture-policy")):
+            with self.assertRaises(client.PausedError):
+                self.client.recover_locked_keychain()
+        self.assertEqual(self.client.status()["reason"], "native_setup_or_policy")
+        self.assertEqual(self.client._load()["pending_write"], pending)
+
+    def test_lock_recovery_cannot_take_over_unmanaged_enrollment(self):
+        self.lock_wait()
+        state = self.client._load()
+        state["managed"] = False
+        self.client._save(state)
+        with patch.object(self.native, "snapshot") as snapshot:
+            with self.assertRaises(client.PausedError):
+                self.client.recover_locked_keychain()
+        snapshot.assert_not_called()
+        self.assertEqual(self.client.status()["reason"], "keychain_access_required")
+
+    def test_waiting_daemon_preserves_a_manual_pause_before_recovery_lock(self):
+        self.lock_wait()
+
+        def sleep(_):
+            state = self.client._load()
+            state.update(state="paused", reason="manual_pause")
+            self.client._save(state)
+
+        with patch.object(self.native, "snapshot") as snapshot, \
+                patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(client.run(self.client, sleep=sleep), 2)
+        snapshot.assert_not_called()
+        self.assertEqual(self.client.status()["reason"], "manual_pause")
+        self.assertEqual(len(self.native.writes), 1)
+
+    def test_foreground_resume_closes_wait_before_a_later_lock(self):
+        self.lock_wait()
+        delays = []
+        is_locked = False
+        snapshot = self.native.snapshot
+
+        def guarded_snapshot():
+            if is_locked:
+                raise NativeKeychainAccessError(-25308, reason="locked")
+            return snapshot()
+
+        def sleep(delay):
+            nonlocal is_locked
+            delays.append(delay)
+            if len(delays) == 1:
+                # Another client has explicitly resumed between daemon polls.
+                self.restart().resume()
+            elif len(delays) == 2:
+                is_locked = True
+            elif len(delays) == 3:
+                state = self.client._load()
+                state.update(state="paused", reason="manual_pause")
+                self.client._save(state)
+
+        with patch.object(self.native, "snapshot", side_effect=guarded_snapshot), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertEqual(client.run(self.client, sleep=sleep, jitter=lambda low, high: 1), 2)
+        events = [json.loads(line)["event"] for line in output.getvalue().splitlines() if line.startswith("{")]
+        self.assertEqual(events, ["keychain-waiting", "keychain-ready", "keychain-waiting", "sync-stopped"])
+        self.assertEqual(self.client.status()["reason"], "manual_pause")
+
+    def test_lock_recovery_unknown_denial_and_guard_failure_require_foreground(self):
+        self.lock_wait()
+        state = self.client._load()
+        failures = (("snapshot", NativeKeychainAccessError(-25308)),
+                    ("snapshot", NativeStoreError("FAKE_SECRET")),
+                    ("noninteractive", NativeStoreError("FAKE_SECRET")))
+        for stage, error in failures:
+            with self.subTest(stage=stage, error=type(error).__name__):
+                self.client._save(state)
+                with patch.object(self.native, stage, side_effect=error):
+                    with self.assertRaises(client.PausedError) as raised:
+                        self.client.recover_locked_keychain()
+                self.assertNotIn("FAKE_SECRET", str(raised.exception))
+                self.assertEqual(self.client.status()["reason"], "keychain_access_required")
+                self.assertTrue(self.native.interaction_allowed)
+
+    def test_explicit_resume_remains_available_for_locked_keychain_pause(self):
+        self.lock_wait()
+        self.assertEqual(self.client.resume()["state"], "enrolled")
+        self.assertEqual(self.client.sync()["state"], "active")
 
     def test_daemon_cannot_start_if_keychain_ui_cannot_be_disabled(self):
         self.enroll()

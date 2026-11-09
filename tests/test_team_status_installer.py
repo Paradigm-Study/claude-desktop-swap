@@ -248,6 +248,12 @@ if command == "format" {
     state["state"] = "paused"
     save()
     precondition(!readStatus(statePath: path, runningOverride: true).canSwitch)
+    state["reason"] = "keychain_locked"
+    save()
+    let locked = readStatus(statePath: path, runningOverride: true)
+    precondition(!locked.canSwitch && locked.heading == "Waiting for Keychain")
+    precondition(readStatus(statePath: path, runningOverride: false).heading == "Automatic switching paused")
+    state.removeValue(forKey: "reason")
     state["state"] = "active"
     state["pending_write"] = ["account_id": "other-account"]
     save()

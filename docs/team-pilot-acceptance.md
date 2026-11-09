@@ -481,3 +481,36 @@ The fixture now accepts immediate EOF/reset or broken pipe while separately
 asserting that parsing, pool inspection and process creation were never reached.
 All 20 relay tests and 100 focused race iterations passed locally, including 50
 with an intentionally delayed write. This correction changes tests only.
+
+## a15: recoverable Keychain waits and explicit setup recovery
+
+On November 9, Mac A's a13 daemon stopped after a Keychain-access error at
+08:01:36 UTC. Two hours later, noninteractive native access, backup and ownership
+checks passed, but the persisted pause still blocked both automatic assignment
+and menu switching. Its assigned account had reached 100% weekly usage; eight
+other pool accounts were eligible. The old diagnostic did not distinguish a
+locked Keychain, an approval problem or a command failure, so the original access
+failure's exact cause remains unknown.
+
+Explicit guarded resume and normal automatic sync selected an eligible account
+in 0.25 seconds. The installed a13 menu helper then switched to another eligible
+account and back in 0.38 and 0.39 seconds. Backup, device token and shared connector
+values were preserved. A fresh native Sonnet request returned exact `OK` with
+exit zero in 3.70 seconds. These checks establish restored switching and native
+authentication; they do not establish that an existing in-flight conversation
+has reloaded its credential.
+
+Client a15 distinguishes a positively observed locked Keychain from unknown
+access failures. The former keeps the daemon alive with a noninteractive
+30-second wait and verifies ownership, backup, device identity, policy and any
+write journal before resuming. Unknown access failures still stop background
+sync. Explicit setup can now repair an owned Keychain pause instead of rejecting
+the recovery action recommended by the menu. Read-only checks remain read-only.
+
+Local validation passed 539 tests with one optional dependency skip. Regression
+coverage includes lock/unlock, daemon restart while waiting, foreground resume,
+new manual pauses, native drift, missing recovery data, completed versus partial
+writes, unclassified access errors and the menu's waiting state. Independent
+review reran 143 focused tests. No live Keychain lock, sleep/wake or logout test
+was performed, and these changes do not guarantee recovery from arbitrary ACL
+or command failures. The coordinator and GUI execution protocol are unchanged.

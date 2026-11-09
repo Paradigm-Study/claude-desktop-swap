@@ -34,6 +34,7 @@ DEFAULT_CONFIG = Path.home() / ".config/claude-desktop-swap/team.json"
 SERVICE = "study.paradigm.claude-desktop-swap.team"
 DEVICE_SECRET = "device-token"
 MAX_RESPONSE = 64 * 1024
+KEYCHAIN_WAIT_SECONDS = 30
 _REQUEST_ENDPOINTS = frozenset((
     "/v1/enroll", "/v1/enroll/share", "/v1/link/share", "/v1/assignment",
     "/v1/accounts/list", "/v1/contributions/start", "/v1/contributions/complete",
@@ -396,12 +397,19 @@ class Client:
     def _transport(self, state):
         return self.transport or Transport(state["server"], allow_loopback_http=state.get("allow_loopback_http", False))
 
-    def _keychain_access_required(self, state=None):
-        message = ("Keychain access requires foreground authorization. Run resume and then sync --once "
+    def _keychain_access_required(self, state=None, error=None):
+        # An access error alone never authorizes retries. Only the native
+        # adapter's explicit lock metadata can enter the recoverable wait.
+        locked = getattr(error, "reason", None) == "locked"
+        reason = "keychain_locked" if locked else "keychain_access_required"
+        message = ("The login Keychain is locked. Background synchronization will wait for it to unlock."
+                   if locked else
+                   "Keychain access requires foreground authorization. Run resume and then sync --once "
                    "in Terminal, approve the expected Keychain request, then restart the service.")
         if state is not None:
-            state.update(state="paused", reason="keychain_access_required")
-            self._save(state)
+            if (state.get("state"), state.get("reason")) != ("paused", reason):
+                state.update(state="paused", reason=reason)
+                self._save(state)
             raise PausedError(message) from None
         raise ClientError(message) from None
 
@@ -423,8 +431,8 @@ class Client:
                 self._save(state)
                 raise PausedError("Native setup or policy changed. Correct it, then explicitly resume the client.") from None
             raise ClientError("Native setup or policy preflight failed; verify the launcher, local selectors, and authentication settings.") from None
-        except NativeKeychainAccessError:
-            self._keychain_access_required(state)
+        except NativeKeychainAccessError as error:
+            self._keychain_access_required(state, error)
         except NativeStoreError:
             raise ClientError("Native credential preflight failed; verify Keychain access.") from None
 
@@ -437,8 +445,8 @@ class Client:
             state.update(state="paused", reason="native_credentials_changed")
             self._save(state)
             raise PausedError("Native credentials changed during recovery. Both credential stores were preserved.") from None
-        except NativeKeychainAccessError:
-            self._keychain_access_required(state)
+        except NativeKeychainAccessError as error:
+            self._keychain_access_required(state, error)
         except NativePolicyError:
             state.update(state="paused", reason="native_setup_or_policy")
             self._save(state)
@@ -483,8 +491,8 @@ class Client:
             self._preflight(state, inspect_native=not state.get("managed", False))
             try:
                 snapshot = self.native.snapshot()
-            except NativeKeychainAccessError:
-                self._keychain_access_required(state)
+            except NativeKeychainAccessError as error:
+                self._keychain_access_required(state, error)
             except NativeStoreError:
                 raise ClientError("Cannot inspect native credential state; no assignment was requested.") from None
             self._recover_pending(state, snapshot)
@@ -502,8 +510,8 @@ class Client:
                 self._preflight(state)
             try:
                 token = self.native.get_secret(DEVICE_SECRET)
-            except NativeKeychainAccessError:
-                self._keychain_access_required(state)
+            except NativeKeychainAccessError as error:
+                self._keychain_access_required(state, error)
             if not _safe_string(token):
                 raise ClientError("Device credential is missing. Leave and enroll with a new invitation.")
             try:
@@ -553,8 +561,8 @@ class Client:
                 state.update(state="paused", reason="native_setup_or_policy")
                 self._save(state)
                 raise PausedError("Native policy blocks this assignment; correct the policy or pool, then explicitly resume.") from None
-            except NativeKeychainAccessError:
-                self._keychain_access_required(state)
+            except NativeKeychainAccessError as error:
+                self._keychain_access_required(state, error)
             except NativeStoreError:
                 raise ClientError("Could not update the native credential store. Enrollment is preserved.") from None
             if fingerprint != pending["after"]:
@@ -705,6 +713,64 @@ class Client:
                        synced_at=current.get("synced_at"), catalog_at=self.clock())
         return catalog
 
+    def recover_locked_keychain(self):
+        """Clear only a proved lock wait after noninteractive ownership checks.
+
+        This is not foreground resume: it accepts only a complete or untouched
+        recorded write and never retires fallback files. Eligibility and recovery
+        share the client lock, so a newer manual pause cannot be cleared by a
+        stale observer. Normal sync rechecks ownership before any assignment.
+        """
+        from .native import NativeKeychainAccessError, NativePolicyError, NativeStoreError
+        with self.locked():
+            state = self._load()
+            if state.get("state") != "paused" or state.get("reason") != "keychain_locked":
+                return False
+
+            def stop(reason, message):
+                state.update(state="paused", reason=reason)
+                self._save(state)
+                raise PausedError(message) from None
+
+            if not state.get("managed") or not isinstance(state.get("fingerprint"), str) or not re.fullmatch(r"[a-f0-9]{64}", state["fingerprint"]):
+                self._keychain_access_required(state)
+            pending = state.get("pending_write")
+            if pending is not None and (not isinstance(pending, dict)
+                    or any(not isinstance(pending.get(key), str) or not re.fullmatch(r"[a-f0-9]{64}", pending[key])
+                           for key in ("before", "keychain_only", "after"))
+                    or pending["before"] != state["fingerprint"]):
+                stop("partial_native_write", "The native write recovery record needs foreground review; synchronization remains paused.")
+            try:
+                # Always enforce this even when called outside the daemon.
+                with self.native.noninteractive():
+                    self._preflight(state, inspect_native=False)
+                    snapshot = self.native.snapshot()
+                    if not snapshot["has_backup"]:
+                        stop("native_setup_or_policy", "The native recovery backup is missing; synchronization remains paused.")
+                    self.native.preflight()
+                    token = self.native.get_secret(DEVICE_SECRET)
+                    if not _safe_string(token):
+                        self._keychain_access_required(state)
+                    # A lock can happen after journaling but before native
+                    # apply. Reuse the existing before/after recovery rules;
+                    # an intermediate or unrelated write remains paused.
+                    self._recover_pending(state, snapshot)
+                    if snapshot["fingerprint"] != state["fingerprint"]:
+                        stop("native_credentials_changed", "Native credentials changed while waiting; synchronization remains paused.")
+            except NativeKeychainAccessError as error:
+                if error.reason == "locked":
+                    return False
+                self._keychain_access_required(state, error)
+            except NativePolicyError:
+                stop("native_setup_or_policy", "Native setup or policy changed while waiting; explicitly repair and resume the client.")
+            except NativeStoreError:
+                # Read, ACL and guard failures are not evidence of a lock.
+                self._keychain_access_required(state)
+            state["state"] = "enrolled"
+            state.pop("reason", None)
+            self._save(state)
+            return True
+
     def resume(self):
         """Acknowledge repaired setup; never overwrite or accept native-login drift."""
         from .native import NativeKeychainAccessError
@@ -716,8 +782,8 @@ class Client:
             try:
                 snapshot = self.native.snapshot()
                 token = self.native.get_secret(DEVICE_SECRET)
-            except NativeKeychainAccessError:
-                self._keychain_access_required(state)
+            except NativeKeychainAccessError as error:
+                self._keychain_access_required(state, error)
             if not _safe_string(token):
                 raise ClientError("Device credential is missing. Leave and enroll with a new invitation.")
             self._recover_pending(state, snapshot)
@@ -844,18 +910,34 @@ def _sync_diagnostic(event, *, started, failures, error=None, retry_in=None):
 def _run(client, *, sleep, jitter):
     failures = 0
     last_state = None
+    waiting_for_keychain = False
     while True:
         started = time.monotonic()
         failure = None
         recovered_attempts = 0
         try:
+            if waiting_for_keychain and client.recover_locked_keychain():
+                waiting_for_keychain = False
+                _sync_diagnostic("keychain-ready", started=started, failures=0)
             status = client.sync()
+            # Foreground resume can clear the persisted pause between waits.
+            # A successful sync closes that wait even if this process did not
+            # perform the guarded recovery itself.
+            if waiting_for_keychain:
+                waiting_for_keychain = False
+                _sync_diagnostic("keychain-ready", started=started, failures=0)
             recovered_attempts = failures
             failures = 0
             delay = max(5, status.get("next_sync_in", 30))
         except PausedError as error:
-            _sync_diagnostic("sync-stopped", started=started, failures=failures + 1, error=error)
             status = client.status()
+            if status.get("state") == "paused" and status.get("reason") == "keychain_locked":
+                if not waiting_for_keychain:
+                    _sync_diagnostic("keychain-waiting", started=started, failures=0)
+                    waiting_for_keychain = True
+                sleep(KEYCHAIN_WAIT_SECONDS)
+                continue
+            _sync_diagnostic("sync-stopped", started=started, failures=failures + 1, error=error)
             if status.get("reason") == "keychain_access_required":
                 print("Client paused: Keychain access requires foreground authorization. Run resume and sync --once in Terminal before restarting the service.", flush=True)
             else:

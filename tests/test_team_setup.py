@@ -254,6 +254,49 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(self.client.config.read_bytes(), before)
         self.assertEqual(self.mutations(), [])
 
+    def assert_owned_keychain_setup_repair(self, reason):
+        self.active(state="paused", reason=reason)
+        device = self.client._load()["device_id"]
+        original = copy.deepcopy(self.native.original)
+        secret = self.native.secrets[DEVICE_SECRET]
+        result = self.setup.run()
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(self.client._load()["device_id"], device)
+        self.assertEqual(self.native.original, original)
+        self.assertEqual(self.native.secrets[DEVICE_SECRET], secret)
+        self.assertEqual(self.enroll_calls, [True])
+
+    def test_foreground_setup_can_repair_owned_keychain_approval_pause(self):
+        self.assert_owned_keychain_setup_repair("keychain_access_required")
+
+    def test_foreground_setup_can_repair_owned_locked_keychain_wait(self):
+        self.assert_owned_keychain_setup_repair("keychain_locked")
+
+    def test_keychain_setup_repair_refuses_manual_login_and_missing_backup(self):
+        self.active(state="paused", reason="keychain_access_required")
+        original_credentials = copy.deepcopy(self.native.credentials)
+        self.native.credentials = {"manual": "fixture-sign-in"}
+        before = self.client.config.read_bytes()
+        with self.assertRaisesRegex(ClientError, "manual login"):
+            self.setup.run()
+        self.assertEqual(self.client.config.read_bytes(), before)
+        self.assertEqual(self.mutations(), [])
+        self.native.credentials = original_credentials
+        self.native.original = None
+        self.native.has_backup = False
+        with self.assertRaisesRegex(ClientError, "backup is missing"):
+            self.setup.run()
+        self.assertEqual(self.client.config.read_bytes(), before)
+        self.assertEqual(self.mutations(), [])
+
+    def test_readiness_check_never_resumes_keychain_pause(self):
+        self.active(state="paused", reason="keychain_access_required")
+        before = self.client.config.read_bytes()
+        with self.assertRaises(ClientError):
+            self.setup.run(check=True)
+        self.assertEqual(self.client.config.read_bytes(), before)
+        self.assertEqual(self.mutations(), [])
+
     def test_readiness_check_never_resumes_owned_policy_pause(self):
         self.active(state="paused", reason="native_setup_or_policy")
         before = self.client.config.read_bytes()

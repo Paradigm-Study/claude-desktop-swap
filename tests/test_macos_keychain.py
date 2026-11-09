@@ -6,7 +6,7 @@ import unittest
 
 from team_pool.macos_keychain import (
     ITEM_NOT_FOUND, KeychainInteractionError, KeychainWriteError, MacOSKeychain,
-    _SecurityAPI, access_required_status,
+    _SecurityAPI, access_required_reason, access_required_status,
 )
 
 
@@ -75,6 +75,7 @@ class MacOSKeychainTests(unittest.TestCase):
                 with self.assertRaises(KeychainWriteError) as raised:
                     backend.set_password("sensitive-service", "sensitive-user", "sensitive-value")
                 self.assertEqual(raised.exception.status, status)
+                self.assertEqual(raised.exception.reason, "access_required")
                 self.assertNotIn("sensitive", str(raised.exception))
                 self.assertEqual([call[0] for call in api.calls], ["update"])
                 self.assertEqual(reader.calls, [])
@@ -126,6 +127,28 @@ class MacOSKeychainTests(unittest.TestCase):
         cycle = RuntimeError("cycle")
         cycle.__cause__ = cycle
         self.assertIsNone(access_required_status(cycle))
+
+    def test_only_our_explicit_typed_lock_is_retryable(self):
+        self.assertEqual(access_required_reason(KeychainWriteError(-25308, reason="locked")), "locked")
+        for error in (KeychainWriteError(-25308), RuntimeError(-25308, "locked")):
+            self.assertEqual(access_required_reason(error), "access_required")
+        spoofed = RuntimeError(-25308, "FAKE_SECRET")
+        spoofed.reason = "locked"
+        self.assertEqual(access_required_reason(spoofed), "access_required")
+        wrapped = RuntimeError("FAKE_SECRET")
+        wrapped.__cause__ = KeychainWriteError(-25308, reason="locked")
+        self.assertEqual(access_required_reason(wrapped), "access_required")
+
+    def test_reason_vocabulary_drops_arbitrary_exception_data(self):
+        class LooksLocked:
+            def __eq__(self, other):
+                return True
+
+        for reason in ("FAKE_SECRET", {"token": "FAKE_SECRET"}, LooksLocked(), None):
+            error = KeychainWriteError(-25308, reason=reason)
+            self.assertEqual(error.reason, "access_required")
+            self.assertEqual(access_required_reason(error), "access_required")
+            self.assertNotIn("FAKE_SECRET", str(error))
 
 
 class CFConstructionTests(unittest.TestCase):

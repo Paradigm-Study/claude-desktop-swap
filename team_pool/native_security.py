@@ -65,11 +65,11 @@ class NativeSecurityCLI:
             return
         try:
             inspector = self.inspector or NativeACLInspector(self.api)
-            allowed = inspector.ready(SERVICE, username)
+            reason = inspector.access_reason(SERVICE, username)
         except Exception:
-            allowed = False
-        if not allowed:
-            raise KeychainWriteError(-25308)
+            reason = "access_required"
+        if reason is not None:
+            raise KeychainWriteError(-25308, reason=reason)
 
     def _run(self, arguments, *, background, payload=None, reading=False):
         try:
@@ -178,6 +178,15 @@ class NativeACLInspector:
         return False
 
     def ready(self, service, username):
+        return self.access_reason(service, username) is None
+
+    def access_reason(self, service, username):
+        """Return None when safe, otherwise a closed access failure category.
+
+        Only a successful lock-status query that explicitly reports locked is
+        recoverable without foreground approval. Missing items, ACL denials and
+        unavailable metadata are deliberately indistinguishable here.
+        """
         previous = self.api.get_user_interaction_allowed()
         self.api.set_user_interaction_allowed(False)
         try:
@@ -190,8 +199,10 @@ class NativeACLInspector:
                 item = self._copy(stack, self.copy_item, query)
                 keychain = self._copy(stack, self.copy_keychain, item)
                 status = ctypes.c_uint32()
-                if self.keychain_status(keychain, ctypes.byref(status)) != 0 or not status.value & 1:
-                    return False
+                if self.keychain_status(keychain, ctypes.byref(status)) != 0:
+                    return "access_required"
+                if not status.value & 1:
+                    return "locked"
                 access = self._copy(stack, self.copy_access, item)
                 acls = self._copy(stack, self.copy_acls, access)
                 partitions = []
@@ -208,17 +219,19 @@ class NativeACLInspector:
                             if value:
                                 acl_stack.enter_context(self.api._owned(value))
                         if result != 0:
-                            return False
+                            return "access_required"
                         if "ACLAuthorizationPartitionID" in tags:
                             value = plistlib.loads(bytes.fromhex(self._string(description.value)))
                             ids = value.get("Partitions") if isinstance(value, dict) else None
                             if not isinstance(ids, list) or not all(isinstance(value, str) for value in ids):
-                                return False
+                                return "access_required"
                             partitions.append(ids)
                         if "ACLAuthorizationDecrypt" in tags and not flags.value & 1:
                             decrypt_allowed |= self._security_trusted(apps.value)
-                return bool(partitions) and all("apple-tool:" in ids for ids in partitions) and decrypt_allowed
+                if bool(partitions) and all("apple-tool:" in ids for ids in partitions) and decrypt_allowed:
+                    return None
+                return "access_required"
         except Exception:
-            return False
+            return "access_required"
         finally:
             self.api.set_user_interaction_allowed(previous)

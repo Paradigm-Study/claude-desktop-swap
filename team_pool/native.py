@@ -46,9 +46,12 @@ class NativeStoreError(RuntimeError):
 class NativeKeychainAccessError(NativeStoreError):
     """Foreground approval or an unlocked Keychain is required."""
 
-    def __init__(self, status):
+    def __init__(self, status, *, reason="access_required"):
         self.status = status
-        super().__init__("Keychain access requires foreground authorization.")
+        self.reason = "locked" if type(reason) is str and reason == "locked" else "access_required"
+        message = ("The native Keychain is locked." if self.reason == "locked"
+                   else "Keychain access requires foreground authorization.")
+        super().__init__(message)
 
 
 class NativeDriftError(NativeStoreError):
@@ -241,10 +244,11 @@ class NativeStore:
         try:
             return self.backend.get_password(service, account)
         except Exception as error:
-            from .macos_keychain import access_required_status
+            from .macos_keychain import access_required_reason, access_required_status
             status = access_required_status(error)
             if status is not None:
-                raise NativeKeychainAccessError(status) from None
+                reason = access_required_reason(error) if service == NATIVE_SERVICE else "access_required"
+                raise NativeKeychainAccessError(status, reason=reason) from None
             raise NativeStoreError("Keychain read failed or was denied; no plaintext fallback is used.") from None
 
     def _set(self, service, account, value):
@@ -257,10 +261,11 @@ class NativeStore:
                 if self.backend.get_password(service, account) != value:
                     raise ValueError
         except Exception as error:
-            from .macos_keychain import access_required_status
+            from .macos_keychain import access_required_reason, access_required_status
             status = access_required_status(error)
             if status is not None:
-                raise NativeKeychainAccessError(status) from None
+                reason = access_required_reason(error) if service == NATIVE_SERVICE else "access_required"
+                raise NativeKeychainAccessError(status, reason=reason) from None
             raise NativeStoreError("Keychain write failed or could not be verified.") from None
 
     @contextmanager
