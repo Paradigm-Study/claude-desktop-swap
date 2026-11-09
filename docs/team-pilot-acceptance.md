@@ -1,6 +1,6 @@
 # Live two-Mac acceptance worksheet
 
-Status: **IN PROGRESS — client 0.1.0a14 active for the SSH user on Mac B; a13 last verified on Mac A**.
+Status: **IN PROGRESS — client/menu 0.1.0a15 active on Mac A; a14 last verified for the SSH user on Mac B**.
 Mac B's a14 upgrade preserved enrollment, native ownership, shared connector
 credentials and existing conversation files. A newly created helper started in
 plain SSH context authenticated and completed a native request through the GUI
@@ -514,3 +514,15 @@ writes, unclassified access errors and the menu's waiting state. Independent
 review reran 143 focused tests. No live Keychain lock, sleep/wake or logout test
 was performed, and these changes do not guarantee recovery from arbitrary ACL
 or command failures. The coordinator and GUI execution protocol are unchanged.
+
+The a15 client and menu were installed on Mac A in **3.50 seconds**. Its existing
+Desktop launcher and settings hashes and Desktop process remained unchanged;
+this user-level update did not install the SSH GUI bridge on Mac A. The new sync
+service committed a newer active assignment before the menu was replaced.
+The installed a15 helper loaded the pool in **0.16 seconds**, switched to an
+eligible account in **0.41 seconds**, and restored the original selection in
+**0.37 seconds**. A fresh native Sonnet request returned exact `OK` in
+**3.78 seconds**. Device identity and token, recovery backup, and all four shared
+connector records matched the pre-update baseline. Native ownership matched,
+the assignment was unexpired, no write was pending, and background sync remained
+running. Visible menu clicks and the original conversation were not exercised.
