@@ -462,3 +462,15 @@ lost service-drain reply. These tests do not establish future provider renewal,
 all Desktop updates, logout/login, sleep/wake, menu clicks or quota switching
 within a running conversation. A GUI login is still required; logging out ends
 its services and processes. Coordinator code was unchanged by a14.
+
+After publication, the public branch installer matched the tested script and
+its exact `curl ... | /bin/bash` invocation completed on Mac B. Desktop helper
+processes continued using the original `Claude` user-data directory, with no
+`Claude-3p` user-data override. A fresh child of the existing SSH helper also
+reported native Max authentication in 0.46 seconds. Temporary verification jobs
+were removed; the permanent sync and GUI execution services remained active.
+The [release CI run](https://github.com/Paradigm-Study/claude-desktop-swap/actions/runs/42573240344)
+passed on macOS and Linux, both with and without the optional upstream package,
+and passed the unchanged Cloudflare coordinator checks. A test-only follow-up
+bounds the relay environment fixture's wait and handles failure/EOF explicitly;
+it does not change the released runtime.

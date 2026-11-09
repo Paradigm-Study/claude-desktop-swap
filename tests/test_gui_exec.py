@@ -238,15 +238,31 @@ class GUIExecTests(unittest.TestCase):
         self.assertNotEqual(clean["USER"], "other")
         executable = self.cli("import os,json\nprint(json.dumps(dict(os.environ)))\n")
         conn = self.connect()
-        conn.sendall(bridge._frame(b"J", bridge._json(self.request(executable, source))))
         incoming, output = bytearray(), bytearray()
         finished = False
-        while not finished:
-            incoming.extend(conn.recv(32768))
-            while (frame := bridge._take(incoming)) is not None:
-                kind, data = frame
-                if kind == b"O": output.extend(data)
-                if kind == b"X": finished = True
+        deadline = time.monotonic() + 5
+        try:
+            conn.sendall(bridge._frame(b"J", bridge._json(self.request(executable, source))))
+            while not finished:
+                remaining = deadline - time.monotonic()
+                self.assertGreater(remaining, 0, "GUI relay did not finish before the test deadline")
+                conn.settimeout(remaining)
+                try:
+                    received = conn.recv(32768)
+                except socket.timeout:
+                    self.fail("GUI relay did not finish before the test deadline")
+                self.assertTrue(received, "GUI relay closed before reporting process exit")
+                incoming.extend(received)
+                while (frame := bridge._take(incoming)) is not None:
+                    kind, data = frame
+                    if kind == b"F":
+                        self.fail("GUI relay reported a startup or execution failure")
+                    if kind == b"O": output.extend(data)
+                    if kind == b"X":
+                        self.assertEqual(data, b"0", "Environment fixture did not exit successfully")
+                        finished = True
+        finally:
+            conn.close()
         self.assertNotIn(b"secret", output)
         self.assertEqual(json.loads(output)["HOME"], str(self.home))
 
