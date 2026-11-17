@@ -85,7 +85,7 @@ private func readStatus(statePath: URL = stateURL, runningOverride: Bool? = nil)
         "partial_native_write": "Interrupted sign-in update needs recovery",
         "coordinator_unavailable": "Shared coordinator is unavailable",
         "quota_stale": "Waiting for fresh account usage",
-        "quota_exhausted": "All available pool accounts have reached the quota threshold",
+        "quota_exhausted": "Some reported quotas reached the threshold; check model limits or choose another account",
         "device_revoked": "This Mac’s pool access was revoked",
         "keychain_access_required": "Keychain access needs attention; run setup in Terminal",
         "keychain_locked": "Unlock your login Keychain; sync will recheck access automatically",
@@ -113,7 +113,15 @@ private func readStatus(statePath: URL = stateURL, runningOverride: Bool? = nil)
     } else if mode == "degraded" {
         status.heading = "Shared pool needs attention"
         status.detail = details[reason] ?? "Background sync has reported a problem"
+        if reason == "quota_exhausted", let synced = status.syncedAt,
+           Date().timeIntervalSince(synced) >= 0,
+           Date().timeIntervalSince(synced) <= max(180, (state["renew_after"] as? Double ?? 60) * 3),
+           status.expiresAt != nil {
+            status.heading = "Current account has quota limits"
+            status.canSwitch = true
+        }
     } else if let synced = status.syncedAt,
+              Date().timeIntervalSince(synced) >= 0,
               Date().timeIntervalSince(synced) <= max(180, (state["renew_after"] as? Double ?? 60) * 3),
               status.expiresAt != nil, mode == "active" {
         status.heading = "Automatic switching active"
@@ -362,6 +370,27 @@ private func quotaIsStale(_ account: [String: Any], now: Date = Date()) -> Bool 
     return age < 0 || age > 300
 }
 
+private func modelQuotaLimited(_ account: [String: Any]) -> Bool {
+    account["selectable"] as? Bool == true && account["eligible"] as? Bool == false
+        && account["reason"] as? String == "quota-exhausted"
+}
+
+private func accountSelectable(_ account: [String: Any], now: Date = Date()) -> Bool {
+    guard account["selectable"] as? Bool == true,
+          account["selection_reason"] is NSNull,
+          account["state"] as? String == "ready",
+          let expiry = timestamp(account["expires_at"]), expiry > now else { return false }
+    return !quotaIsStale(account, now: now)
+}
+
+private func accountAvailability(_ account: [String: Any]) -> String {
+    if account["selectable"] as? Bool == true {
+        return modelQuotaLimited(account) ? "Manual selection available · model quota limited" : "Available"
+    }
+    let reason = account["selection_reason"] as? String
+    return availabilityReasons[reason ?? ""] ?? "Currently unavailable"
+}
+
 private func catalogControlsEnabled(bridgeBusy: Bool, catalogFailed: Bool) -> Bool {
     !bridgeBusy && !catalogFailed
 }
@@ -563,12 +592,14 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                       let details = account["account"] as? [String: Any] else { continue }
                 let email = safeLabel(details["emailAddress"]) ?? "Subscription account"
                 let usage = account["usage"] as? [String: Any] ?? [:]
-                let eligible = account["eligible"] as? Bool == true
+                let selectable = accountSelectable(account)
+                let modelLimited = modelQuotaLimited(account)
                 let isCurrent = id == selected
                 let reason = account["reason"] as? String
                 let staleUsage = quotaIsStale(account)
-                let available = eligible ? "Available" : availabilityReasons[reason ?? ""] ?? "Currently unavailable"
-                let row = NSMenuItem(title: "\(email)  ·  \(quotaSummary(usage, stale: staleUsage))",
+                let available = accountAvailability(account)
+                let warning = modelLimited ? "  ·  Model quota limit" : ""
+                let row = NSMenuItem(title: "\(email)  ·  \(quotaSummary(usage, stale: staleUsage))\(warning)",
                                      action: nil, keyEquivalent: "")
                 row.state = isCurrent ? .on : .off
                 row.toolTip = "\(isCurrent ? "Assigned to this Mac. " : "")\(available)"
@@ -585,13 +616,18 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     line("\(String(label.prefix(80))): \(quotaDisplay(usage, key: key, stale: staleUsage))", in: detail)
                 }
                 line(available, in: detail)
+                if modelLimited {
+                    line("One or more model-specific quotas reached the threshold", in: detail)
+                    line("Other models may still have quota", in: detail)
+                    line("Automatic switching may later choose a fully eligible account", in: detail)
+                }
                 if let fetched = timestamp(account["fetched"]) {
                     let relative = RelativeDateTimeFormatter()
                     line("Usage checked \(relative.localizedString(for: fetched, relativeTo: Date()))", in: detail)
                 }
                 detail.addItem(.separator())
                 action(isCurrent ? "Assigned to this Mac" : "Switch This Mac to This Account",
-                       #selector(switchAccount(_:)), enabled: current.canSwitch && eligible && !isCurrent && controlsEnabled,
+                       #selector(switchAccount(_:)), enabled: current.canSwitch && selectable && !isCurrent && controlsEnabled,
                        value: id, in: detail)
                 if reason == "quarantined" {
                     action("Reconnect Account…", #selector(reconnectAccount(_:)),
@@ -656,10 +692,14 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.current.accountID = value["account_id"] as? String
                 self.current.account = safeLabel(value["account_email"])
                 self.current.expiresAt = timestamp(value["expires_at"])
-                self.current.canSwitch = value["state"] as? String == "active"
+                let modelLimited = value["state"] as? String == "degraded"
+                    && value["reason"] as? String == "quota_exhausted"
+                self.current.canSwitch = (value["state"] as? String == "active" || modelLimited)
                     && value["write_recovery_pending"] as? Bool != true
                     && value["credential_expired"] as? Bool != true
-                self.notice = "This Mac switched; automatic switching remains active"
+                self.notice = modelLimited
+                    ? "This Mac switched; model quotas still apply. Automatic switching may choose another account later."
+                    : "This Mac switched; automatic switching remains active"
             case .failure(let error): self.notice = self.message(error)
             }
             self.refreshLocal()

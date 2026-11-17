@@ -14,8 +14,11 @@ def identifier(value):
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) is not None
 
 
-def validate_catalog(value):
+def validate_catalog(value, *, usage_schema=2):
     try:
+        if type(usage_schema) is not int or usage_schema not in (1, 2, 3):
+            raise ValueError
+        fields = FIELDS | ({"selectable", "selection_reason"} if usage_schema == 3 else set())
         if (not isinstance(value, dict) or set(value) != {"accounts", "account_id", "threshold"}
                 or not isinstance(value["accounts"], list) or len(value["accounts"]) > 100
                 or (value["account_id"] is not None and not identifier(value["account_id"]))
@@ -23,7 +26,7 @@ def validate_catalog(value):
             raise ValueError
         accounts, seen = [], set()
         for row in value["accounts"]:
-            if (not isinstance(row, dict) or set(row) != FIELDS or not identifier(row["id"])
+            if (not isinstance(row, dict) or set(row) != fields or not identifier(row["id"])
                     or row["id"] in seen or row["state"] not in ("ready", "refreshing", "quarantined")
                     or not isinstance(row["eligible"], bool)
                     or row["reason"] not in REASONS | {None}
@@ -41,7 +44,7 @@ def validate_catalog(value):
                 if (not isinstance(usage, dict) or not {"five_hour", "seven_day"} <= set(usage)
                         or len(usage) > 30 or any(not isinstance(key, str)
                             or not re.fullmatch(r"(?:five_hour|seven_day(?:_[A-Za-z0-9_-]{1,64})?|weekly_scoped:[^\x00-\x1f\x7f]{1,96})", key)
-                            or not ((key == "five_hour" and percent is None)
+                            or not ((usage_schema >= 2 and key == "five_hour" and percent is None)
                                     or (_number(percent) and percent >= 0))
                             for key, percent in usage.items())):
                     raise ValueError
@@ -49,6 +52,25 @@ def validate_catalog(value):
                                     or any(percent >= value["threshold"] for percent in usage.values()
                                            if percent is not None)):
                 raise ValueError
+            if usage_schema == 3:
+                selectable, selection_reason = row["selectable"], row["selection_reason"]
+                if (not isinstance(selectable, bool) or selection_reason not in REASONS | {None}
+                        or selectable != (selection_reason is None)
+                        or (row["eligible"] and not selectable)):
+                    raise ValueError
+                base_limited = usage is not None and any(
+                    usage[key] is not None and usage[key] >= value["threshold"]
+                    for key in ("five_hour", "seven_day"))
+                scoped_limited = usage is not None and any(
+                    percent >= value["threshold"] for key, percent in usage.items()
+                    if key not in ("five_hour", "seven_day"))
+                if selectable:
+                    if (row["state"] != "ready" or usage is None or row["fetched"] is None
+                            or base_limited or row["reason"] not in (None, "quota-exhausted")
+                            or (not row["eligible"] and not scoped_limited)):
+                        raise ValueError
+                elif selection_reason != row["reason"] or (selection_reason == "quota-exhausted" and not base_limited):
+                    raise ValueError
             seen.add(row["id"])
             accounts.append({**row, "account": dict(account), "usage": dict(usage) if usage is not None else None})
         return {"accounts": accounts, "account_id": value["account_id"], "threshold": value["threshold"]}

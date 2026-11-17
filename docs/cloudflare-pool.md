@@ -184,10 +184,27 @@ checked before and after provider waits. The list does not change assignment.
 `account_id` selects that account only if fresh usage and token validity make it
 eligible. Unavailable selections return HTTP 409 without changing the assignment.
 Manual selection applies only to that device and stays sticky until normal quota
-failover; it does not override the pool threshold or reserve quota exclusively.
+failover; it does not reserve quota exclusively.
 The native client commits through the same ownership checks and recovery journal.
 Changing credentials does not retry a failed turn or replace credentials already
 cached inside an in-flight turn or subagent.
+
+Client a16 requests catalog `usage_schema: 3`. This preserves automatic
+`eligible` / `reason` and adds `selectable` / `selection_reason` for explicit
+manual selection. Schemas 1 and 2 retain their previous shape and policy. With
+`account_id` and `allow_model_limited: true`, assignment checks the same
+authentication, freshness, token and overall weekly/session quota guards, but a
+model-specific weekly limit does not block the explicit choice. A limited model
+remains limited. Such a selection returns `quota_exhausted` to retain the warning
+about automatic eligibility; a16 accepts that result only for the requested
+account. Requests without the opt-in keep the old all-meter selection rule.
+
+Automatic assignment does not change: it prefers an account with all reported
+meters below the threshold. When none is eligible, it retains the current usable
+credential. A manually selected model-limited account may therefore be replaced
+as soon as a fully eligible alternative appears. Deploy the schema-3 coordinator
+before updating clients; a new client fails clearly against an older coordinator
+instead of guessing manual eligibility.
 
 ## Operations and limits
 

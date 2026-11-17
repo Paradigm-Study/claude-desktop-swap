@@ -17,7 +17,7 @@ from team_pool.setup import (MAX_LAUNCHER_TRANSACTION_BYTES, Setup, TEAM_ID,
                              launcher_transaction_pending, setup_lock, share_membership)
 from team_pool.share_enrollment import DEFAULT_SHARE_SERVER
 from team_pool.desktop_profile import DesktopProfileError
-from test_team_client import FakeNative, FakeTransport
+from test_team_client import FakeNative, FakeTransport, assignment
 
 
 class SetupTests(unittest.TestCase):
@@ -121,6 +121,69 @@ class SetupTests(unittest.TestCase):
         self.assertTrue(self.loaded)
         self.assertFalse(any(args[0] in ("/usr/bin/sudo", "/usr/bin/osascript") for args in self.commands))
         self.assertIn("background sync was verified", self.output[-1])
+
+    def test_update_installs_menu_while_owned_assignment_is_quota_limited(self):
+        self.active()
+        original, token = copy.deepcopy(self.native.original), self.native.get_secret(DEVICE_SECRET)
+        self.transport.next = assignment(state="quota_exhausted")
+        result = self.setup.run()
+        self.assertEqual(result["state"], "degraded")
+        self.assertEqual(result["reason"], "quota_exhausted")
+        self.assertEqual(self.native.original, original)
+        self.assertEqual(self.native.get_secret(DEVICE_SECRET), token)
+        self.assertEqual(self.enroll_calls, [True])
+        self.assertTrue(self.loaded)
+        self.assertTrue(any("install_team_status.py" in " ".join(args) for args in self.commands))
+        self.assertIn("background sync was verified", self.output[-1])
+        self.assertIn("current account has quota limits", self.output[-1])
+
+    def test_setup_does_not_accept_stale_quota_as_confirmed_assignment(self):
+        self.active()
+        self.transport.next = assignment(state="quota_stale")
+        with self.assertRaisesRegex(ClientError, "no confirmed usable assignment"):
+            self.setup.run()
+        self.assertFalse(self.loaded)
+        self.assertFalse(any("install_team_status.py" in " ".join(args) for args in self.commands))
+
+    def test_new_enrollment_cannot_complete_with_quota_limited_assignment(self):
+        self.transport.next = assignment(state="quota_exhausted")
+        with self.assertRaisesRegex(ClientError, "no confirmed usable assignment"):
+            self.setup.run()
+        self.assertFalse(self.loaded)
+
+    def test_noninteractive_sync_must_still_confirm_assignment_before_install(self):
+        self.active()
+        original_sync = self.client.sync
+        count = 0
+        def sync(**kwargs):
+            nonlocal count
+            count += 1
+            self.transport.next = assignment(state="quota_exhausted" if count == 1 else "quota_stale")
+            return original_sync(**kwargs)
+        self.client.sync = sync
+        with self.assertRaisesRegex(ClientError, "after noninteractive sync"):
+            self.setup.run()
+        self.assertFalse(self.loaded)
+
+    def test_assignment_readiness_preserves_expiry_pause_and_write_guards(self):
+        self.active(state="degraded", reason="quota_exhausted")
+        ready = self.client._load()
+        self.assertFalse(self.setup.assignment_ready(ready))
+        self.assertTrue(self.setup.assignment_ready(ready, allow_quota_limited=True))
+        for changes in ({"state": "paused"}, {"reason": "quota_stale"},
+                        {"reason": "coordinator_unavailable"}, {"managed": False},
+                        {"pending_write": {"before": "recorded"}},
+                        {"expires_at": 999}, {"expires_at": float("nan")}, {"expires_at": None}):
+            with self.subTest(changes=changes):
+                self.assertFalse(self.setup.assignment_ready({**ready, **changes}, allow_quota_limited=True))
+
+    def test_background_quota_limited_assignment_must_be_newer_than_foreground(self):
+        self.active(state="degraded", reason="quota_exhausted")
+        state = self.client._load()
+        self.loaded = True
+        with self.assertRaisesRegex(ClientError, "did not confirm"):
+            self.setup.background_ready(state["synced_at"], allow_quota_limited=True)
+        self.setup.background_ready(state["synced_at"] - 1, allow_quota_limited=True)
 
     def test_directory_repair_precedes_native_reads_without_stopping_desktop(self):
         self.access_check.side_effect = [True, False]

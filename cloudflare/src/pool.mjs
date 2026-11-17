@@ -340,14 +340,16 @@ export class PoolObject extends DurableObject {
         result = await this.enrollShare(body, device);
         break;
       case '/v1/assignment':
-        this.requireKeys(body, [], ['account_id']);
+        this.requireKeys(body, [], ['account_id', 'allow_model_limited']);
         if (Object.hasOwn(body, 'account_id') && (typeof body.account_id !== 'string'
             || !/^[a-zA-Z0-9_-]{1,64}(?![\s\S])/.test(body.account_id))) throw new PoolError('invalid-account-id');
-        result = await this.assignment(device, body.account_id);
+        if (Object.hasOwn(body, 'allow_model_limited')
+            && (body.allow_model_limited !== true || !Object.hasOwn(body, 'account_id'))) throw new PoolError('invalid-body');
+        result = await this.assignment(device, body.account_id, body.allow_model_limited === true);
         break;
       case '/v1/accounts/list':
         this.requireKeys(body, [], ['usage_schema']);
-        if (Object.hasOwn(body, 'usage_schema') && body.usage_schema !== 2) throw new PoolError('invalid-body');
+        if (Object.hasOwn(body, 'usage_schema') && ![2, 3].includes(body.usage_schema)) throw new PoolError('invalid-body');
         result = await this.memberAccounts(device, body.usage_schema ?? 1);
         break;
       case '/v1/contributions/start':
@@ -614,8 +616,16 @@ export class PoolObject extends DurableObject {
     else if (row.fetched === null || !validUsage(usage)) reason = 'quota-unavailable';
     else if (now - row.fetched < 0 || now - row.fetched > FRESH_SECONDS) reason = 'quota-stale';
     else if (Object.values(usage).some(value => value !== null && value >= this.threshold)) reason = 'quota-exhausted';
+    // Automatic routing remains conservative across every reported meter. An
+    // explicit selection may use other models when only a scoped meter is full,
+    // but never waive identity, expiry, fresh-usage or overall-quota checks.
+    let selectionReason = reason;
+    if (reason === 'quota-exhausted'
+        && (usage.five_hour === null || usage.five_hour < this.threshold)
+        && usage.seven_day < this.threshold) selectionReason = null;
     return {
       usage, reason, eligible: reason === null,
+      selectable: selectionReason === null, selection_reason: selectionReason,
       usable: row.state === 'ready' && Boolean(row.verified) && credentials.expires_at > now + EXPIRY_MARGIN,
     };
   }
@@ -640,7 +650,7 @@ export class PoolObject extends DurableObject {
     const now = this.now();
     return {
       accounts: snapshots.map(({ row, credentials }) => {
-        let { usage, eligible, reason } = this.accountAvailability(row, credentials, now);
+        let { usage, eligible, reason, selectable, selection_reason } = this.accountAvailability(row, credentials, now);
         if (usageSchema === 1 && usage !== null && Object.values(usage).some(value => value === null)) {
           // Older menus require every meter to be numeric. Preserve their wire
           // contract without inventing a zero for an explicitly absent meter.
@@ -653,6 +663,7 @@ export class PoolObject extends DurableObject {
           account: { emailAddress: credentials.account.emailAddress, subscriptionType: credentials.account.subscriptionType },
           usage, fetched: row.fetched, expires_at: credentials.expires_at,
           state: row.state, eligible, reason,
+          ...(usageSchema === 3 ? { selectable, selection_reason } : {}),
         };
       }),
       account_id: device.account_id, threshold: this.threshold,
@@ -908,26 +919,28 @@ export class PoolObject extends DurableObject {
     }
   }
 
-  async assignment(device, requestedAccount) {
+  async assignment(device, requestedAccount, allowModelLimited = false) {
     await this.poll();
     const snapshots = await this.accountSnapshots(true);
     await this.checkShareMembership(device);
     const now = this.now();
     const loads = new Map(this.query('SELECT account_id,count(*) n FROM devices WHERE revoked=0 AND last_seen>? GROUP BY account_id', now - DEVICE_ACTIVE_SECONDS).map(row => [row.account_id, row.n]));
-    const usable = new Map(), eligible = [];
+    const usable = new Map(), selectable = new Map(), eligible = [];
     for (const snapshot of snapshots) {
       const { row, credentials } = snapshot;
       const availability = this.accountAvailability(row, credentials, now);
       if (availability.usable) usable.set(row.id, snapshot);
+      if (availability.selectable) selectable.set(row.id, availability);
       if (availability.eligible) eligible.push([loads.get(row.id) || 0,
         Math.max(...Object.values(availability.usage).filter(value => value !== null)), row.id]);
     }
     const current = device.account_id;
     let chosen, state;
     if (requestedAccount !== undefined) {
-      if (!eligible.some(candidate => candidate[2] === requestedAccount)) throw new PoolError('account-unavailable', 409);
+      const availability = selectable.get(requestedAccount);
+      if (!availability || (!availability.eligible && !allowModelLimited)) throw new PoolError('account-unavailable', 409);
       chosen = requestedAccount;
-      state = 'fresh';
+      state = availability.eligible ? 'fresh' : 'quota_exhausted';
     } else if (eligible.some(candidate => candidate[2] === current)) {
       chosen = current;
       state = 'fresh';
