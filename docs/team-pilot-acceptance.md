@@ -1,6 +1,6 @@
 # Live two-Mac acceptance worksheet
 
-Status: **IN PROGRESS — client/menu 0.1.0a15 active on Mac A; a14 last verified for the SSH user on Mac B**.
+Status: **IN PROGRESS — client/menu 0.1.0a16 installed on Mac A; a14 last verified for the SSH user on Mac B**.
 Mac B's a14 upgrade preserved enrollment, native ownership, shared connector
 credentials and existing conversation files. A newly created helper started in
 plain SSH context authenticated and completed a native request through the GUI
@@ -526,3 +526,44 @@ eligible account in **0.41 seconds**, and restored the original selection in
 connector records matched the pre-update baseline. Native ownership matched,
 the assignment was unexpired, no write was pending, and background sync remained
 running. Visible menu clicks and the original conversation were not exercised.
+
+## a16: explicit switching with scoped model limits
+
+On November 16, Mac A's a15 daemon was running with recent successful sync and
+an unexpired owned native credential. Nine accounts had fresh overall weekly
+usage between 49% and 66%, but every account's provider-reported scoped weekly
+meter was between 98% and 100%. The pool's 98% all-meter rule excluded all nine
+from both automatic and manual selection. A native Sonnet request still worked.
+The tenth account retained a historical rejected sign-in. This was a selection
+contract problem, not the prior Keychain pause.
+
+A16 separates explicit manual selection from automatic eligibility. Schema 3
+adds manual selection metadata; older catalog schemas and manual requests keep
+their prior behavior. Only an explicit `allow_model_limited: true` request can
+select an account whose fresh overall meters have headroom but whose scoped
+quota is limited. It retains the quota warning. Automatic selection still
+requires headroom across all meters and may replace that manual choice when a
+fully eligible account becomes available. Authentication, usage freshness,
+overall thresholds and native ownership checks remain enforced.
+
+Local validation passed 553 Python tests with one optional dependency skip,
+115 Cloudflare tests, the compiled Swift menu harness, shell syntax and the
+Wrangler deployment dry-run. An independent review reran 106 focused tests.
+Regression coverage includes explicit opt-in, old wire contracts, nullable
+session meters, rejected stale/global-exhausted/auth-invalid selections,
+assignment persistence and automatic failover, degraded menu controls, and
+updates of existing quota-limited installations. Fresh enrollment does not gain
+an exception to its initial usable-assignment requirement.
+
+The coordinator was deployed without changing its Durable Object identity,
+secrets, or threshold. The old a15 catalog still loaded successfully; a16 showed
+nine manually selectable accounts and zero automatic candidates. Mac A's user
+client/menu update completed in **3.48 seconds**, retaining its existing launcher
+and settings hashes and Desktop process. The installed a16 menu helper loaded
+the catalog in **0.15 seconds** and switched to the chosen account in
+**0.35 seconds**. A native Sonnet request returned exact `OK` in **3.73 seconds**.
+Device and Share identity, device token, recovery backup, and all four connector
+records matched the pre-update baseline. Native ownership matched, no write was
+pending, and the sync service remained running. The quota-limited status remains
+intentional; switching does not replenish the limited model's quota. Visible menu
+clicks and an existing conversation's cached credential were not exercised.

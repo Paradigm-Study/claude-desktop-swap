@@ -189,6 +189,27 @@ if command == "format" {
     precondition(quotaIsStale(["usage": absentMeter, "fetched": 999, "reason": "quota-stale"], now: quotaNow))
     precondition(catalogControlsEnabled(bridgeBusy: false, catalogFailed: false))
     precondition(!catalogControlsEnabled(bridgeBusy: true, catalogFailed: false))
+    var limited: [String: Any] = ["selectable": true, "selection_reason": NSNull(),
+        "eligible": false, "reason": "quota-exhausted", "state": "ready",
+        "usage": ["five_hour": 10, "seven_day": 10, "seven_day_opus": 100],
+        "fetched": 999, "expires_at": 2000]
+    precondition(modelQuotaLimited(limited))
+    precondition(accountSelectable(limited, now: quotaNow))
+    precondition(accountAvailability(limited).contains("model quota limited"))
+    limited["selectable"] = false
+    limited["selection_reason"] = "quota-exhausted"
+    precondition(!accountSelectable(limited, now: quotaNow))
+    precondition(!modelQuotaLimited(limited))
+    limited["selectable"] = true
+    limited["selection_reason"] = NSNull()
+    limited["fetched"] = 699
+    precondition(!accountSelectable(limited, now: quotaNow))
+    limited["fetched"] = 999
+    limited["expires_at"] = 1000
+    precondition(!accountSelectable(limited, now: quotaNow))
+    limited["expires_at"] = 2000
+    limited["state"] = "quarantined"
+    precondition(!accountSelectable(limited, now: quotaNow))
     precondition(helperTimeout(for: "list") == 120)
     precondition(helperTimeout(for: "switch") == 240)
     precondition(helperTimeout(for: "contribute-complete") == 240)
@@ -245,6 +266,42 @@ if command == "format" {
     let resumed = readStatus(statePath: path, runningOverride: true)
     precondition(resumed.accountID == "new-account" && resumed.canSwitch)
     precondition(recoveryAccountID(resumed.contribution) == "quarantined-account")
+    state["state"] = "degraded"
+    state["reason"] = "quota_exhausted"
+    save()
+    let limited = readStatus(statePath: path, runningOverride: true)
+    precondition(limited.canSwitch && limited.needsAttention)
+    precondition(limited.heading == "Current account has quota limits")
+    precondition(limited.detail.contains("Some reported quotas reached the threshold"))
+    precondition(!limited.detail.contains("automatic replacement"))
+    for reason in ["quota_stale", "coordinator_unavailable", "native_credentials_changed"] {
+        state["reason"] = reason
+        save()
+        precondition(!readStatus(statePath: path, runningOverride: true).canSwitch)
+    }
+    state["reason"] = "quota_exhausted"
+    save()
+    precondition(!readStatus(statePath: path, runningOverride: false).canSwitch)
+    state["expires_at"] = now - 1
+    save()
+    precondition(!readStatus(statePath: path, runningOverride: true).canSwitch)
+    state.removeValue(forKey: "expires_at")
+    save()
+    precondition(!readStatus(statePath: path, runningOverride: true).canSwitch)
+    state["expires_at"] = now + 600
+    state["synced_at"] = now - 600
+    save()
+    precondition(!readStatus(statePath: path, runningOverride: true).canSwitch)
+    state["synced_at"] = now
+    state["pending_write"] = ["account_id": "other-account"]
+    save()
+    precondition(!readStatus(statePath: path, runningOverride: true).canSwitch)
+    state.removeValue(forKey: "pending_write")
+    state["managed"] = false
+    save()
+    precondition(!readStatus(statePath: path, runningOverride: true).canSwitch)
+    state["managed"] = true
+    state.removeValue(forKey: "reason")
     state["state"] = "paused"
     save()
     precondition(!readStatus(statePath: path, runningOverride: true).canSwitch)

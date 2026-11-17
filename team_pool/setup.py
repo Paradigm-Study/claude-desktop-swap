@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from .client import (Client, ClientError, SERVICE, _lock, _private_read, _private_write,
+from .client import (Client, ClientError, SERVICE, _lock, _number, _private_read, _private_write,
                      install_service, service_path, verify_desktop_wrapper)
 from .native import NativeKeychainAccessError, NativePolicyError, NativeStoreError
 from .desktop_profile import DesktopProfileError, resolve_target
@@ -316,7 +316,16 @@ class Setup:
         self.verify_wrapper()
         return was_running
 
-    def background_ready(self, foreground_synced_at):
+    def assignment_ready(self, state, *, allow_quota_limited=False):
+        # Updating an owned installation must remain possible while every
+        # account is model-limited. This proves synchronization, not capacity.
+        return (bool(state.get("managed")) and not state.get("pending_write")
+                and (state.get("state") == "active" or
+                     (allow_quota_limited and state.get("state") == "degraded"
+                      and state.get("reason") == "quota_exhausted"))
+                and _number(state.get("expires_at")) and state["expires_at"] > self.client.clock())
+
+    def background_ready(self, foreground_synced_at, *, allow_quota_limited=False):
         deadline = self.clock() + 80
         saw_process = False
         while self.clock() < deadline:
@@ -332,11 +341,11 @@ class Setup:
             if loaded is None or (not running and (saw_process or exited)):
                 raise ClientError("The background sync process exited. Run team-pool-client status and inspect its private agent.log; setup is not complete.")
             saw_process = saw_process or running
-            if (running and state.get("synced_at", 0) > foreground_synced_at and state.get("state") == "active"
-                    and not state.get("pending_write") and state.get("managed")):
+            if (running and state.get("synced_at", 0) > foreground_synced_at
+                    and self.assignment_ready(state, allow_quota_limited=allow_quota_limited)):
                 return
             self.sleep(1)
-        raise ClientError("Background sync did not confirm an active assignment in time. Run team-pool-client status; setup is not complete.")
+        raise ClientError("Background sync did not confirm a current assignment in time. Run team-pool-client status; setup is not complete.")
 
     def run(self, *, check=False):
         self.prerequisites()
@@ -404,6 +413,7 @@ class Setup:
             # Repeat inspection after stopping competing writers; never accept drift.
             with _lock(self.client.config):
                 state = inspect_state(self.client, allow_owned_repair=True)
+            allow_quota_limited = bool(state and state.get("managed"))
             if state and state.get("managed"):
                 # Explicit setup is the foreground recovery action. resume
                 # still requires the original fingerprint and backup and only
@@ -413,13 +423,16 @@ class Setup:
                         device_name=socket.gethostname(), link=state is not None)
             self.client.sync(take_over_native_store=not bool(state and state.get("managed")))
             synced = self.client._load()
-            if synced.get("state") != "active":
+            if not self.assignment_ready(synced, allow_quota_limited=allow_quota_limited):
                 raise ClientError("The pool has no confirmed usable assignment. Inspect team-pool-client status and repeat setup when quota is available.")
             # Exercise the same noninteractive guards as the LaunchAgent before
             # installing it. This does not approve or bypass a Keychain dialog.
             with self.client.native.noninteractive():
                 self.client.sync()
-            foreground_synced_at = self.client._load()["synced_at"]
+            synced = self.client._load()
+            if not self.assignment_ready(synced, allow_quota_limited=allow_quota_limited):
+                raise ClientError("The pool has no confirmed usable assignment after noninteractive sync. Inspect team-pool-client status before repeating setup.")
+            foreground_synced_at = synced["synced_at"]
             result = self.command(["/bin/launchctl", "enable", self.service])
             if result.returncode:
                 raise ClientError("Could not enable background synchronization. Existing pool enrollment was preserved.")
@@ -444,7 +457,7 @@ class Setup:
                         _private_write(backup, previous_bytes)
                         self.output("The previous service configuration was preserved at " + str(backup))
                 raise
-            self.background_ready(foreground_synced_at)
+            self.background_ready(foreground_synced_at, allow_quota_limited=allow_quota_limited)
             if self.gui_installer is None:
                 from .gui_exec_service import install_service as install_gui_service
             else:
@@ -452,8 +465,11 @@ class Setup:
             install_gui_service(home=self.home, python=sys.executable)
             result = self.command([sys.executable, str(self.source / "scripts/install_team_status.py"), "install"], visible=True, timeout=180)
             if result.returncode:
-                raise ClientError("The pool is active, but the menu bar installation failed. Repeat setup to finish installing the menu bar.")
-            self.output("Setup complete: Paradigm shared pool is active in native subscription mode; background sync was verified.")
+                raise ClientError("The pool is synchronized, but the menu bar installation failed. Repeat setup to finish installing the menu bar.")
+            if self.client._load().get("state") == "degraded":
+                self.output("Setup complete: native subscription mode is installed and background sync was verified. The current account has quota limits; open the menu to check model quotas and select an account with overall capacity.")
+            else:
+                self.output("Setup complete: Paradigm shared pool is active in native subscription mode; background sync was verified.")
             return self.client.status()
         except BaseException:
             try:

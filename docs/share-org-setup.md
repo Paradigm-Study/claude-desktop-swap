@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/
 ```
 
 Run it as your ordinary Mac user, without `sudo` in front of the command. The
-installer uses the pinned `v0.1.0a15` package and prepares its own Python runtime;
+installer uses the pinned `v0.1.0a16` package and prepares its own Python runtime;
 Git, Python and uv do not need to be installed beforehand. Use that Mac’s
 logged-in desktop Terminal, including when helping through Screen Sharing. An
 SSH shell can lack access to its login Keychain even when the desktop services
@@ -87,6 +87,12 @@ drift and other pauses still need their reported condition resolved. A failed
 installation can be retried with the same command; it does not require a second
 enrollment or invitation token.
 
+A16 also lets an already managed Mac finish its update while its valid current
+assignment is quota-limited. Setup still verifies a new background sync and shows
+the quota warning. This permits installing the menu needed for manual selection;
+it does not establish capacity for every model or bypass a new enrollment's
+initial usable-assignment requirement.
+
 The installer stops the personal `cswap` menu service to avoid competing writes.
 If you run `cswap auto` in a Terminal, stop that loop first. Global terminal and
 Codex gateway settings are preserved. Native setup supports the default Claude
@@ -94,13 +100,13 @@ credential store only and refuses a `CLAUDE_CONFIG_DIR` override or conflicting
 native provider configuration.
 
 The package and runtime stay under
-`~/.local/share/claude-desktop-swap/releases/v0.1.0a15/`. Keep that directory in
+`~/.local/share/claude-desktop-swap/releases/v0.1.0a16/`. Keep that directory in
 place while the service uses it. Setup prints the installed client path; for this
 release, status and contribution commands are:
 
 ```sh
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a15/venv/bin/team-pool-client status
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a15/venv/bin/team-pool-client contribute-account
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a16/venv/bin/team-pool-client status
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a16/venv/bin/team-pool-client contribute-account
 ```
 
 If Share saves its sign-in elsewhere, use the same installer with its account
@@ -152,7 +158,7 @@ need a normal restart/retry to use the new launcher.
 For a read-only diagnosis on the remote Mac, run:
 
 ```sh
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a15/venv/bin/team-pool-client doctor --ssh
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a16/venv/bin/team-pool-client doctor --ssh
 ```
 
 The report distinguishes missing GUI login, stopped sync, expired assignment,

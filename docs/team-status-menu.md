@@ -9,7 +9,7 @@ and Status** requests an earlier refresh.
 
 Some subscriptions currently report weekly quota without a five-hour meter.
 The menu shows **Not reported** for that meter, rather than inventing 0%.
-Availability follows the measured weekly and model-specific quotas. Old readings
+Automatic availability follows the measured weekly and model-specific quotas. Old readings
 are explicitly labeled **stale** when a fresh provider response is unavailable.
 Version a10 understands this response; rerun the one-command setup to update an
 older menu. Automatic background assignment remains compatible with older clients.
@@ -22,6 +22,22 @@ client writes the assignment with its existing policy, ownership and recovery
 checks. The menu reports success only after the local commit. Other devices are
 not switched. The selected account remains assigned until automatic quota
 failover is needed; the configured threshold still applies.
+
+With a16, manual selection distinguishes overall quota from model-specific
+quota. An account with fresh usage below the threshold for overall weekly usage
+and its reported five-hour meter can be selected even when a model's weekly
+meter has reached the threshold. Its submenu identifies the limited model;
+switching accounts does not restore that model's budget. A missing five-hour
+meter remains **Not reported**. Stale readings, rejected sign-ins and exhausted
+overall quota still block selection.
+
+Automatic selection remains conservative because the coordinator does not know
+which model a native conversation is using. It requires headroom across all
+reported meters. A manually selected account with a model limit remains assigned
+while there is no fully eligible alternative; if one becomes available, normal
+background sync switches to it. Manual controls remain available during the
+quota-limited state when sync is recent, the service is running and native
+ownership is intact.
 
 Unavailable accounts cannot be selected. If the pool refresh fails, prior rows
 remain visible with a refresh-failed message and selection is disabled. Their

@@ -515,7 +515,7 @@ class Client:
             if not _safe_string(token):
                 raise ClientError("Device credential is missing. Leave and enroll with a new invitation.")
             try:
-                body = {} if account_id is None else {"account_id": account_id}
+                body = {} if account_id is None else {"account_id": account_id, "allow_model_limited": True}
                 assignment = self._transport(state).post("/v1/assignment", body, token=token)
             except RequestError as error:
                 if account_id is not None and error.status == 409:
@@ -527,7 +527,7 @@ class Client:
                 self._save(state)
                 raise
             self._validate_assignment(assignment)
-            if account_id is not None and (assignment["account_id"] != account_id or assignment.get("state", "fresh") != "fresh"):
+            if account_id is not None and (assignment["account_id"] != account_id or assignment.get("state", "fresh") not in ("fresh", "quota_exhausted")):
                 raise ClientError("The coordinator did not confirm the selected account; your native login was not changed.")
             expected = snapshot["fingerprint"] if initialize else state["fingerprint"]
             try:
@@ -682,13 +682,12 @@ class Client:
 
         state, token = context()
         try:
-            # Schema 2 preserves an explicitly absent session meter as null.
-            # Older menus require numbers; opt in rather than silently changing
-            # their entire catalog contract when the provider adds quota forms.
-            value = self._transport(state).post("/v1/accounts/list", {"usage_schema": 2}, token=token)
+            # Schema 3 separates manual selection from conservative automatic
+            # failover while retaining schema 2's explicitly absent session meter.
+            value = self._transport(state).post("/v1/accounts/list", {"usage_schema": 3}, token=token)
         except RequestError as error:
             if error.status == 400:
-                raise ClientError("The coordinator does not support this menu's usage format yet. Refresh after the coordinator update completes.") from None
+                raise ClientError("The coordinator does not support this menu's usage format yet. Update the shared coordinator, then refresh the pool.") from None
             if error.status == 404:
                 raise ClientError("The coordinator is still updating. Refresh the pool shortly.") from None
             if error.status == 401:
@@ -703,7 +702,7 @@ class Client:
                         self._save(current)
                 raise ClientError("This Mac no longer has shared pool access. Check your Claude Share membership.") from None
             raise
-        catalog = validate_catalog(value)
+        catalog = validate_catalog(value, usage_schema=3)
         current, current_token = context()
         if identity(current) != identity(state) or current_token != token:
             raise ClientError("Pool enrollment changed while loading accounts. Refresh after setup completes.")

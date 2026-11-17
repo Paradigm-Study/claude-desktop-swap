@@ -20,10 +20,10 @@ def catalog():
     return {"account_id": "account-a", "threshold": 98, "accounts": [
         {"id": "account-a", "account": {"emailAddress": "a@example.invalid", "subscriptionType": "max"},
          "usage": {"five_hour": 10, "seven_day": 86}, "fetched": 999, "expires_at": 4000,
-         "state": "ready", "eligible": True, "reason": None},
+         "state": "ready", "eligible": True, "reason": None, "selectable": True, "selection_reason": None},
         {"id": "account-b", "account": {"emailAddress": "b@example.invalid", "subscriptionType": "max"},
          "usage": {"five_hour": 0, "seven_day": 100}, "fetched": 999, "expires_at": 4000,
-         "state": "ready", "eligible": False, "reason": "quota-exhausted"},
+         "state": "ready", "eligible": False, "reason": "quota-exhausted", "selectable": False, "selection_reason": "quota-exhausted"},
     ]}
 
 
@@ -54,7 +54,7 @@ class PoolMenuTests(unittest.TestCase):
         self.assertEqual(result["client_state"], "active")
         self.assertEqual(len(self.native.writes), writes)
         self.assertEqual(before, self.client.config.read_bytes())
-        self.assertEqual(self.transport.calls[-1], ("/v1/accounts/list", {"usage_schema": 2}, DEVICE_TOKEN))
+        self.assertEqual(self.transport.calls[-1], ("/v1/accounts/list", {"usage_schema": 3}, DEVICE_TOKEN))
         self.assertNotIn(DEVICE_TOKEN, json.dumps(result))
         self.assertNotIn(PROVIDER_TOKEN, json.dumps(result))
 
@@ -199,7 +199,80 @@ class PoolMenuTests(unittest.TestCase):
     def test_catalog_accepts_provider_legacy_and_named_model_quotas(self):
         value = catalog()
         value["accounts"][0]["usage"].update(seven_day_sonnet=25, **{"weekly_scoped:claude sonnet 4.5": 30})
-        self.assertEqual(validate_catalog(value)["accounts"][0]["usage"], value["accounts"][0]["usage"])
+        self.assertEqual(validate_catalog(value, usage_schema=3)["accounts"][0]["usage"], value["accounts"][0]["usage"])
+
+    def test_schema3_model_limited_account_is_selectable_without_auto_eligibility(self):
+        value = catalog()
+        row = value["accounts"][0]
+        row["usage"]["weekly_scoped:provider-model-label"] = 100
+        row.update(eligible=False, reason="quota-exhausted")
+        self.transport.next = value
+        before, writes = self.client.config.read_bytes(), len(self.native.writes)
+        result = dispatch({"action": "list"}, self.client)["accounts"][0]
+        self.assertFalse(result["eligible"])
+        self.assertTrue(result["selectable"])
+        self.assertIsNone(result["selection_reason"])
+        self.assertEqual(before, self.client.config.read_bytes())
+        self.assertEqual(writes, len(self.native.writes))
+
+    def test_schema3_rejects_contradictory_or_unusable_manual_selection(self):
+        changes = [
+            {"selectable": False, "selection_reason": None},
+            {"selectable": True, "selection_reason": "quota-exhausted"},
+            {"selectable": 1},
+            {"selectable": False, "selection_reason": "quota-stale"},
+            {"eligible": False, "reason": "quota-stale"},
+            {"eligible": False, "reason": "quota-exhausted"},
+            {"state": "refreshing"}, {"state": "quarantined"},
+            {"fetched": None}, {"usage": None},
+            {"eligible": False, "reason": "quota-exhausted",
+             "usage": {"five_hour": 98, "seven_day": 10}},
+            {"eligible": False, "reason": "quota-exhausted",
+             "usage": {"five_hour": 10, "seven_day": 100}},
+        ]
+        for change in changes:
+            with self.subTest(change=change):
+                value = catalog()
+                value["accounts"][0].update(change)
+                with self.assertRaises(ClientError):
+                    validate_catalog(value, usage_schema=3)
+
+    def test_schema3_base_exhaustion_blocks_manual_selection_with_scoped_headroom(self):
+        for limit in ("five_hour", "seven_day"):
+            value = catalog()
+            row = value["accounts"][0]
+            row["usage"] = {"five_hour": 0, "seven_day": 0, "seven_day_opus": 0, limit: 98}
+            row.update(eligible=False, reason="quota-exhausted", selectable=False,
+                       selection_reason="quota-exhausted")
+            self.assertFalse(validate_catalog(value, usage_schema=3)["accounts"][0]["selectable"])
+
+    def test_schema3_rejects_false_manual_block_for_only_model_exhaustion(self):
+        value = catalog()
+        row = value["accounts"][1]
+        row["usage"] = {"five_hour": None, "seven_day": 10, "seven_day_opus": 100}
+        with self.assertRaises(ClientError):
+            validate_catalog(value, usage_schema=3)
+
+    def test_legacy_catalog_contract_is_explicit_and_cannot_downgrade_new_client(self):
+        value = catalog()
+        for row in value["accounts"]:
+            row.pop("selectable")
+            row.pop("selection_reason")
+        for schema in (1, 2):
+            self.assertEqual(validate_catalog(value, usage_schema=schema), value)
+        with self.assertRaises(ClientError):
+            validate_catalog(value, usage_schema=3)
+        self.transport.next = value
+        before, writes = self.client.config.read_bytes(), len(self.native.writes)
+        code, result, _ = self.run_bridge({"action": "list"})
+        self.assertEqual(code, 1)
+        self.assertIn("invalid pool metadata", result["error"])
+        self.assertEqual(before, self.client.config.read_bytes())
+        self.assertEqual(writes, len(self.native.writes))
+        value["accounts"][0]["usage"]["five_hour"] = None
+        self.assertIsNone(validate_catalog(value, usage_schema=2)["accounts"][0]["usage"]["five_hour"])
+        with self.assertRaises(ClientError):
+            validate_catalog(value, usage_schema=1)
 
     def test_catalog_preserves_absent_session_meter_without_fabricating_zero(self):
         value = catalog()
@@ -222,9 +295,10 @@ class PoolMenuTests(unittest.TestCase):
                 row = value["accounts"][0]
                 row["usage"] = {"five_hour": None, "seven_day": 11, limit: 100}
                 with self.assertRaises(ClientError):
-                    validate_catalog(value)
-                row.update(eligible=False, reason="quota-exhausted")
-                self.assertEqual(validate_catalog(value)["accounts"][0]["usage"][limit], 100)
+                    validate_catalog(value, usage_schema=3)
+                row.update(eligible=False, reason="quota-exhausted", selectable=limit != "seven_day",
+                           selection_reason="quota-exhausted" if limit == "seven_day" else None)
+                self.assertEqual(validate_catalog(value, usage_schema=3)["accounts"][0]["usage"][limit], 100)
 
     def test_catalog_null_is_allowed_only_for_explicit_session_meter(self):
         bad_usage = [
@@ -241,7 +315,7 @@ class PoolMenuTests(unittest.TestCase):
                 value = catalog()
                 value["accounts"][0]["usage"] = usage
                 with self.assertRaises(ClientError):
-                    validate_catalog(value)
+                    validate_catalog(value, usage_schema=3)
 
     def test_catalog_rejects_credential_fields_duplicates_and_invalid_usage(self):
         bad = []
@@ -254,7 +328,7 @@ class PoolMenuTests(unittest.TestCase):
         value = catalog(); value["accounts"][0]["usage"]["private_credential"] = 0; bad.append(value)
         for value in bad:
             with self.subTest(value=value), self.assertRaises(ClientError):
-                validate_catalog(value)
+                validate_catalog(value, usage_schema=3)
 
     def test_listing_revocation_marks_existing_device_and_returns_no_catalog(self):
         self.transport.error = RequestError(401)
@@ -322,6 +396,7 @@ class PoolMenuTests(unittest.TestCase):
         code, result, _ = self.run_bridge({"action": "list"})
         self.assertEqual(code, 1)
         self.assertIn("usage format", result["error"])
+        self.assertIn("Update the shared coordinator", result["error"])
         self.assertEqual(before, self.client.config.read_bytes())
         self.assertEqual(writes, len(self.native.writes))
 
@@ -338,9 +413,39 @@ class PoolMenuTests(unittest.TestCase):
         self.assertEqual(result["account_id"], "account-c")
         self.assertEqual(self.native.credentials["account_id"], "account-c")
         self.assertEqual(self.native.original, before)
-        self.assertEqual(self.transport.calls[-1], ("/v1/assignment", {"account_id": "account-c"}, DEVICE_TOKEN))
+        self.assertEqual(self.transport.calls[-1], ("/v1/assignment", {"account_id": "account-c", "allow_model_limited": True}, DEVICE_TOKEN))
         self.assertEqual(allowed, [False])
         self.assertNotIn("fixture-c", json.dumps(result))
+
+    def test_manual_model_limited_selection_from_degraded_state_keeps_guards_and_warning(self):
+        self.transport.next = assignment(state="quota_exhausted")
+        self.client.sync()
+        before = copy.deepcopy(self.native.original)
+        self.transport.next = assignment(account_id="account-c", access_token="fixture-c", state="quota_exhausted")
+        result = dispatch({"action": "switch", "account_id": "account-c"}, self.client, running=lambda: True)
+        self.assertEqual(result["account_id"], "account-c")
+        self.assertEqual(result["state"], "degraded")
+        self.assertEqual(result["reason"], "quota_exhausted")
+        self.assertEqual(self.native.original, before)
+        self.assertEqual(self.transport.calls[-1],
+                         ("/v1/assignment", {"account_id": "account-c", "allow_model_limited": True}, DEVICE_TOKEN))
+        self.assertEqual(self.native.credentials["account_id"], "account-c")
+
+    def test_manual_model_opt_in_still_rejects_stale_or_mismatched_assignment(self):
+        before, writes = self.client.config.read_bytes(), len(self.native.writes)
+        for response in (assignment(account_id="account-c", state="quota_stale"),
+                         assignment(account_id="account-b", state="quota_exhausted"),
+                         assignment(account_id="account-c", state="model_limited")):
+            with self.subTest(response_state=response["state"], account=response["account_id"]):
+                self.transport.next = response
+                with self.assertRaises(ClientError):
+                    dispatch({"action": "switch", "account_id": "account-c"}, self.client, running=lambda: True)
+                self.assertEqual(before, self.client.config.read_bytes())
+                self.assertEqual(writes, len(self.native.writes))
+
+    def test_automatic_sync_never_opts_into_model_limited_selection(self):
+        self.client.sync()
+        self.assertEqual(self.transport.calls[-1], ("/v1/assignment", {}, DEVICE_TOKEN))
 
     def test_unavailable_selection_preserves_local_assignment_and_active_state(self):
         before, writes = self.client.config.read_bytes(), len(self.native.writes)

@@ -384,10 +384,52 @@ test('member menu schemas reject extra fields and malformed requested account ID
       { error: 'invalid-account-id' });
   }
   await h.request('/v1/assignment', { account_id: 'a', force: true }, device.device_token, { expected: 400 });
-  for (const usage_schema of [null, false, 1, 3, '2', {}]) {
+  for (const usage_schema of [null, false, 1, 4, '2', '3', {}]) {
     await h.request('/v1/accounts/list', { usage_schema }, device.device_token, { expected: 400 });
   }
+  for (const body of [
+    { allow_model_limited: true },
+    ...[null, false, 1, 'true', {}].map(allow_model_limited => ({ account_id: 'a', allow_model_limited })),
+  ]) {
+    assert.deepEqual(await h.request('/v1/assignment', body, device.device_token, { expected: 400 }),
+      { error: 'invalid-body' });
+  }
   assert.equal(h.provider.calls.length, 0);
+});
+
+test('schema3 distinguishes manual selection from automatic eligibility without changing prior catalog contracts', async () => {
+  const value = await h.add('limited');
+  h.provider.rawUsage = {
+    five_hour: null, seven_day: { utilization: 49 },
+    limits: [
+      { kind: 'weekly_all', group: 'weekly', percent: 49 },
+      { kind: 'weekly_scoped', group: 'weekly', percent: 100, scope: { model: { display_name: 'Fable' } } },
+    ],
+  };
+  const device = await h.shareEnroll();
+  const before = (await h.admin('devices/list')).devices;
+  const legacy = await h.request('/v1/accounts/list', {}, device.device_token);
+  const current = await h.request('/v1/accounts/list', { usage_schema: 2 }, device.device_token);
+  const manual = await h.request('/v1/accounts/list', { usage_schema: 3 }, device.device_token);
+  const priorKeys = ['account', 'eligible', 'expires_at', 'fetched', 'id', 'reason', 'state', 'usage'];
+  assert.deepEqual(Object.keys(legacy.accounts[0]).sort(), priorKeys);
+  assert.deepEqual(Object.keys(current.accounts[0]).sort(), priorKeys);
+  assert.equal(legacy.accounts[0].usage, null);
+  assert.equal(legacy.accounts[0].eligible, false);
+  assert.equal(legacy.accounts[0].reason, 'quota-exhausted');
+  assert.deepEqual(current.accounts[0].usage, { five_hour: null, seven_day: 49, 'weekly_scoped:fable': 100 });
+  assert.equal(current.accounts[0].eligible, false);
+  assert.equal(current.accounts[0].reason, 'quota-exhausted');
+  assert.deepEqual(manual.accounts[0], { ...current.accounts[0], selectable: true, selection_reason: null });
+  assert.deepEqual(Object.keys(manual).sort(), ['account_id', 'accounts', 'threshold']);
+  assert.equal(h.provider.count('usage'), 1, 'all catalog versions reuse the same complete observation');
+  assert.deepEqual((await h.admin('devices/list')).devices, before, 'selection hints must not assign an account');
+  for (const secret of [value.access_token, value.refresh_token, device.device_token]) {
+    assert.equal(JSON.stringify(manual).includes(secret), false);
+  }
+  const selected = await h.request('/v1/assignment', { account_id: 'limited', allow_model_limited: true }, device.device_token);
+  assert.equal(selected.account_id, 'limited');
+  assert.equal(selected.state, 'quota_exhausted');
 });
 
 test('nullable session quota is explicit for schema2 menus while legacy menus and automatic clients remain compatible', async () => {
@@ -530,6 +572,103 @@ test('manual account selection overrides balancing, stays sticky, and resumes no
   assert.equal((await h.assignment(device)).account_id, 'a');
 });
 
+test('explicit model-limited selection persists with no automatic alternative while automatic routing stays conservative', async () => {
+  await h.add('a');
+  await h.add('b');
+  h.provider.rawUsage = {
+    five_hour: { utilization: 66 }, seven_day: { utilization: 49 },
+    limits: [
+      { kind: 'weekly_all', group: 'weekly', percent: 49 },
+      { kind: 'weekly_scoped', group: 'weekly', percent: 98, scope: { model: { display_name: 'Fable' } } },
+    ],
+  };
+  const device = await h.shareEnroll();
+  await h.assignment(device, { expected: 503 });
+  await h.request('/v1/assignment', { account_id: 'b' }, device.device_token, { expected: 409 });
+  assert.equal((await h.admin('devices/list')).devices[0].account_id, null,
+    'legacy selection and new automatic assignment must not use the scoped-limited row');
+  const selected = await h.request('/v1/assignment', { account_id: 'b', allow_model_limited: true }, device.device_token);
+  assert.equal(selected.account_id, 'b');
+  assert.equal(selected.state, 'quota_exhausted', 'the model restriction must remain visible');
+  assert.equal(selected.access_token, 'access-secret-b');
+  assert.equal(Object.hasOwn(selected, 'refresh_token'), false);
+  assert.deepEqual((await h.assignment(device)), selected);
+  await h.restart();
+  assert.deepEqual((await h.assignment(device)), selected, 'a new coordinator instance preserves the explicit assignment');
+  await h.assignment(await h.enroll('New Mac'), { expected: 503 });
+  assert.equal((await h.sql("SELECT * FROM audit WHERE event='assignment-changed'")).length, 1);
+
+  h.provider.rawUsage = undefined;
+  await h.add('healthy');
+  const automatic = await h.assignment(device);
+  assert.equal(automatic.account_id, 'healthy');
+  assert.equal(automatic.state, 'fresh', 'a fully eligible alternative still wins normal automatic failover');
+  const requested = await h.request('/v1/assignment', { account_id: 'healthy', allow_model_limited: true }, device.device_token);
+  assert.equal(requested.state, 'fresh', 'opt-in does not mark an unrestricted account exhausted');
+  const catalog = await h.request('/v1/accounts/list', { usage_schema: 3 }, device.device_token);
+  assert.equal(catalog.accounts.find(row => row.id === 'healthy').selectable, true);
+  assert.equal(catalog.accounts.find(row => row.id === 'healthy').eligible, true);
+  assert.equal(catalog.accounts.find(row => row.id === 'b').eligible, false);
+});
+
+test('manual model-limit opt-in cannot bypass base quota, unknown usage, freshness, or account readiness', async () => {
+  const device = await h.shareEnroll();
+  const goodUsage = { five_hour: 49, seven_day: 66, 'weekly_scoped:fable': 100 };
+  const cases = [
+    { id: 'session-spent', usage: { ...goodUsage, five_hour: 98 }, reason: 'quota-exhausted' },
+    { id: 'weekly-spent', usage: { ...goodUsage, five_hour: null, seven_day: 98 }, reason: 'quota-exhausted' },
+    { id: 'stale', fetched: h.now - 301, reason: 'quota-stale' },
+    { id: 'future', fetched: h.now + 1, reason: 'quota-stale' },
+    { id: 'missing', fetched: null, reason: 'quota-unavailable' },
+    { id: 'invalid', usage: { five_hour: 49 }, reason: 'quota-unavailable' },
+    { id: 'unverified', verified: 0, reason: 'unverified' },
+    { id: 'quarantined', state: 'quarantined', reason: 'quarantined' },
+  ];
+  for (const entry of cases) {
+    await h.add(entry.id);
+    await h.sql('UPDATE accounts SET state=?,verified=?,usage=?,fetched=?,next_poll=? WHERE id=?',
+      entry.state ?? 'ready', entry.verified ?? 1, JSON.stringify(entry.usage ?? goodUsage),
+      Object.hasOwn(entry, 'fetched') ? entry.fetched : h.now, h.now + 600, entry.id);
+  }
+  const before = (await h.admin('devices/list')).devices;
+  const catalog = await h.request('/v1/accounts/list', { usage_schema: 3 }, device.device_token);
+  for (const entry of cases) {
+    const row = catalog.accounts.find(row => row.id === entry.id);
+    assert.equal(row.selectable, false, entry.id);
+    assert.equal(row.selection_reason, entry.reason, entry.id);
+    assert.equal(row.eligible, false, entry.id);
+    assert.equal(row.reason, entry.reason, entry.id);
+    assert.deepEqual(await h.request('/v1/assignment', { account_id: entry.id, allow_model_limited: true },
+      device.device_token, { expected: 409 }), { error: 'account-unavailable' });
+  }
+  assert.deepEqual((await h.admin('devices/list')).devices, before);
+  assert.equal((await h.sql("SELECT * FROM audit WHERE event='assignment-changed'")).length, 0);
+  assert.equal(h.provider.calls.length, 0, 'manual override must respect readiness and polling backoff');
+});
+
+test('manual model-limit opt-in cannot reuse a rejected sign-in or failed expired-token refresh', async () => {
+  await h.add('rejected');
+  h.provider.quotas.set('rejected', { five_hour: 49, seven_day: 66, seven_day_fable: 100 });
+  const device = await h.shareEnroll();
+  const first = await h.request('/v1/accounts/list', { usage_schema: 3 }, device.device_token);
+  assert.equal(first.accounts[0].selectable, true);
+  h.provider.usageFailure = 401;
+  await h.advance(121);
+  const rejected = await h.request('/v1/accounts/list', { usage_schema: 3 }, device.device_token);
+  assert.equal(rejected.accounts[0].selectable, false);
+  assert.equal(rejected.accounts[0].selection_reason, 'quarantined');
+  assert.deepEqual(rejected.accounts[0].usage, { five_hour: 49, seven_day: 66, seven_day_fable: 100 },
+    'old quota does not authorize reuse after an authentication failure');
+  await h.request('/v1/assignment', { account_id: 'rejected', allow_model_limited: true }, device.device_token, { expected: 409 });
+
+  await h.add('expired', h.now - 1);
+  h.provider.refreshFailure = 401;
+  await h.request('/v1/assignment', { account_id: 'expired', allow_model_limited: true }, device.device_token, { expected: 409 });
+  assert.equal((await h.admin('devices/list')).devices[0].account_id, null);
+  assert.equal((await h.sql("SELECT * FROM audit WHERE event='assignment-changed'")).length, 0);
+  assert.equal(h.provider.count('refresh'), 1);
+});
+
 test('unknown and exhausted manual selections refuse without changing assignment, liveness, or its audit', async () => {
   await h.add('a', undefined, 10);
   await h.add('spent', undefined, 98);
@@ -540,6 +679,8 @@ test('unknown and exhausted manual selections refuse without changing assignment
   await h.advance(30);
   for (const account_id of ['missing', 'spent']) {
     assert.deepEqual(await h.request('/v1/assignment', { account_id }, device.device_token, { expected: 409 }),
+      { error: 'account-unavailable' });
+    assert.deepEqual(await h.request('/v1/assignment', { account_id, allow_model_limited: true }, device.device_token, { expected: 409 }),
       { error: 'account-unavailable' });
   }
   assert.deepEqual((await h.admin('devices/list')).devices, before);
