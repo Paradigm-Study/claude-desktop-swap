@@ -370,6 +370,31 @@ private func quotaIsStale(_ account: [String: Any], now: Date = Date()) -> Bool 
     return age < 0 || age > 300
 }
 
+private func quotaResetDisplay(_ account: [String: Any], key: String, now: Date = Date(),
+                               locale: Locale = .current, timeZone: TimeZone = .current) -> String {
+    guard let resets = account["reset_at"] as? [String: Any],
+          let reset = timestamp(resets[key]), reset.timeIntervalSince1970 <= 253_402_300_799 else {
+        return "Reset time not reported"
+    }
+    let absolute = DateFormatter()
+    absolute.locale = locale
+    absolute.timeZone = timeZone
+    absolute.setLocalizedDateFormatFromTemplate("MMM d yyyy jm z")
+    let date = absolute.string(from: reset)
+    // Cached timestamps describe the provider's last response. Neither a past
+    // reset nor a failed sign-in proves that its quota has replenished.
+    if account["state"] as? String != "ready" || quotaIsStale(account, now: now) {
+        return "Last reported reset \(date) (stale)"
+    }
+    if reset <= now {
+        return "Reset time passed; awaiting updated usage · \(date)"
+    }
+    let relative = RelativeDateTimeFormatter()
+    relative.locale = locale
+    relative.unitsStyle = .full
+    return "Resets \(relative.localizedString(for: reset, relativeTo: now)) · \(date)"
+}
+
 private func modelQuotaLimited(_ account: [String: Any]) -> Bool {
     account["selectable"] as? Bool == true && account["eligible"] as? Bool == false
         && account["reason"] as? String == "quota-exhausted"
@@ -608,12 +633,15 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 line(email, in: detail)
                 if let plan = safeLabel(details["subscriptionType"]) { line("Plan: \(plan)", in: detail) }
                 line("5-hour usage: \(quotaDisplay(usage, key: "five_hour", stale: staleUsage))", in: detail)
+                line(quotaResetDisplay(account, key: "five_hour"), in: detail)
                 if usage["five_hour"] is NSNull { line("Claude did not report a 5-hour meter", in: detail) }
                 line("Weekly usage: \(quotaDisplay(usage, key: "seven_day", stale: staleUsage))", in: detail)
+                line(quotaResetDisplay(account, key: "seven_day"), in: detail)
                 for key in usage.keys.sorted() where key != "five_hour" && key != "seven_day" {
                     let label = key.replacingOccurrences(of: "seven_day_", with: "Weekly ")
                         .replacingOccurrences(of: "weekly_scoped:", with: "Weekly ")
                     line("\(String(label.prefix(80))): \(quotaDisplay(usage, key: key, stale: staleUsage))", in: detail)
+                    line(quotaResetDisplay(account, key: key), in: detail)
                 }
                 line(available, in: detail)
                 if modelLimited {

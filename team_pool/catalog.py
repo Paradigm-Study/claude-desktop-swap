@@ -8,6 +8,7 @@ from .client import ClientError, _number, _safe_string
 REASONS = {"quarantined", "refreshing", "unverified", "token-expiring",
            "quota-unavailable", "quota-stale", "quota-exhausted"}
 FIELDS = {"id", "account", "usage", "fetched", "expires_at", "state", "eligible", "reason"}
+MAX_RESET_EPOCH = 253402300799
 
 
 def identifier(value):
@@ -16,9 +17,11 @@ def identifier(value):
 
 def validate_catalog(value, *, usage_schema=2):
     try:
-        if type(usage_schema) is not int or usage_schema not in (1, 2, 3):
+        if type(usage_schema) is not int or usage_schema not in (1, 2, 3, 4):
             raise ValueError
-        fields = FIELDS | ({"selectable", "selection_reason"} if usage_schema == 3 else set())
+        fields = FIELDS | ({"selectable", "selection_reason"} if usage_schema >= 3 else set())
+        if usage_schema == 4:
+            fields |= {"reset_at"}
         if (not isinstance(value, dict) or set(value) != {"accounts", "account_id", "threshold"}
                 or not isinstance(value["accounts"], list) or len(value["accounts"]) > 100
                 or (value["account_id"] is not None and not identifier(value["account_id"]))
@@ -52,7 +55,7 @@ def validate_catalog(value, *, usage_schema=2):
                                     or any(percent >= value["threshold"] for percent in usage.values()
                                            if percent is not None)):
                 raise ValueError
-            if usage_schema == 3:
+            if usage_schema >= 3:
                 selectable, selection_reason = row["selectable"], row["selection_reason"]
                 if (not isinstance(selectable, bool) or selection_reason not in REASONS | {None}
                         or selectable != (selection_reason is None)
@@ -71,8 +74,17 @@ def validate_catalog(value, *, usage_schema=2):
                         raise ValueError
                 elif selection_reason != row["reason"] or (selection_reason == "quota-exhausted" and not base_limited):
                     raise ValueError
+            if usage_schema == 4:
+                resets = row["reset_at"]
+                if (not isinstance(resets, dict) or set(resets) != set(usage or {})
+                        or any(value is not None and (not _number(value) or not 0 < value <= MAX_RESET_EPOCH)
+                               for value in resets.values())
+                        or (usage is not None and usage.get("five_hour") is None
+                            and resets.get("five_hour") is not None)):
+                    raise ValueError
             seen.add(row["id"])
-            accounts.append({**row, "account": dict(account), "usage": dict(usage) if usage is not None else None})
+            accounts.append({**row, "account": dict(account), "usage": dict(usage) if usage is not None else None,
+                             **({"reset_at": dict(row["reset_at"])} if usage_schema == 4 else {})})
         return {"accounts": accounts, "account_id": value["account_id"], "threshold": value["threshold"]}
     except (ValueError, TypeError, KeyError):
         raise ClientError("The coordinator returned invalid pool metadata. No account was changed.") from None

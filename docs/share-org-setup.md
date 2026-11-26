@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/Paradigm-Study/claude-desktop-swap/
 ```
 
 Run it as your ordinary Mac user, without `sudo` in front of the command. The
-installer uses the pinned `v0.1.0a16` package and prepares its own Python runtime;
+installer uses the pinned `v0.1.0a17` package and prepares its own Python runtime;
 Git, Python and uv do not need to be installed beforehand. Use that Mac’s
 logged-in desktop Terminal, including when helping through Screen Sharing. An
 SSH shell can lack access to its login Keychain even when the desktop services
@@ -100,13 +100,13 @@ credential store only and refuses a `CLAUDE_CONFIG_DIR` override or conflicting
 native provider configuration.
 
 The package and runtime stay under
-`~/.local/share/claude-desktop-swap/releases/v0.1.0a16/`. Keep that directory in
+`~/.local/share/claude-desktop-swap/releases/v0.1.0a17/`. Keep that directory in
 place while the service uses it. Setup prints the installed client path; for this
 release, status and contribution commands are:
 
 ```sh
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a16/venv/bin/team-pool-client status
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a16/venv/bin/team-pool-client contribute-account
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a17/venv/bin/team-pool-client status
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a17/venv/bin/team-pool-client contribute-account
 ```
 
 If Share saves its sign-in elsewhere, use the same installer with its account
@@ -158,7 +158,7 @@ need a normal restart/retry to use the new launcher.
 For a read-only diagnosis on the remote Mac, run:
 
 ```sh
-env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a16/venv/bin/team-pool-client doctor --ssh
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL ~/.local/share/claude-desktop-swap/releases/v0.1.0a17/venv/bin/team-pool-client doctor --ssh
 ```
 
 The report distinguishes missing GUI login, stopped sync, expired assignment,

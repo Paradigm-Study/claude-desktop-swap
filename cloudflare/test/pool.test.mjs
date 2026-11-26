@@ -384,7 +384,7 @@ test('member menu schemas reject extra fields and malformed requested account ID
       { error: 'invalid-account-id' });
   }
   await h.request('/v1/assignment', { account_id: 'a', force: true }, device.device_token, { expected: 400 });
-  for (const usage_schema of [null, false, 1, 4, '2', '3', {}]) {
+  for (const usage_schema of [null, false, 1, 5, '2', '3', '4', {}]) {
     await h.request('/v1/accounts/list', { usage_schema }, device.device_token, { expected: 400 });
   }
   for (const body of [
@@ -430,6 +430,110 @@ test('schema3 distinguishes manual selection from automatic eligibility without 
   const selected = await h.request('/v1/assignment', { account_id: 'limited', allow_model_limited: true }, device.device_token);
   assert.equal(selected.account_id, 'limited');
   assert.equal(selected.state, 'quota_exhausted');
+});
+
+test('schema4 adds matching reset metadata without changing older schemas or eligibility', async () => {
+  const credential = await h.add('limited');
+  const weekly = new Date((h.now + 3600) * 1000).toISOString();
+  const scoped = new Date((h.now + 7200) * 1000).toISOString();
+  h.provider.rawUsage = {
+    five_hour: null, seven_day: { utilization: 49, resets_at: weekly },
+    limits: [
+      { kind: 'weekly_all', group: 'weekly', percent: 49, resets_at: weekly },
+      { kind: 'weekly_scoped', group: 'weekly', percent: 100, resets_at: scoped,
+        scope: { model: { display_name: 'Fable' } } },
+    ],
+  };
+  const device = await h.shareEnroll();
+  const prior = await h.request('/v1/accounts/list', { usage_schema: 3 }, device.device_token);
+  const result = await h.request('/v1/accounts/list', { usage_schema: 4 }, device.device_token);
+  assert.deepEqual(result.accounts[0], { ...prior.accounts[0], reset_at: {
+    five_hour: null, seven_day: h.now + 3600, 'weekly_scoped:fable': h.now + 7200,
+  } });
+  assert.equal(result.accounts[0].eligible, false);
+  assert.equal(result.accounts[0].selectable, true);
+  assert.equal(h.provider.count('usage'), 1, 'one observation populates every catalog version');
+  for (const usage_schema of [undefined, 2, 3]) {
+    const old = await h.request('/v1/accounts/list', usage_schema ? { usage_schema } : {}, device.device_token);
+    assert.equal(Object.hasOwn(old.accounts[0], 'reset_at'), false);
+  }
+  for (const forbidden of [credential.access_token, credential.refresh_token, device.device_token]) {
+    assert.equal(JSON.stringify(result).includes(forbidden), false);
+  }
+  const stored = (await h.sql('SELECT usage,usage_reset_at,fetched FROM accounts WHERE id=?', 'limited'))[0];
+  assert.deepEqual(JSON.parse(stored.usage), result.accounts[0].usage);
+  assert.deepEqual(JSON.parse(stored.usage_reset_at), result.accounts[0].reset_at);
+  assert.equal(stored.fetched, result.accounts[0].fetched);
+});
+
+test('old stored usage gains unknown reset metadata without repolling or changing enrollment', async () => {
+  await h.add('old');
+  const device = await h.shareEnroll();
+  await h.request('/v1/accounts/list', { usage_schema: 3 }, device.device_token);
+  const before = await h.sql('SELECT secret,generation,usage,fetched,next_poll FROM accounts');
+  const devices = (await h.admin('devices/list')).devices;
+  await h.sql('ALTER TABLE accounts DROP COLUMN usage_reset_at');
+  const calls = h.provider.calls.length;
+  await h.restart();
+  const result = await h.request('/v1/accounts/list', { usage_schema: 4 }, device.device_token);
+  assert.deepEqual(result.accounts[0].reset_at, { five_hour: null, seven_day: null });
+  assert.equal(h.provider.calls.length, calls);
+  assert.deepEqual(await h.sql('SELECT secret,generation,usage,fetched,next_poll FROM accounts'), before);
+  assert.deepEqual((await h.admin('devices/list')).devices, devices);
+});
+
+test('stale and quarantined reset dates retain their observation across restart', async () => {
+  await h.add('limited');
+  const date = new Date((h.now + 60) * 1000).toISOString();
+  h.provider.rawUsage = { five_hour: { utilization: 20, resets_at: date },
+    seven_day: { utilization: 40, resets_at: date } };
+  const device = await h.shareEnroll();
+  const first = (await h.request('/v1/accounts/list', { usage_schema: 4 }, device.device_token)).accounts[0];
+  h.provider.usageFailure = 429;
+  await h.advance(301);
+  const stale = (await h.request('/v1/accounts/list', { usage_schema: 4 }, device.device_token)).accounts[0];
+  assert.equal(stale.reason, 'quota-stale');
+  assert.deepEqual(stale.reset_at, first.reset_at);
+  assert.equal(stale.fetched, first.fetched);
+  await h.restart();
+  const persisted = (await h.request('/v1/accounts/list', { usage_schema: 4 }, device.device_token)).accounts[0];
+  assert.deepEqual(persisted, stale);
+  await h.sql("UPDATE accounts SET state='quarantined',error='http-401' WHERE id=?", 'limited');
+  const calls = h.provider.calls.length;
+  const quarantined = (await h.request('/v1/accounts/list', { usage_schema: 4 }, device.device_token)).accounts[0];
+  assert.equal(quarantined.reason, 'quarantined');
+  assert.deepEqual(quarantined.reset_at, first.reset_at);
+  assert.equal(quarantined.fetched, first.fetched);
+  assert.equal(h.provider.calls.length, calls, 'displaying reset metadata must not recover authentication');
+});
+
+test('unknown reset metadata does not reject otherwise fresh quota and absent usage returns no dates', async () => {
+  await h.add('known');
+  h.provider.rawUsage = { five_hour: { utilization: 20, resets_at: 'invalid' },
+    seven_day: { utilization: 40, resets_at: null } };
+  const device = await h.shareEnroll();
+  const measured = (await h.request('/v1/accounts/list', { usage_schema: 4 }, device.device_token)).accounts[0];
+  assert.equal(measured.eligible, true);
+  assert.deepEqual(measured.reset_at, { five_hour: null, seven_day: null });
+  await h.sql("UPDATE accounts SET state='quarantined',usage=NULL WHERE id=?", 'known');
+  const absent = (await h.request('/v1/accounts/list', { usage_schema: 4 }, device.device_token)).accounts[0];
+  assert.equal(absent.usage, null);
+  assert.deepEqual(absent.reset_at, {});
+});
+
+test('admin replacement clears cached reset dates along with the old quota observation', async () => {
+  const old = await h.add('replace');
+  const device = await h.enroll();
+  h.provider.rawUsage = { five_hour: { utilization: 20, resets_at: '2026-11-27T01:00:00Z' },
+    seven_day: { utilization: 40, resets_at: '2026-11-28T01:00:00Z' } };
+  await h.assignment(device);
+  await h.sql("UPDATE accounts SET state='quarantined' WHERE id=?", 'replace');
+  const replacement = { ...old, access_token: 'fresh-replacement-access', refresh_token: 'fresh-replacement-refresh' };
+  h.provider.register(replacement);
+  await h.admin('accounts/import', { account_id: 'replace', credentials: replacement,
+    exclusive_owner: true, replace_quarantined: true });
+  const row = (await h.sql('SELECT usage,usage_reset_at,fetched,next_poll FROM accounts WHERE id=?', 'replace'))[0];
+  assert.deepEqual(row, { usage: null, usage_reset_at: null, fetched: null, next_poll: 0 });
 });
 
 test('nullable session quota is explicit for schema2 menus while legacy menus and automatic clients remain compatible', async () => {
@@ -948,6 +1052,8 @@ async function quarantinedAccount(name = 'recover') {
 
 test('targeted recovery atomically replaces the same quarantined account with fresh quota and durable idempotent receipt', async () => {
   await quarantinedAccount();
+  await h.sql('UPDATE accounts SET usage_reset_at=? WHERE id=?',
+    JSON.stringify({ five_hour: h.now + 100, seven_day: h.now + 1000 }), 'recover');
   const first = await h.enroll(); const second = await h.enroll();
   const operation = await h.startContribution(first, 'recover');
   assert.equal(operation.account_id, 'recover');
@@ -960,9 +1066,9 @@ test('targeted recovery atomically replaces the same quarantined account with fr
   assert.equal(receipts[0].account_id, 'recover');
   for (const receipt of receipts) assert.deepEqual(receipt, receipts[0]);
   assert.equal(h.provider.count('exchange'), 1);
-  const row = (await h.sql('SELECT id,generation,state,verified,usage,fetched,next_poll,failures,error,refresh_diagnostic FROM accounts'))[0];
+  const row = (await h.sql('SELECT id,generation,state,verified,usage,usage_reset_at,fetched,next_poll,failures,error,refresh_diagnostic FROM accounts'))[0];
   assert.deepEqual(row, { id: 'recover', generation: 2, state: 'ready', verified: 1,
-    usage: null, fetched: null, next_poll: 0, failures: 0, error: null, refresh_diagnostic: null });
+    usage: null, usage_reset_at: null, fetched: null, next_poll: 0, failures: 0, error: null, refresh_diagnostic: null });
   h.provider.quotas.set('recover', { five_hour: 3, seven_day: 17 });
   for (const device of [first, second]) {
     const assignment = await h.assignment(device);
