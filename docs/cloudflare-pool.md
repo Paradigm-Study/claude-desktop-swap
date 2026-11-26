@@ -206,6 +206,15 @@ as soon as a fully eligible alternative appears. Deploy the schema-3 coordinator
 before updating clients; a new client fails clearly against an older coordinator
 instead of guessing manual eligibility.
 
+Client a17 requests `usage_schema: 4`, adding `reset_at` alongside the schema-3
+fields. This map uses the same keys as `usage`, with provider-reported Unix
+timestamps or null for unknown reset times. Old catalog schemas remain unchanged.
+The coordinator stores reset metadata with the matching usage reading from one
+provider request. Reset dates do not participate in quota eligibility and do not
+establish that a past window has renewed. Existing rows receive unknown dates
+until their next ordinary successful poll; deployment does not force provider
+polling or change credential renewal.
+
 ## Operations and limits
 
 Use `cloudflare_pool_admin.py revoke DEVICE_ID` to stop further deliveries to a

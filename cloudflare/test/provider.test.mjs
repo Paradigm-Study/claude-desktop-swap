@@ -209,6 +209,88 @@ test('usage validates all subscription windows and leaves extra usage out', asyn
   assert.equal(requests[0].headers['anthropic-beta'], 'oauth-2025-04-20');
 });
 
+test('usage snapshot captures actual window reset dates in one request without changing the usage API', async () => {
+  const raw = {
+    five_hour: { utilization: 20, resets_at: '2026-11-25T12:34:56.125Z' },
+    seven_day: { utilization: 30, resets_at: '2026-11-27T05:00:00-08:00' },
+    seven_day_opus: { utilization: 70, resets_at: '2026-11-28T13:00:00+00:00' },
+    extra_usage: { utilization: 90, resets_at: '2026-11-26T00:00:00Z' },
+  };
+  const { provider, requests } = fake([raw, raw]);
+  const snapshot = await provider.usageSnapshot('access-secret');
+  assert.deepEqual(snapshot, { usage: { five_hour: 20, seven_day: 30, seven_day_opus: 70 },
+    reset_at: { five_hour: Date.parse(raw.five_hour.resets_at) / 1000,
+      seven_day: Date.parse(raw.seven_day.resets_at) / 1000,
+      seven_day_opus: Date.parse(raw.seven_day_opus.resets_at) / 1000 } });
+  assert.equal(requests.length, 1, 'quota and resets must come from the same observation');
+  assert.deepEqual(await provider.usage('access-secret'), snapshot.usage);
+});
+
+test('canonical reset dates follow the maximum reading, including model scopes and absent session', async () => {
+  const low = '2026-11-26T01:00:00Z', high = '2026-11-27T02:00:00Z';
+  const { provider } = fake([{
+    five_hour: null, seven_day: { utilization: 30, resets_at: low },
+    limits: [
+      { kind: 'weekly_all', group: 'weekly', percent: 40, resets_at: high },
+      { kind: 'weekly_scoped', group: 'weekly', percent: 80, resets_at: high,
+        scope: { model: { display_name: 'Fable' } } },
+      { kind: 'weekly_scoped', group: 'weekly', percent: 10, resets_at: low,
+        scope: { model: { display_name: 'FABLE' } } },
+    ],
+  }]);
+  assert.deepEqual(await provider.usageSnapshot('access'), {
+    usage: { five_hour: null, seven_day: 40, 'weekly_scoped:fable': 80 },
+    reset_at: { five_hour: null, seven_day: Date.parse(high) / 1000,
+      'weekly_scoped:fable': Date.parse(high) / 1000 },
+  });
+});
+
+test('equal maximum resets must agree after timezone normalization', async () => {
+  const a = '2026-11-25T13:00:00Z', same = '2026-11-25T05:00:00-08:00';
+  const different = '2026-11-25T14:00:00Z';
+  for (const [resets, expected] of [
+    [[same], Date.parse(a) / 1000], [[different], null], [[undefined], null],
+    [[different, a], null],
+  ]) {
+    const snapshot = await fake([{
+      five_hour: { utilization: 90, resets_at: a }, seven_day: { utilization: 20 },
+      limits: resets.map(resets_at => ({ kind: 'session', group: 'session', percent: 90, resets_at })),
+    }]).provider.usageSnapshot('access');
+    assert.equal(snapshot.usage.five_hour, 90);
+    assert.equal(snapshot.reset_at.five_hour, expected);
+  }
+});
+
+test('missing or malformed resets remain unknown without discarding usable percentages', async () => {
+  for (const resets_at of [undefined, null, true, 1795600000, {}, '', 'tomorrow',
+    '2026-11-25', '2026-11-25T12:00:00', '2026-02-29T00:00:00Z',
+    '2026-02-30T00:00:00Z', '2026-13-01T00:00:00Z', '2026-11-25T24:00:00Z',
+    '2026-11-25T00:00:60Z', '2026-11-25T00:00:00+24:00',
+    '2026-11-25T00:00:00-00:00', '2026-11-25T00:00:00Z\n',
+    '1970-01-01T00:00:00Z', '9999-12-31T23:59:59.999Z', '+010000-01-01T00:00:00Z']) {
+    const snapshot = await fake([{
+      five_hour: { utilization: 20, resets_at }, seven_day: { utilization: 40, resets_at },
+    }]).provider.usageSnapshot('access');
+    assert.deepEqual(snapshot, { usage: { five_hour: 20, seven_day: 40 },
+      reset_at: { five_hour: null, seven_day: null } });
+  }
+  const snapshot = await fake([{
+    five_hour: { utilization: 20, resets_at: '2028-02-29T00:00:00Z' },
+    seven_day: { utilization: 40, resets_at: '9999-12-31T23:59:59Z' },
+  }]).provider.usageSnapshot('access');
+  assert.equal(snapshot.reset_at.five_hour, Date.parse('2028-02-29T00:00:00Z') / 1000);
+  assert.equal(snapshot.reset_at.seven_day, 253402300799);
+});
+
+test('a lower reading cannot donate its reset when the maximum has no valid date', async () => {
+  const snapshot = await fake([{
+    five_hour: { utilization: 90 }, seven_day: { utilization: 20 },
+    limits: [{ kind: 'session', group: 'session', percent: 10, resets_at: '2026-11-25T13:00:00Z' }],
+  }]).provider.usageSnapshot('access');
+  assert.equal(snapshot.usage.five_hour, 90);
+  assert.equal(snapshot.reset_at.five_hour, null);
+});
+
 test('weekly row aggregates are metadata rather than quota windows', async () => {
   const aggregate = { as_of: '2026-10-26T12:00:00Z', rows: [],
     window_started_at: '2026-10-20T12:00:00Z' };

@@ -106,6 +106,24 @@ function retryAfter(headers) {
   return Number.isFinite(seconds) ? Math.min(86400, Math.max(0, seconds)) : 0;
 }
 
+// Reset dates are display metadata, not a promise of capacity. Only accept an
+// explicit ISO timezone and a real calendar date; malformed/absent metadata must
+// not discard an otherwise valid quota observation or invent a new window.
+function resetEpoch(value) {
+  if (typeof value !== 'string' || value.length > 40) return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-]\d{2}:\d{2})(?![\s\S])/.exec(value);
+  if (!match) return null;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, zone] = match;
+  const [year, month, day, hour, minute, second] = [yearText, monthText, dayText, hourText, minuteText, secondText].map(Number);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (year < 1 || month < 1 || month > 12 || day < 1 || day > days[month - 1]
+      || hour > 23 || minute > 59 || second > 59 || zone === '-00:00'
+      || (zone !== 'Z' && (Number(zone.slice(1, 3)) > 23 || Number(zone.slice(4)) > 59))) return null;
+  const epoch = Date.parse(value) / 1000;
+  return Number.isFinite(epoch) && epoch > 0 && epoch <= 253402300799 ? epoch : null;
+}
+
 // Administrator diagnostics contain quota structure only. Never return the raw
 // provider body: future responses may include unrelated account information.
 export function usageDiagnostic(raw) {
@@ -268,8 +286,23 @@ export class Provider {
   }
 
   async usage(accessToken) {
+    return (await this.usageSnapshot(accessToken)).usage;
+  }
+
+  async usageSnapshot(accessToken) {
     const raw = await this.request(USAGE_URL, { token: accessToken });
-    const result = {};
+    const result = {}, reset_at = {};
+    const record = (key, pct, reset) => {
+      const epoch = resetEpoch(reset);
+      if (!Object.hasOwn(result, key) || pct > result[key]) {
+        result[key] = pct;
+        reset_at[key] = epoch;
+      } else if (pct === result[key] && reset_at[key] !== epoch) {
+        // The displayed percentage is the maximum observation. Equal maxima
+        // must agree on their reset; a lower reading cannot supply its date.
+        reset_at[key] = null;
+      }
+    };
     const percent = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
     const keys = new Set(['five_hour', 'seven_day', ...Object.keys(raw).filter(k => k.startsWith('seven_day_'))]);
     for (const key of keys) {
@@ -288,7 +321,7 @@ export class Provider {
       if (!percent(pct)) {
         throw new ProviderError('bad-usage');
       }
-      result[key] = pct;
+      record(key, pct, value.resets_at);
     }
     // Newer responses enumerate session, weekly-all and per-model quotas in
     // limits[]. is_active describes the currently displayed meter, not whether
@@ -305,7 +338,7 @@ export class Provider {
             throw new ProviderError('bad-usage');
           }
           const key = weekly ? 'seven_day' : 'five_hour';
-          result[key] = Math.max(result[key] ?? 0, limit.percent);
+          record(key, limit.percent, limit.resets_at);
           if (weekly) canonicalWeekly = true;
           continue;
         }
@@ -317,17 +350,20 @@ export class Provider {
           throw new ProviderError('bad-usage');
         }
         const key = `weekly_scoped:${name.toLowerCase()}`;
-        result[key] = Math.max(result[key] ?? 0, pct);
+        record(key, pct, limit.resets_at);
       }
     }
     // A complete canonical weekly response may intentionally omit a session
     // meter. Keep that absence as null, never a fabricated 0% reading. Missing
     // legacy-only data, empty limits and unmeasured weekly budgets fail closed.
-    if (!Object.hasOwn(result, 'five_hour') && canonicalWeekly) result.five_hour = null;
+    if (!Object.hasOwn(result, 'five_hour') && canonicalWeekly) {
+      result.five_hour = null;
+      reset_at.five_hour = null;
+    }
     if (!Object.hasOwn(result, 'five_hour') || !percent(result.seven_day)) {
       throw new ProviderError('bad-usage');
     }
-    return result;
+    return { usage: result, reset_at };
   }
 
   async refresh(credentials) {

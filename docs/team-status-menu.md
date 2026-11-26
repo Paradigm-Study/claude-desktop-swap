@@ -7,6 +7,18 @@ The menu displays the coordinator's latest reported usage, not a live billing
 counter. It refreshes the catalog approximately once a minute; **Refresh Pool
 and Status** requests an earlier refresh.
 
+With a17, each account's submenu also shows when its **5-hour, overall weekly,
+and model-specific limits reset**, whenever Claude reports those timestamps.
+Each quota has a countdown and an absolute date/time in this Mac's local time
+zone. This is separate from **Usage checked**, which says when the pool last
+obtained the readings.
+
+Missing or invalid reset timestamps show **Reset time not reported**. A reset
+time that has passed shows that the menu is awaiting updated usage; the client
+does not assume the quota has renewed or set usage to zero. Stale or quarantined
+accounts label reset dates as **Last reported**. The menu never derives reset
+times from token expiry or adds five hours or a week to the current time.
+
 Some subscriptions currently report weekly quota without a five-hour meter.
 The menu shows **Not reported** for that meter, rather than inventing 0%.
 Automatic availability follows the measured weekly and model-specific quotas. Old readings

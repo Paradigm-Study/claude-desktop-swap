@@ -1,6 +1,6 @@
 # Live two-Mac acceptance worksheet
 
-Status: **IN PROGRESS — client/menu 0.1.0a16 installed on Mac A; a14 last verified for the SSH user on Mac B**.
+Status: **IN PROGRESS — client/menu 0.1.0a17 installed on Mac A; a14 last verified for the SSH user on Mac B**.
 Mac B's a14 upgrade preserved enrollment, native ownership, shared connector
 credentials and existing conversation files. A newly created helper started in
 plain SSH context authenticated and completed a native request through the GUI
@@ -567,3 +567,31 @@ records matched the pre-update baseline. Native ownership matched, no write was
 pending, and the sync service remained running. The quota-limited status remains
 intentional; switching does not replenish the limited model's quota. Visible menu
 clicks and an existing conversation's cached credential were not exercised.
+
+## a17: quota reset dates in the account menu
+
+On November 25, a live usage response confirmed that Claude supplies
+`resets_at` for both legacy quota windows and canonical overall/model weekly
+limits. The old adapter retained percentages but discarded those dates, so
+**Usage checked** could not answer when a subscription allowance resets.
+
+A17 stores dates from the same provider response as their matching percentages
+and adds them to catalog schema 4. Earlier schemas remain unchanged. Reset
+metadata does not affect selection, credential renewal or usage freshness. The
+menu displays a countdown and local date/time for each reported quota window;
+past, missing and stale dates are distinguished without assuming replenishment.
+
+Validation passed 558 Python tests with one optional dependency skip, 125
+Cloudflare tests, the compiled Swift formatter checks and deployment dry-run.
+The coordinator update retained its identity, secrets and threshold. Schema 3
+still loaded after deployment. The main Mac's client/menu update took **3.70
+seconds**; the installed helper loaded schema 4 in **0.42 seconds**, with ten
+real reset dates across five accounts after their ordinary quota polls. The
+installed-source Swift formatter showed the reported weekly/model dates in
+local time, independently of token expiration. Missing session dates remained
+unknown. This validates the data and formatter, not a screenshot or menu click.
+
+The native fingerprint, selected account, device/Share identities, device token,
+recovery backup and all four connector records matched the baseline. Desktop's
+process and launcher/settings hashes were unchanged. Background sync remained
+active, the credential was unexpired, and manual menu controls remained enabled.

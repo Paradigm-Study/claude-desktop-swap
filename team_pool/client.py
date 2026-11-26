@@ -682,9 +682,9 @@ class Client:
 
         state, token = context()
         try:
-            # Schema 3 separates manual selection from conservative automatic
-            # failover while retaining schema 2's explicitly absent session meter.
-            value = self._transport(state).post("/v1/accounts/list", {"usage_schema": 3}, token=token)
+            # Schema 4 adds provider quota reset times without changing the
+            # schema 3 distinction between manual and automatic availability.
+            value = self._transport(state).post("/v1/accounts/list", {"usage_schema": 4}, token=token)
         except RequestError as error:
             if error.status == 400:
                 raise ClientError("The coordinator does not support this menu's usage format yet. Update the shared coordinator, then refresh the pool.") from None
@@ -702,7 +702,7 @@ class Client:
                         self._save(current)
                 raise ClientError("This Mac no longer has shared pool access. Check your Claude Share membership.") from None
             raise
-        catalog = validate_catalog(value, usage_schema=3)
+        catalog = validate_catalog(value, usage_schema=4)
         current, current_token = context()
         if identity(current) != identity(state) or current_token != token:
             raise ClientError("Pool enrollment changed while loading accounts. Refresh after setup completes.")

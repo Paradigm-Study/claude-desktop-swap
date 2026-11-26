@@ -218,6 +218,50 @@ if command == "format" {
     precondition(claudeAuthorizationURL("https://evil.test@claude.com/cai/oauth/authorize") == nil)
     precondition(claudeAuthorizationURL("https://claude.com/cai/oauth/authorize#fragment") == nil)
     print("format-ok")
+} else if command == "quota-resets" {
+    let now = ISO8601DateFormatter().date(from: "2026-11-25T20:00:00Z")!
+    let us = Locale(identifier: "en_US_POSIX")
+    let pacific = TimeZone(identifier: "America/Los_Angeles")!
+    var account: [String: Any] = ["state": "ready", "fetched": now.timeIntervalSince1970 - 1,
+        "expires_at": now.timeIntervalSince1970 + 500,
+        "usage": ["five_hour": 20, "seven_day": 50, "weekly_scoped:model": 98],
+        "reset_at": ["five_hour": now.timeIntervalSince1970 + 3600,
+                     "seven_day": now.timeIntervalSince1970 + 7 * 86400,
+                     "weekly_scoped:model": NSNull()]]
+    func display(_ key: String = "five_hour", zone: TimeZone = pacific) -> String {
+        quotaResetDisplay(account, key: key, now: now, locale: us, timeZone: zone)
+    }
+    let future = display().split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    precondition(future.hasPrefix("Resets in 1 hour · "))
+    precondition(future.contains("Nov 25, 2026") && future.contains("1:00 PM PST"))
+    let tokyo = display(zone: TimeZone(identifier: "Asia/Tokyo")!)
+    precondition(tokyo.contains("Nov 26, 2026") && tokyo != future)
+    precondition(display("seven_day").contains("Dec 2, 2026"))
+    precondition(display("weekly_scoped:model") == "Reset time not reported")
+    precondition(display("missing") == "Reset time not reported")
+    account["reset_at"] = ["five_hour": now.timeIntervalSince1970 - 1]
+    precondition(display().hasPrefix("Reset time passed; awaiting updated usage · "))
+    account["reset_at"] = ["five_hour": now.timeIntervalSince1970]
+    precondition(display().hasPrefix("Reset time passed; awaiting updated usage · "))
+    account["reset_at"] = ["five_hour": now.timeIntervalSince1970 + 3600]
+    account["fetched"] = now.timeIntervalSince1970 - 301
+    precondition(display().hasPrefix("Last reported reset ") && display().hasSuffix("(stale)"))
+    precondition(!display().contains("in 1 hour"))
+    account["fetched"] = now.timeIntervalSince1970 - 1
+    for state in ["quarantined", "refreshing"] {
+        account["state"] = state
+        precondition(display().hasPrefix("Last reported reset ") && display().hasSuffix("(stale)"))
+    }
+    account["state"] = "ready"
+    for bad: Any in [NSNull(), true, false, -1, 0, Double.nan, Double.infinity,
+                     253_402_300_800.0, "2026-11-25T21:00:00Z"] {
+        account["reset_at"] = ["five_hour": bad]
+        precondition(display() == "Reset time not reported")
+    }
+    account.removeValue(forKey: "reset_at")
+    // Credential expiry is present, but is never substituted for quota reset.
+    precondition(display() == "Reset time not reported")
+    print("quota-resets-ok")
 } else if command == "diagnostics" {
     let directory = URL(fileURLWithPath: CommandLine.arguments[2])
     for n in 1...70 {
@@ -367,6 +411,10 @@ if command == "format" {
     def test_quota_format_and_official_authorization_origin(self):
         result = subprocess.run([str(self.binary), "format"], capture_output=True, text=True, check=True)
         self.assertEqual(result.stdout.strip(), "format-ok")
+
+    def test_quota_reset_times_show_local_dates_without_inventing_replenishment(self):
+        result = subprocess.run([str(self.binary), "quota-resets"], capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.strip(), "quota-resets-ok")
 
     def test_catalog_diagnostics_are_private_bounded_and_record_recovery(self):
         result = subprocess.run([str(self.binary), "diagnostics", str(self.work)],
